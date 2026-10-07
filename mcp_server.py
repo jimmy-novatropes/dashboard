@@ -57,6 +57,10 @@ Reproducing: for Step Functions failures, get_step_function_input gives the exac
 failing Lambda received - use it to write a local test that fails first, then fix.
 Partner problems (expired tokens, 429s) across clients: partner_api_health.
 
+Infrastructure: schedules_health (jobs that silently stopped), inventory / upgrade_checklist
+(runtimes, layers, packages, timeout/memory headroom), apis_and_alarms, secrets_overview (metadata
+only; useful when auth errors start), cost_estimate, daily_digest (morning summary per client).
+
 Good workflow: error_overview -> list_error_patterns for the project -> get_log_lines for a
 pattern -> get_line_context on one line to see what the code printed just before it -> find the
 code in the repo (a log group like /aws/lambda/<name> is the Lambda function <name>;
@@ -457,6 +461,155 @@ def get_step_function_input(event_id: str = "", execution_arn: str = "", profile
     if not r["failures"]:
         out.append("\n(No failed states in this run's history.)")
     return finish(out)
+
+
+def _scan_note(profile=""):
+    st = api("/api/infra/status", profile=profile)
+    pend = [x["profile"] for x in st if not x["scanned_at"]]
+    errs = [f"{x['profile']}: {k} ({v})" for x in st for k, v in x["errors"].items()]
+    out = ""
+    if pend:
+        out += f"NOTE: infrastructure scan still running for {', '.join(pend)}; results incomplete.\n"
+    if errs:
+        out += "Unavailable (usually a missing read permission): " + "; ".join(errs[:12]) + "\n"
+    return out
+
+
+def _when(ms):
+    return t(ms) if ms else "-"
+
+
+@mcp.tool()
+@guard
+def schedules_health(profile: str = "", only_problems: bool = False) -> str:
+    """EventBridge schedules / scheduled rules vs what actually ran: for each schedule its
+    expression, target Lambda or state machine, expected vs actual runs in the last 24h, missed
+    run times, last run (and whether it timed out / failed) and next run. Catches jobs that stopped
+    silently (disabled schedule, missing target, never triggered) - those never log an error."""
+    rows = api("/api/infra/schedules", profile=profile)
+    bad = [r for r in rows if r["status"] in ("not running", "missed runs", "target missing", "last run failed")]
+    out = [_scan_note(profile) + f"{len(rows)} schedules, {len(bad)} with problems — dashboard: {link(tab='schedules', profile=profile)}"]
+    for r in (bad if only_problems else rows):
+        out.append(f"- [{r['status'].upper()}] {r['profile']} | {r['name']} ({r['source']}) | {r['expression']}"
+                   f"{' ' + r['tz'] if r.get('tz') not in (None, 'UTC') else ''} -> {r['function'] or r['state_machine'] or r['target']}"
+                   f" | expected {r['expected']}, ran {r['actual']} | last run {_when(r['last_run'])}"
+                   f"{' (' + r['last_run_status'] + ')' if r.get('last_run_status') else ''} | next {_when(r['next_run'])}"
+                   + (f" | {r['detail']}" if r['detail'] else "")
+                   + (f" | missed at: {', '.join(_when(m) for m in r['missed'][-5:])}" if r['missed'] else ""))
+    return finish(out)
+
+
+@mcp.tool()
+@guard
+def inventory(profile: str = "", function: str = "", only_flagged: bool = False) -> str:
+    """Lambda inventory for a client (or one function): runtime + support status, layers (and
+    whether a newer layer version exists), secrets it uses, timeout and memory headroom from the
+    last 24h of runs, throttles, cold starts and estimated monthly cost."""
+    rows = api("/api/infra/functions", profile=profile, function=function)
+    if only_flagged:
+        rows = [r for r in rows if r["flags"]]
+    out = [_scan_note(profile) + f"{len(rows)} functions — dashboard: {link(tab='inventory', profile=profile)}"]
+    for r in rows[:120]:
+        out.append(f"- {r['profile']} | {r['name']} | {r['runtime'] or '?'} ({r['runtime_text']}) | timeout {r['timeout']}s"
+                   f" (max run {r['max_ms'] or '-'} ms = {r['timeout_pct'] if r['timeout_pct'] is not None else '-'}%) | memory {r['memory']} MB"
+                   f" (max used {r['mem_used_mb'] or '-'} MB) | {r['invocations_24h']} runs/24h | ~${r['cost_30d']}/30d"
+                   + (f" | layers: {', '.join(l.split(':', 6)[-1] for l in r['layers'])}" if r['layers'] else "")
+                   + (f" | secrets: {', '.join(r['secrets'])}" if r['secrets'] else "")
+                   + (f" | NEEDS ATTENTION: {'; '.join(r['flags'])}" if r['flags'] else "")
+                   + (f" ({', '.join(r['outdated_layers'])})" if r['outdated_layers'] else ""))
+    return finish(out)
+
+
+@mcp.tool()
+@guard
+def upgrade_checklist(profile: str = "") -> str:
+    """What to upgrade, per client: functions on deprecated or soon-deprecated Lambda runtimes
+    (with AWS's dates), functions on an older layer version than the latest, and the package
+    versions inside each layer version in use (to compare clients / spot old libraries)."""
+    fns = api("/api/infra/functions", profile=profile)
+    lays = api("/api/infra/layers", profile=profile)
+    out = [_scan_note(profile) + f"Upgrade checklist — dashboard: {link(tab='inventory', profile=profile)}"]
+    rt = [f for f in fns if f["runtime_status"] in ("deprecated", "soon")]
+    out.append(f"\n## Runtimes ({len(rt)} functions)")
+    out += [f"- {f['profile']} | {f['name']}: {f['runtime']} - {f['runtime_text']}" for f in rt] or ["- all on supported runtimes"]
+    old = [l for l in lays if l["outdated"]]
+    out.append(f"\n## Outdated layer versions ({len(old)})")
+    out += [f"- {l['profile']} | {l['layer']}:{l['version']} (latest {l['latest']}) used by {', '.join(l['functions'])}" for l in old] \
+        or ["- none (or layer versions couldn't be read)"]
+    out.append("\n## Packages per layer version in use")
+    for l in lays:
+        pk = ", ".join(f"{k} {v}" for k, v in sorted(l["packages"].items())) or (l.get("note") or "-")
+        out.append(f"- {l['profile']} | {l['layer']}:{l['version']}: {cap(pk, 1200)}")
+    return finish(out)
+
+
+@mcp.tool()
+@guard
+def apis_and_alarms(profile: str = "") -> str:
+    """API Gateway health for the last 24h (requests, 4xx, 5xx, p99 latency per stage, and which
+    Lambda handles each route - 5xx on a webhook endpoint usually means lost events) plus
+    CloudWatch alarms that are currently firing."""
+    r = api("/api/infra/apis", profile=profile)
+    out = [_scan_note(profile) + f"Dashboard: {link(tab='apis', profile=profile)}", "\n## API Gateway (24h)"]
+    for a in r["apis"]:
+        out.append(f"- {a['profile']} | {a['api']} ({a['kind']}) stage {a['stage']}: {a['requests']} requests, {a['e4']} 4xx, "
+                   f"{a['e5']} 5xx, p99 {a['p99_ms'] or '-'} ms" + (f" | {'; '.join(a['flags'])}" if a['flags'] else "")
+                   + " | routes: " + ", ".join(f"{x['route']}{' -> ' + x['function'] if x['function'] else ''}" for x in a["routes"][:8]))
+    if not r["apis"]:
+        out.append("- none found")
+    firing = [a for a in r["alarms"] if a["state"] == "ALARM"]
+    out.append(f"\n## Alarms firing ({len(firing)} of {len(r['alarms'])})")
+    out += [f"- {a['profile']} | {a['name']} ({a['metric']}) since {_when(a['since'])}: {a['reason'][:200]}" for a in firing] or ["- none"]
+    return finish(out)
+
+
+@mcp.tool()
+@guard
+def secrets_overview(profile: str = "") -> str:
+    """Secrets Manager metadata (never the values): last changed / rotated / read, which Lambdas
+    use each secret, and flags - changed in the last 48h, not read in 30+ days, rotation overdue,
+    and 'possibly related' when auth errors (401/403) started soon after a secret changed."""
+    rows = api("/api/infra/secrets", profile=profile)
+    out = [_scan_note(profile) + f"{len(rows)} secrets — dashboard: {link(tab='inventory', profile=profile)}"]
+    for r in rows:
+        out.append(f"- {r['profile']} | {r['name']} | changed {_when(r['last_changed'])} | rotated {_when(r['last_rotated'])} | "
+                   f"read {_when(r['last_accessed'])} | rotation {'on' if r['rotation'] else 'off'} | used by "
+                   f"{', '.join(r['functions']) or 'not found in env vars'}"
+                   + (f" | {'; '.join(r['flags'])}" if r['flags'] else "") + (f" | {'; '.join(r['related'])}" if r['related'] else ""))
+    return finish(out)
+
+
+@mcp.tool()
+@guard
+def cost_estimate(profile: str = "") -> str:
+    """Estimated Lambda compute cost per client for 30 days, from the last 24h of runs (billed
+    duration x memory + requests at list price, no free tier), and the most expensive functions."""
+    rows = api("/api/infra/cost", profile=profile)
+    out = [f"Estimated Lambda cost (30 days, from last 24h of runs) — dashboard: {link(tab='inventory', profile=profile)}"]
+    for r in rows:
+        out.append(f"- {r['profile']}: ~${r['cost_30d']:.2f} | top: " + ", ".join(
+            f"{x['name']} ${x['cost_30d']} ({x['invocations_24h']}/day, {x['memory']} MB, avg {x['avg_ms']} ms)"
+            for x in r["top"][:4] if x["cost_30d"] > 0))
+    return finish(out)
+
+
+@mcp.tool()
+@guard
+def daily_digest(profile: str = "") -> str:
+    """Per-client summary of what needs attention today: broken schedules, regressions, new and
+    spiking errors, deploy results, partner API problems, firing alarms, API 5xx, functions near
+    their limits and the upgrade backlog. Good as a morning check or a summary to post."""
+    r = api("/api/digest", profile=profile)
+    return finish([_scan_note(profile) + r["text"], f"\nDashboard: {link(tab='digest', profile=profile)}"])
+
+
+@mcp.tool()
+@guard
+def rescan_infrastructure(profile: str = "") -> str:
+    """Re-read schedules, functions, layers, secrets metadata, APIs and alarms now (normally every
+    15 minutes) - e.g. right after deploying or changing a schedule. Takes about a minute."""
+    api("/api/infra/rescan", profile=profile)
+    return "Re-scan started; results update in about a minute."
 
 
 def _rate(x, per):

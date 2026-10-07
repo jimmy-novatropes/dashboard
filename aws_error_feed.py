@@ -26,7 +26,10 @@ AWS when you pick them and deleted again 24 hours later. Deleting the file is al
 
 Needs only read access in each account: logs:DescribeLogGroups, logs:FilterLogEvents,
 for Step Functions: states:ListStateMachines, states:ListExecutions, states:GetExecutionHistory,
-and for deploy tracking: lambda:ListFunctions.
+for deploy tracking: lambda:ListFunctions, and for the infrastructure tabs (each optional):
+lambda:ListLayerVersions, lambda:GetLayerVersion, scheduler:ListSchedules, scheduler:GetSchedule,
+events:ListRules, events:ListTargetsByRule, secretsmanager:ListSecrets (metadata only - secret
+values are never read), apigateway:GET, cloudwatch:GetMetricData, cloudwatch:DescribeAlarms.
 
 Step Functions: failed / timed-out / aborted executions show under Errors (with the failing
 state, error code and cause). Successful runs that only got through because a Retry or Catch
@@ -55,6 +58,8 @@ except ImportError:
     sys.exit("boto3 is required:  pip install boto3")
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+import aws_infra  # noqa: E402  (infrastructure scan: schedules, layers, secrets, APIs, alarms)
 DAY_MS = 86_400_000
 LEVELS = ("error", "suspect", "warning", "info", "platform")
 
@@ -97,6 +102,11 @@ DEFAULTS = {
     "sfn_poll_seconds": 120,
     # Deploy tracking (lambda:ListFunctions). A deploy = the function's code fingerprint changed.
     "track_deploys": True,
+    # Infrastructure scan (schedules, Lambda config + layers, secrets metadata, API Gateway, alarms)
+    "infra_scan": True,
+    "infra_refresh_minutes": 15,
+    "infra_scan_layer_packages": True,   # download each layer version once to list its packages
+    "infra_max_layer_mb": 100,
     # Baseline for "new since yesterday" / spikes: hourly error counts kept this many days
     "baseline_days": 30,
     "seed_baseline_days": 7,      # one-time errors-only pull per account to start the baseline
@@ -338,6 +348,8 @@ class Store:
             CREATE TABLE IF NOT EXISTS mutes(
                 etype TEXT, sig TEXT, profile TEXT, status TEXT, at INTEGER, note TEXT,
                 PRIMARY KEY(etype, sig, profile));
+            CREATE TABLE IF NOT EXISTS infra_snap(key TEXT PRIMARY KEY, at INTEGER, data TEXT);
+            CREATE TABLE IF NOT EXISTS layer_pkgs(arn TEXT PRIMARY KEY, data TEXT);
             CREATE TABLE IF NOT EXISTS deploys(
                 profile TEXT, region TEXT, function TEXT, log_group TEXT, deployed_at INTEGER,
                 code_sha TEXT, kind TEXT, label TEXT, runtime TEXT,
@@ -631,6 +643,28 @@ class Store:
                 g["last"] = max(g["last"], r[4])
         return sorted(rows.values(), key=lambda g: -g["total"])
 
+    # ---- infrastructure snapshots (latest per account/region) and layer package lists
+    def save_infra(self, key, snap):
+        with self.lock:
+            self.db.execute("INSERT OR REPLACE INTO infra_snap VALUES (?,?,?)",
+                            (key, snap.get("at", 0), json.dumps(snap)))
+            self.db.commit()
+
+    def get_infra(self, key):
+        with self.lock:
+            r = self.db.execute("SELECT data FROM infra_snap WHERE key = ?", (key,)).fetchone()
+        return json.loads(r[0]) if r else None
+
+    def save_layer_pkgs(self, arn, pkgs):
+        with self.lock:
+            self.db.execute("INSERT OR REPLACE INTO layer_pkgs VALUES (?,?)", (arn, json.dumps(pkgs)))
+            self.db.commit()
+
+    def get_layer_pkgs(self, arn):
+        with self.lock:
+            r = self.db.execute("SELECT data FROM layer_pkgs WHERE arn = ?", (arn,)).fetchone()
+        return json.loads(r[0]) if r else None
+
     # ---- deploys (kept forever; tiny)
     def record_functions(self, profile, region, funcs):
         """Compare each function with what we last saw; record new code or config deploys."""
@@ -859,6 +893,101 @@ def deploy_impact(store, d, window_hours=24):
 VERSION_DESC_RX = re.compile(r"\b(?:git|commit|sha|version|release|v)[\s:=#]*([0-9a-f]{7,40}|v?\d[\w.\-]{0,38})\b", re.I)
 VERSION_ENV_KEYS = ("GIT_SHA", "GIT_COMMIT", "COMMIT_SHA", "CODE_VERSION", "APP_VERSION", "VERSION",
                     "RELEASE", "BUILD_ID", "DEPLOY_VERSION")
+
+
+def infra_views(store, workers, profile=None):
+    """(worker, snapshot, REPORT stats) for each account/region, optionally one profile."""
+    now = int(time.time() * 1000)
+    out = []
+    for w in workers:
+        if profile and w.profile != profile:
+            continue
+        snap = store.get_infra(w.key) or {}
+        stats = aws_infra.report_stats(store, w.profile, w.region, now - DAY_MS)
+        out.append((w, snap, stats))
+    return out
+
+
+def tag(rows, w):
+    for r in rows:
+        r["profile"], r["region"] = w.profile, w.region
+    return rows
+
+
+def build_digest(store, workers, cfg, profile=None):
+    """Per-client morning summary: what needs attention today."""
+    now = int(time.time() * 1000)
+    out = []
+    by_profile = {}
+    for w, snap, stats in infra_views(store, workers, profile):
+        by_profile.setdefault(w.profile, []).append((w, snap, stats))
+    for prof, views in sorted(by_profile.items()):
+        sec = []
+
+        def add(title, items):
+            if items:
+                sec.append({"title": title, "items": items[:8] + ([f"... and {len(items) - 8} more"] if len(items) > 8 else [])})
+        sched, fns, apis, alarms, secrets, cost = [], [], [], [], [], 0.0
+        for w, snap, stats in views:
+            sched += [r for r in aws_infra.schedule_health(snap, stats, now, w.covered_from)
+                      if r["status"] in ("not running", "missed runs", "target missing", "last run failed")]
+            fh = aws_infra.function_health(snap, stats, now)
+            fns += fh
+            cost += sum(f["cost_24h"] for f in fh)
+            apis += [a for a in aws_infra.api_report(snap) if a["e5"]]
+            alarms += [a for a in snap.get("alarms", []) if a["state"] == "ALARM"]
+        add("Scheduled jobs that didn't run properly",
+            [f"{r['name']} ({r['expression']}) -> {r['function'] or r['state_machine'] or r['target']}: {r['status']}. {r['detail']}"
+             for r in sched])
+        pats = store.annotate(store.summary({"hours": 24, "profile": prof, "level": "error,suspect", "hide_muted": "1"}), prof)
+        add("Regressions (marked fixed, came back)", [f"{g['etype']}: {g['sig'][:120]} ({g['count']}x)" for g in pats if g.get("regression")])
+        add("New since yesterday", [f"{g['etype']}: {g['sig'][:120]} ({g['count']}x, {', '.join(list(g['log_groups'])[:2])})"
+                                    for g in pats if g.get("is_new")])
+        add("Spiking", [f"{g['etype']}: {g['sig'][:120]} ({g['last24']} today vs {g['prev7_daily_avg']}/day)"
+                        for g in pats if g.get("is_spike")])
+        tot_e = sum(g["count"] for g in pats if g["level"] == "error")
+        tot_s = sum(g["count"] for g in pats if g["level"] == "suspect")
+        add("Top errors (24h)", [f"{g['etype']}: {g['sig'][:120]} - {g['count']}x" for g in pats[:3]])
+        deps = []
+        for d in store.list_deploys(prof, now - DAY_MS):
+            imp = deploy_impact(store, d, 24)
+            deps.append(f"{d['function']} {d['kind']}{' ' + d['label'] if d['label'] else ''} at {iso(d['deployed_at'])}: {imp['verdict']}")
+        add("Deploys in the last 24h", deps)
+        add("Partner API problems", [f"{p['service']} {p['problem']}: {p['count']} lines ({p['last_hour']} in last hour)"
+                                     + (" - several clients" if p["several_clients_now"] else "")
+                                     for p in partner_health(store, {"hours": 24, "profile": prof}, cfg["partner_services"],
+                                                             cfg.get("partner_function_hints"))])
+        add("CloudWatch alarms firing", [f"{a['name']}: {a['reason'][:150]}" for a in alarms])
+        add("API Gateway server errors", [f"{a['api']} ({a['stage']}): {a['e5']} 5xx of {a['requests']} requests" for a in apis])
+        add("Functions needing attention", [f"{f['name']}: {', '.join(x for x in f['flags'] if 'runtime' not in x and 'layer' not in x)}"
+                                            for f in fns if any('runtime' not in x and 'layer' not in x for x in f['flags'])])
+        dep_rt = sorted({f["runtime"] for f in fns if f["runtime_status"] == "deprecated"})
+        n_old = sum(1 for f in fns if f["runtime_status"] in ("deprecated", "soon"))
+        n_lay = sum(1 for f in fns if f["outdated_layers"])
+        if n_old or n_lay:
+            add("Upgrade backlog", ([f"{n_old} functions on deprecated / soon-deprecated runtimes ({', '.join(dep_rt)})"] if n_old else [])
+                + ([f"{n_lay} functions on an outdated layer version"] if n_lay else []))
+        out.append({"profile": prof, "errors_24h": tot_e, "hidden_24h": tot_s, "cost_24h": round(cost, 2),
+                    "ok": not sec or all(x["title"] in ("Top errors (24h)", "Upgrade backlog", "Deploys in the last 24h") for x in sec),
+                    "sections": sec})
+    out.sort(key=lambda d: (d["ok"], -len(d["sections"])))
+    return out
+
+
+def digest_text(dg):
+    lines = [f"AWS daily digest - {time.strftime('%a %d %b %Y %H:%M')}", ""]
+    quiet = [d["profile"] for d in dg if d["ok"] and not d["sections"]]
+    for d in dg:
+        if d["profile"] in quiet:
+            continue
+        lines.append(f"## {d['profile']} - {d['errors_24h']} errors, {d['hidden_24h']} hidden errors, ~${d['cost_24h']} Lambda cost (24h)")
+        for s in d["sections"]:
+            lines.append(f"* {s['title']}:")
+            lines += [f"    - {i}" for i in s["items"]]
+        lines.append("")
+    if quiet:
+        lines.append("All quiet: " + ", ".join(quiet))
+    return "\n".join(lines)
 
 
 def parse_aws_time(text):
@@ -1166,6 +1295,7 @@ class Worker(threading.Thread):
             self.save()
         self.sfn_cursor, self.sfn_last_poll = self.cursor, 0
         self.lam, self.lambda_count, self.lambda_error, self.deploys_checked = None, 0, None, 0
+        self.infra = None
         sd = store.get_coverage("seed|" + self.key)
         if sd:
             self.seed_from, self.seed_target = sd["covered_from"], sd["target"]
@@ -1451,6 +1581,60 @@ def make_handler(store, workers, cfg):
         def json(self, obj):
             self.send(200, json.dumps(obj), "application/json")
 
+        def infra(self, path, q):
+            now = int(time.time() * 1000)
+            prof = q.get("profile") or None
+            views = infra_views(store, workers, prof)
+            if path == "/api/infra/status":
+                return self.json([{"profile": w.profile, "region": w.region, "scanned_at": snap.get("at"),
+                                   "scanning": bool(w.infra and w.infra.scanning), "errors": snap.get("errors", {}),
+                                   "counts": {k: len(snap.get(k) or []) for k in
+                                              ("functions", "layers", "secrets", "schedules", "apis", "alarms")}}
+                                  for w, snap, _ in views])
+            if path == "/api/infra/rescan":
+                for w, _, _ in views:
+                    if w.infra:
+                        w.infra.wake.set()
+                return self.json({"ok": True})
+            if path == "/api/infra/schedules":
+                return self.json([r for w, snap, st in views
+                                  for r in tag(aws_infra.schedule_health(snap, st, now, w.covered_from), w)])
+            if path == "/api/infra/functions":
+                rows = [r for w, snap, st in views for r in tag(aws_infra.function_health(snap, st, now), w)]
+                if q.get("function"):
+                    rows = [r for r in rows if r["name"] == q["function"]]
+                return self.json(rows)
+            if path == "/api/infra/layers":
+                return self.json([r for w, snap, _ in views for r in tag(aws_infra.layers_report(snap, store), w)])
+            if path == "/api/infra/secrets":
+                out = []
+                for w, snap, _ in views:
+                    auth = [p for p in partner_health(store, {"hours": 48, "profile": w.profile}, cfg["partner_services"],
+                                                      cfg.get("partner_function_hints"))
+                            if p["problem"] in ("auth", "permission")]
+                    out += tag(aws_infra.secrets_report(snap, now, auth), w)
+                return self.json(out)
+            if path == "/api/infra/apis":
+                return self.json({"apis": [r for w, snap, _ in views for r in tag(aws_infra.api_report(snap), w)],
+                                  "alarms": [dict(a, profile=w.profile, region=w.region) for w, snap, _ in views
+                                             for a in snap.get("alarms", [])]})
+            if path == "/api/infra/cost":
+                out = []
+                for w, snap, st in views:
+                    fh = aws_infra.function_health(snap, st, now)
+                    out.append({"profile": w.profile, "region": w.region,
+                                "cost_24h": round(sum(f["cost_24h"] for f in fh), 4),
+                                "cost_30d": round(sum(f["cost_30d"] for f in fh), 2),
+                                "top": sorted(({"name": f["name"], "cost_30d": f["cost_30d"], "invocations_24h": f["invocations_24h"],
+                                                "memory": f["memory"], "avg_ms": f["avg_ms"]} for f in fh),
+                                              key=lambda x: -x["cost_30d"])[:10]})
+                out.sort(key=lambda r: -r["cost_30d"])
+                return self.json(out)
+            if path == "/api/digest":
+                dg = build_digest(store, workers, cfg, prof)
+                return self.json({"digest": dg, "text": digest_text(dg)})
+            self.send(404, "not found", "text/plain")
+
         def do_GET(self):
             u = urlparse(self.path)
             q = {k: v[0] for k, v in parse_qs(u.query, keep_blank_values=True).items()}
@@ -1467,6 +1651,8 @@ def make_handler(store, workers, cfg):
                 return self.json(store.get_status())
             if u.path == "/api/summary":
                 return self.json(store.annotate(store.summary(q), q.get("profile")))
+            if u.path.startswith("/api/infra/") or u.path.startswith("/api/digest"):
+                return self.infra(u.path, q)
             if u.path == "/api/mute":
                 store.set_mute(q["etype"], q.get("sig", ""), q.get("profile", ""),
                                "fixed" if q.get("status") == "fixed" else "muted", q.get("note", ""))
@@ -1619,6 +1805,10 @@ tr.click:hover{background:var(--bg);cursor:pointer}
    <button data-v="volume">Volume</button>
    <button data-v="deploys">Deploys</button>
    <button data-v="partners">Partner APIs</button>
+   <button data-v="schedules">Schedules<span class="n" id="n-sched"></span></button>
+   <button data-v="inventory">Inventory</button>
+   <button data-v="apis">APIs &amp; alarms</button>
+   <button data-v="digest">Digest</button>
   </div>
  </div>
  <div class="row">
@@ -1665,6 +1855,21 @@ tr.click:hover{background:var(--bg);cursor:pointer}
   <div class="row" style="margin-bottom:10px"><label>Compare windows of <select id="dWin"><option value="1">1 hour</option><option value="6">6 hours</option><option value="24" selected>24 hours</option><option value="72">3 days</option></select></label></div>
   <table><thead><tr><th>Deployed</th><th>Profile</th><th>Function</th><th>Change</th><th class="num">Calls before → after</th><th class="num">Errors+hidden before → after</th><th class="num">Rate change</th><th>Patterns</th><th>Verdict</th></tr></thead>
   <tbody id="depBody"></tbody></table></div>
+ <div id="v-schedules" class="view">
+  <p class="help">Every EventBridge schedule / scheduled rule, when it should have run in the last 24h (or since logs were loaded) and whether its Lambda or state machine actually ran. Catches jobs that stop silently — they never log an error. <span id="infraNote"></span></p>
+  <table><thead><tr><th>Status</th><th>Profile</th><th>Schedule</th><th>Runs</th><th>Target</th><th class="num">Expected</th><th class="num">Ran</th><th>Last run</th><th>Next run</th><th>Details</th></tr></thead>
+  <tbody id="schBody"></tbody></table></div>
+ <div id="v-inventory" class="view">
+  <p class="help">Each client's Lambdas with runtime support status, layers, timeout / memory headroom (from the last 24h of runs), throttles and estimated Lambda cost; then layers (with the packages inside each version) and secrets (metadata only — values are never read). <button class="act" id="rescan">re-scan now</button></p>
+  <div class="row" style="margin-bottom:8px"><select id="invView"><option value="functions">Functions</option><option value="layers">Layers &amp; packages</option><option value="secrets">Secrets</option><option value="cost">Cost by client</option></select>
+   <label><input type="checkbox" id="invFlagged"> only ones needing attention</label></div>
+  <div id="invBody"></div></div>
+ <div id="v-apis" class="view">
+  <p class="help">API Gateway (REST and HTTP APIs) over the last 24h: requests, 4xx, 5xx and p99 latency per stage, with the Lambda behind each route — a 5xx on a webhook endpoint usually means that event was lost. Below: CloudWatch alarms that are firing.</p>
+  <div id="apiBody"></div></div>
+ <div id="v-digest" class="view">
+  <p class="help">What needs attention today, per client: broken schedules, regressions, new / spiking errors, deploy results, partner API problems, alarms, API 5xx, functions near limits and the upgrade backlog. Ask Claude for the same with "give me today's digest".</p>
+  <div id="digBody"></div></div>
  <div id="v-partners" class="view">
   <p class="help">API problems with partner services across all clients, from error and hidden-error lines: <b>auth</b> (401, expired token), <b>permission</b> (403, missing scopes), <b>rate limit</b> (429), <b>server error</b> (5xx) and <b>timeout</b>. A red flag means the same problem hit several clients in the last hour — usually the partner's side or a shared credential, not your code. Click a row for the lines.</p>
   <table><thead><tr><th>Service</th><th>Problem</th><th class="num">Lines</th><th class="num">Last hour</th><th>Clients</th><th>Functions</th><th>Last seen</th><th>Example</th></tr></thead>
@@ -1805,9 +2010,10 @@ async function counts(){
 async function refresh(newIds,force){
   if(busy)return; busy=true;
   try{
-    if(['patterns','volume','deploys','partners'].includes(tab)){
+    const HEAVY={volume:loadVolume,deploys:loadDeploys,partners:loadPartners,schedules:loadSchedules,inventory:loadInventory,apis:loadApis,digest:loadDigest};
+    if(tab==='patterns'||HEAVY[tab]){
       if(force||Date.now()-lastHeavy>30000){ lastHeavy=Date.now();
-        tab==='patterns'?(sumRows=await getJ('/api/summary?'+params(false)),renderSummary()):tab==='volume'?await loadVolume():tab==='deploys'?await loadDeploys():await loadPartners(); }
+        tab==='patterns'?(sumRows=await getJ('/api/summary?'+params(false)),renderSummary()):await HEAVY[tab](); }
     } else await loadFeed(newIds);
     await counts();
   }catch(e){} busy=false;
@@ -1833,6 +2039,84 @@ async function loadDeploys(){
     || `<tr><td colspan="9" class="empty">No deploys recorded in this range yet. Deploys are detected from now on (plus each function's latest one).</td></tr>`;
   document.querySelectorAll('#depBody tr.click').forEach(tr=>tr.onclick=()=>{const d=rows[tr.dataset.i].deploy;
     $('fProfile').value=d.profile; setGrp(d.log_group); show('all')});
+}
+const SCHED={'not running':'--err','missed runs':'--err','target missing':'--err','last run failed':'--sus','disabled':'--mute','not enough data':'--mute','not checked':'--mute',ok:'--ok'};
+const when=ms=>ms?new Date(ms).toLocaleString(undefined,{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}):'—';
+const until=ms=>{if(!ms)return'';const s=(ms-Date.now())/1000;return s<5400?'in '+Math.round(s/60)+'m':s<129600?'in '+Math.round(s/3600)+'h':'in '+Math.round(s/86400)+'d'};
+async function infraNote(){
+  const st=await getJ('/api/infra/status'+($('fProfile').value?'?profile='+encodeURIComponent($('fProfile').value):''));
+  const pend=st.filter(x=>!x.scanned_at).length, errs=st.flatMap(x=>Object.entries(x.errors).map(([k,v])=>`${x.profile}: ${k} (${v})`));
+  return (pend?`<b>Scanning ${pend} account(s)…</b> `:'')+(errs.length?`<span title="${esc(errs.join('\n'))}" style="color:var(--sus)">${errs.length} sections unavailable (hover)</span>`:'');
+}
+async function loadSchedules(){
+  const p=new URLSearchParams(); if($('fProfile').value)p.set('profile',$('fProfile').value);
+  const [rows,note]=await Promise.all([getJ('/api/infra/schedules?'+p),infraNote()]); $('infraNote').innerHTML=note;
+  const bad=rows.filter(r=>['not running','missed runs','target missing','last run failed'].includes(r.status)).length;
+  $('n-sched').textContent=bad||''; $('count').textContent=`${rows.length} schedules, ${bad} with problems`;
+  $('schBody').innerHTML=rows.map((r,i)=>`<tr class="click" data-i="${i}"><td><span class="chip" style="border-color:var(${SCHED[r.status]||'--mute'});color:var(${SCHED[r.status]||'--mute'})">${esc(r.status)}</span></td>
+    <td>${esc(r.profile)}</td><td class="sig">${esc(r.name)}<br><span class="small">${r.source==='rule'?'EventBridge rule':'Scheduler'}${r.dlq?' · DLQ':''}</span></td>
+    <td class="small">${esc(r.expression)}${r.tz&&r.tz!=='UTC'?'<br>'+esc(r.tz):''}</td><td class="sig small">${esc(r.function||r.state_machine||r.target||'')}</td>
+    <td class="num">${r.expected??'—'}</td><td class="num">${r.actual??'—'}</td><td class="small">${when(r.last_run)}${r.last_run_status?'<br>'+esc(r.last_run_status):''}</td>
+    <td class="small">${when(r.next_run)}<br>${until(r.next_run)}</td><td class="small">${esc(r.detail)}${r.missed&&r.missed.length?'<br>missed: '+r.missed.slice(-3).map(when).join(', '):''}</td></tr>`).join('')
+    ||`<tr><td colspan="10" class="empty">No schedules found yet (the first scan takes a minute after start).</td></tr>`;
+  document.querySelectorAll('#schBody tr.click').forEach(tr=>tr.onclick=()=>{const r=rows[tr.dataset.i]; if(!r.function&&!r.state_machine)return;
+    $('fProfile').value=r.profile; setGrp(r.function?'/aws/lambda/'+r.function:'stepfunctions:'+r.state_machine); show('all')});
+}
+async function loadInventory(){
+  const v=$('invView').value, only=$('invFlagged').checked, p=new URLSearchParams(); if($('fProfile').value)p.set('profile',$('fProfile').value);
+  const RS={deprecated:'--err',soon:'--sus',ok:'--ok',unknown:'--mute',container:'--mute'};
+  if(v==='functions'){
+    let rows=await getJ('/api/infra/functions?'+p); if(only)rows=rows.filter(r=>r.flags.length);
+    $('count').textContent=`${rows.length} functions`;
+    $('invBody').innerHTML=`<table><thead><tr><th>Profile</th><th>Function</th><th>Runtime</th><th>Layers</th><th class="num">Runs 24h</th><th class="num">Avg / max</th><th class="num">Timeout used</th><th class="num">Memory used</th><th class="num">Est. $/30d</th><th>Needs attention</th></tr></thead><tbody>`+
+      rows.map((r,i)=>`<tr class="click" data-i="${i}"><td>${esc(r.profile)}</td><td class="sig">${esc(r.name)}${r.secrets.length?`<br><span class="small">secrets: ${esc(r.secrets.join(', '))}</span>`:''}</td>
+      <td title="${esc(r.runtime_text)}"><span style="color:var(${RS[r.runtime_status]})">${esc(r.runtime||'?')}</span><br><span class="small">${esc(r.runtime_text)}</span></td>
+      <td class="small">${r.layers.map(l=>esc(l.split(':').slice(-2).join(':'))).join('<br>')||'—'}</td><td class="num">${r.invocations_24h}${r.from_logs?'':'<br><span class="small">metrics</span>'}</td>
+      <td class="num small">${r.avg_ms??'—'} / ${r.max_ms??'—'} ms</td><td class="num">${r.timeout_pct??'—'}${r.timeout_pct!=null?'%':''}<br><span class="small">of ${r.timeout}s</span></td>
+      <td class="num">${r.mem_pct??'—'}${r.mem_pct!=null?'%':''}<br><span class="small">${r.mem_used_mb??'—'} of ${r.memory} MB</span></td><td class="num">${r.cost_30d}</td>
+      <td class="small" style="color:var(--err)">${r.flags.map(esc).join('<br>')}${r.outdated_layers.length?'<br><span style="color:var(--mute)">'+esc(r.outdated_layers.join(', '))+'</span>':''}</td></tr>`).join('')+'</tbody></table>';
+    document.querySelectorAll('#invBody tr.click').forEach(tr=>tr.onclick=()=>{const r=rows[tr.dataset.i]; $('fProfile').value=r.profile; setGrp(r.log_group); show('all')});
+  } else if(v==='layers'){
+    let rows=await getJ('/api/infra/layers?'+p); if(only)rows=rows.filter(r=>r.outdated);
+    $('count').textContent=`${rows.length} layer versions in use`;
+    $('invBody').innerHTML=`<table><thead><tr><th>Profile</th><th>Layer</th><th>Version</th><th>Used by</th><th>Packages</th></tr></thead><tbody>`+
+      rows.map(r=>`<tr><td>${esc(r.profile)}</td><td class="sig">${esc(r.layer)}</td><td>${r.version}${r.outdated?` <span class="badge b-spike">latest ${r.latest}</span>`:''}</td>
+      <td class="small">${r.functions.map(esc).join('<br>')}</td><td class="small sig">${Object.entries(r.packages).map(([k,v])=>esc(k)+' '+esc(v)).join(', ')||esc(r.note||'—')}</td></tr>`).join('')+'</tbody></table>';
+  } else if(v==='secrets'){
+    let rows=await getJ('/api/infra/secrets?'+p); if(only)rows=rows.filter(r=>r.flags.length);
+    $('count').textContent=`${rows.length} secrets`;
+    $('invBody').innerHTML=`<table><thead><tr><th>Profile</th><th>Secret</th><th>Last changed</th><th>Last read</th><th>Rotation</th><th>Used by</th><th>Notes</th></tr></thead><tbody>`+
+      rows.map(r=>`<tr><td>${esc(r.profile)}</td><td class="sig">${esc(r.name)}</td><td class="small">${when(r.last_changed)}<br>${r.last_changed?ago(r.last_changed):''}</td>
+      <td class="small">${r.last_accessed?new Date(r.last_accessed).toLocaleDateString():'—'}</td><td class="small">${r.rotation?'on'+(r.next_rotation?' · next '+new Date(r.next_rotation).toLocaleDateString():''):'off'}</td>
+      <td class="small">${r.functions.map(esc).join('<br>')||'<span style="color:var(--mute)">not found in env vars</span>'}</td>
+      <td class="small" style="color:var(--err)">${r.flags.map(esc).join('<br>')}${r.related.length?'<br>'+r.related.map(esc).join('<br>'):''}</td></tr>`).join('')+'</tbody></table>';
+  } else {
+    const rows=await getJ('/api/infra/cost?'+p); const tot=rows.reduce((s,r)=>s+r.cost_30d,0);
+    $('count').textContent=`~$${tot.toFixed(2)} / 30 days`;
+    $('invBody').innerHTML=`<p class="small">Estimate from the last 24h of Lambda runs (billed duration × memory + requests, list prices, no free tier) × 30. Lambda compute only.</p><table><thead><tr><th>Profile</th><th class="num">Est. $/30d</th><th>Most expensive functions</th></tr></thead><tbody>`+
+      rows.map(r=>`<tr><td>${esc(r.profile)}</td><td class="num"><b>${r.cost_30d.toFixed(2)}</b></td><td class="small">${r.top.filter(t=>t.cost_30d>0).slice(0,5).map(t=>`${esc(t.name)} $${t.cost_30d} (${t.invocations_24h} runs/day, ${t.memory} MB, avg ${t.avg_ms} ms)`).join('<br>')||'—'}</td></tr>`).join('')+'</tbody></table>';
+  }
+}
+async function loadApis(){
+  const p=new URLSearchParams(); if($('fProfile').value)p.set('profile',$('fProfile').value);
+  const r=await getJ('/api/infra/apis?'+p); const firing=r.alarms.filter(a=>a.state==='ALARM');
+  $('count').textContent=`${r.apis.length} API stages, ${firing.length} alarms firing`;
+  $('apiBody').innerHTML=`<table><thead><tr><th>Profile</th><th>API</th><th>Stage</th><th class="num">Requests</th><th class="num">4xx</th><th class="num">5xx</th><th class="num">p99</th><th>Routes → Lambda</th><th>Flags</th></tr></thead><tbody>`+
+    r.apis.map(a=>`<tr><td>${esc(a.profile)}</td><td class="sig">${esc(a.api)}<br><span class="small">${esc(a.kind)}</span></td><td>${esc(a.stage)}</td><td class="num">${a.requests}</td><td class="num">${a.e4}</td>
+    <td class="num" style="${a.e5?'color:var(--err);font-weight:700':''}">${a.e5}</td><td class="num">${a.p99_ms!=null?a.p99_ms+' ms':'—'}</td>
+    <td class="small sig">${a.routes.slice(0,6).map(x=>esc(x.route)+(x.function?' → '+esc(x.function):'')).join('<br>')}${a.routes.length>6?`<br>+${a.routes.length-6} more`:''}</td><td class="small" style="color:var(--err)">${a.flags.map(esc).join('<br>')}</td></tr>`).join('')
+    +(r.apis.length?'':'<tr><td colspan="9" class="empty">No API Gateway APIs found.</td></tr>')+`</tbody></table>
+    <h3 style="font-size:14px;margin:18px 0 8px">CloudWatch alarms (${firing.length} firing of ${r.alarms.length})</h3><table><thead><tr><th>State</th><th>Profile</th><th>Alarm</th><th>Metric</th><th>Since</th><th>Reason</th></tr></thead><tbody>`+
+    r.alarms.sort((a,b)=>(a.state==='ALARM'?0:1)-(b.state==='ALARM'?0:1)).slice(0,200).map(a=>`<tr><td><span class="chip" style="${a.state==='ALARM'?'border-color:var(--err);color:var(--err)':''}">${esc(a.state)}</span></td><td>${esc(a.profile)}</td><td class="sig">${esc(a.name)}</td><td class="small">${esc(a.metric)} ${esc(Object.values(a.dims).join(' '))}</td><td class="small">${when(a.since)}</td><td class="small">${esc(a.reason)}</td></tr>`).join('')
+    +(r.alarms.length?'':'<tr><td colspan="6" class="empty">No CloudWatch alarms.</td></tr>')+'</tbody></table>';
+}
+async function loadDigest(){
+  const p=new URLSearchParams(); if($('fProfile').value)p.set('profile',$('fProfile').value);
+  const r=await getJ('/api/digest?'+p); $('count').textContent=`${r.digest.filter(d=>!d.ok).length} clients need attention`;
+  $('digBody').innerHTML=r.digest.map(d=>`<div class="ev ${d.ok?'info':'error'}" style="padding:10px 14px"><div class="meta"><b style="font-size:14px">${esc(d.profile)}</b><span>${d.errors_24h} errors · ${d.hidden_24h} hidden errors · ~$${d.cost_24h} Lambda (24h)</span>${d.ok?'<span style="color:var(--ok)">all quiet</span>':''}</div>`+
+    d.sections.map(s=>`<div style="margin-top:6px"><b class="small" style="color:var(--fg)">${esc(s.title)}</b><ul style="margin:2px 0 0 18px;padding:0;font-size:13px">${s.items.map(i=>`<li>${esc(i)}</li>`).join('')}</ul></div>`).join('')+'</div>').join('')
+    +`<p class="small"><button class="act" id="copyDig">copy as text</button></p>`;
+  $('copyDig').onclick=()=>navigator.clipboard.writeText(r.text);
 }
 async function loadPartners(){
   const p=params(false); p.delete('level'); p.delete('hide_muted');
@@ -1861,6 +2145,7 @@ function show(v){
   tab=v; document.querySelectorAll('.tabs button').forEach(b=>b.classList.toggle('on',b.dataset.v===v));
   const feed=['errors','suspect','all'].includes(v);
   $('v-feed').classList.toggle('on',feed); $('v-patterns').classList.toggle('on',v==='patterns'); $('v-volume').classList.toggle('on',v==='volume'); $('v-deploys').classList.toggle('on',v==='deploys'); $('v-partners').classList.toggle('on',v==='partners');
+  ['schedules','inventory','apis','digest'].forEach(x=>$('v-'+x).classList.toggle('on',v===x));
   $('fLevel').style.display=(v==='all'||v==='patterns')?'':'none';
   if(v==='patterns'&&!$('fLevel').dataset.touched)$('fLevel').value='error,suspect';
   if(v==='all'&&!$('fLevel').dataset.touched)$('fLevel').value='error,suspect,warning,info';
@@ -1910,10 +2195,11 @@ async function status(){
   }catch(e){}
 }
 function onRange(){ const h=$('fHours').value;
-  if(h&&tab!=='deploys') fetch('/api/backfill?hours='+h);   // the deploy list doesn't need old logs
+  if(h&&!['deploys','schedules','inventory','apis','digest'].includes(tab)) fetch('/api/backfill?hours='+h);   // these views don't need old logs
   refresh(null,true); status(); }
 let qt; $('q').oninput=()=>{clearTimeout(qt);qt=setTimeout(()=>refresh(null,true),300)};
-$('fHours').onchange=onRange; $('showMuted').onchange=()=>refresh(null,true); $('pFilter').onchange=renderSummary; $('dWin').onchange=()=>refresh(null,true); $('fProfile').onchange=()=>refresh(null,true);
+$('fHours').onchange=onRange; $('invView').onchange=()=>refresh(null,true); $('invFlagged').onchange=()=>refresh(null,true);
+$('rescan').onclick=async()=>{await getJ('/api/infra/rescan'+($('fProfile').value?'?profile='+encodeURIComponent($('fProfile').value):'')); $('rescan').textContent='scanning… (about a minute)'}; $('showMuted').onchange=()=>refresh(null,true); $('pFilter').onchange=renderSummary; $('dWin').onchange=()=>refresh(null,true); $('fProfile').onchange=()=>refresh(null,true);
 $('fLevel').onchange=()=>{$('fLevel').dataset.touched=1;refresh(null,true)};
 document.querySelectorAll('.tabs button').forEach(b=>b.onclick=()=>show(b.dataset.v));
 document.querySelectorAll('#v-patterns th[data-k]').forEach(th=>th.onclick=()=>{const k=th.dataset.k;sortDir=sortKey===k?-sortDir:-1;sortKey=k;renderSummary()});
@@ -1932,7 +2218,7 @@ $('notifySus').checked=store.get('notifySus')==='1'; $('notifySus').onchange=e=>
   if(u.get('level')){const sel=$('fLevel'); if(![...sel.options].some(o=>o.value===u.get('level'))){const o=document.createElement('option');o.value=u.get('level');o.textContent=u.get('level');sel.appendChild(o)} sel.value=u.get('level'); sel.dataset.touched=1}
   if(u.get('grp'))grpFilter=u.get('grp');
   if(u.get('etype'))sigFilter={etype:u.get('etype'),sig:u.get('sig')||''};
-  renderChips(); show(['errors','suspect','all','patterns','volume','deploys','partners'].includes(u.get('tab'))?u.get('tab'):'errors');})();
+  renderChips(); show(['errors','suspect','all','patterns','volume','deploys','partners','schedules','inventory','apis','digest'].includes(u.get('tab'))?u.get('tab'):'errors');})();
 onRange(); tick(); setInterval(tick,5000); setInterval(status,5000);
 </script></body></html>"""
 
@@ -1998,6 +2284,9 @@ def main():
     print(f"Watching {len(workers)} profile/region pair(s):")
     for w in workers:
         print(f"  - {w.key}")
+        if cfg["infra_scan"]:
+            w.infra = aws_infra.InfraScanner(w.profile, w.region, cfg, store)
+            w.infra.start()
         store.set_status(w.key, ok=False, profile=w.profile, region=w.region, error="starting…")
         w.start()
 
