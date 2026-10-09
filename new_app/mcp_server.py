@@ -13,9 +13,16 @@ Claude Desktop: add to claude_desktop_config.json
     "mcpServers": {"aws-error-feed": {"command": "python",
                    "args": ["C:\\\\path\\\\to\\\\dashboard\\\\mcp_server.py"]}}
 
-It talks to the dashboard at http://127.0.0.1:8765 (override with AWS_ERROR_FEED_URL) and starts
-the dashboard in the background if it isn't running (set AWS_ERROR_FEED_AUTOSTART=0 to disable).
-Read-only: it never changes anything in AWS.
+It talks to the dashboard at http://127.0.0.1:8766, and starts it in the background if it isn't
+running (AWS_ERROR_FEED_AUTOSTART=0 disables that). Read-only: it never changes anything in AWS.
+
+Several machines (e.g. tower runs the dashboard + local model, laptop runs Claude + repos):
+  AWS_ERROR_FEED_URL   = "https://tower.your-tailnet.ts.net,http://127.0.0.1:8766"
+                         tried in order; a local (127.0.0.1) entry is started automatically when
+                         nothing earlier in the list answers - so the laptop still works when the
+                         tower is off.
+  AWS_ERROR_FEED_REPOS = "C:\\path\\to\\your\\repos"   (optional) look up stack-trace code in THIS
+                         machine's repo copies, so file paths / VS Code links point at the laptop.
 """
 import json
 import os
@@ -32,8 +39,12 @@ except ImportError:
     from mcp.server.fastmcp import FastMCP as Server           # mcp 1.x
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-BASE = os.environ.get("AWS_ERROR_FEED_URL", "http://127.0.0.1:8765").rstrip("/")
+URLS = [u.strip().rstrip("/") for u in os.environ.get("AWS_ERROR_FEED_URL", "http://127.0.0.1:8766").split(",")
+        if u.strip()] or ["http://127.0.0.1:8766"]
+BASE = URLS[0]
 AUTOSTART = os.environ.get("AWS_ERROR_FEED_AUTOSTART", "1") != "0"
+REPOS = os.environ.get("AWS_ERROR_FEED_REPOS") or None
+_active = {"url": None, "at": 0.0}
 MAX_OUT = 60_000          # keep tool results a sensible size for the conversation
 
 INSTRUCTIONS = """\
@@ -60,6 +71,17 @@ Partner problems (expired tokens, 429s) across clients: partner_api_health.
 Infrastructure: schedules_health (jobs that silently stopped), inventory / upgrade_checklist
 (runtimes, layers, packages, timeout/memory headroom), apis_and_alarms, secrets_overview (metadata
 only; useful when auth errors start), cost_estimate, daily_digest (morning summary per client).
+
+Big picture: clients_status (red/amber/green per client). Record questions ("what happened to
+deal 991?"): trace_record. Run-level: list_runs / get_run; did_nothing_check for syncs that ran
+but processed nothing. Fixing code: locate_code turns an error's stack trace into repo file paths
+with the code around the failing line. Team notes on patterns appear as "NOTE from the team" -
+respect them (e.g. don't re-investigate known, accepted issues). client_report = weekly report.
+
+Saving context: lines tagged LOCAL-MODEL TRIAGE come from a small model on the user's machine -
+use them to prioritise, but verify before acting. For "what's wrong with X" start with investigate
+(one call). To understand many lines, use summarize_logs (the local model reads them) instead of
+pulling raw lines with get_log_lines.
 
 Good workflow: error_overview -> list_error_patterns for the project -> get_log_lines for a
 pattern -> get_line_context on one line to see what the code printed just before it -> find the
@@ -92,10 +114,45 @@ def _start_dashboard():
     return True
 
 
+def _is_local(u):
+    return urllib.parse.urlparse(u).hostname in ("127.0.0.1", "localhost", "::1")
+
+
+def _reachable(u, timeout=3):
+    try:
+        urllib.request.urlopen(f"{u}/api/status", timeout=timeout).read()
+        return True
+    except Exception:
+        return False
+
+
+def base():
+    """First dashboard in AWS_ERROR_FEED_URL that answers (re-checked every 60 s); if none does,
+    start the local copy (when one is listed and autostart is on)."""
+    global BASE
+    if _active["url"] and time.time() - _active["at"] < 60:
+        return _active["url"]
+    for u in URLS:
+        if _reachable(u):
+            _active.update(url=u, at=time.time())
+            BASE = u
+            return u
+    for u in URLS:
+        if _is_local(u) and AUTOSTART and _start_dashboard():
+            for _ in range(30):
+                time.sleep(0.5)
+                if _reachable(u, 2):
+                    _active.update(url=u, at=time.time())
+                    BASE = u
+                    return u
+    raise FeedDown("No AWS Error Feed dashboard is reachable (tried: " + ", ".join(URLS) + "). "
+                   f"Start it with `python aws_error_feed.py` in {HERE} or check the tower / Tailscale.")
+
+
 def api(path, **params):
     q = urllib.parse.urlencode({k: v for k, v in params.items() if v not in (None, "")})
-    url = f"{BASE}{path}?{q}"
     for attempt in range(2):
+        url = f"{base()}{path}?{q}"
         try:
             with urllib.request.urlopen(url, timeout=40) as r:
                 return json.loads(r.read().decode("utf-8"))
@@ -107,18 +164,33 @@ def api(path, **params):
         except (urllib.error.URLError, ConnectionError) as ex:
             if isinstance(getattr(ex, "reason", None), TimeoutError):
                 raise FeedDown(f"The dashboard at {BASE} didn't answer within 40 s - restart it.") from None
-            if attempt == 0 and AUTOSTART and _start_dashboard():
-                for _ in range(30):                     # give it up to ~15 s to come up
-                    time.sleep(0.5)
-                    try:
-                        urllib.request.urlopen(f"{BASE}/api/status", timeout=2).read()
-                        break
-                    except Exception:
-                        continue
+            if attempt == 0:
+                _active["at"] = 0                       # that dashboard went away: pick again
                 continue
             raise FeedDown(
                 f"The AWS Error Feed dashboard isn't reachable at {BASE} ({ex}). Start it with "
                 f"`python aws_error_feed.py` in {HERE}.") from None
+
+
+_code_index = {}
+
+
+def local_code(r):
+    """Re-resolve stack-trace frames against THIS machine's repos (AWS_ERROR_FEED_REPOS)."""
+    if not REPOS or not r.get("function") or not r.get("message"):
+        return r
+    try:
+        sys.path.insert(0, HERE)
+        import aws_ops
+        ci = _code_index.get("ci") or aws_ops.CodeIndex(REPOS, os.path.join(HERE, "repos.json"))
+        _code_index["ci"] = ci
+        ci.build([r["function"]])
+        if ci.map.get(r["function"]):
+            return {**r, "mapped": ci.map[r["function"]], "frames": ci.locate(r["function"], r["message"]),
+                    "local": True}
+    except Exception:
+        pass
+    return r
 
 
 def link(**params):
@@ -144,7 +216,18 @@ def flags(g):
         f.append(f"SPIKE x{g.get('spike_ratio')} vs 7-day avg")
     if g.get("mute") and not g.get("regression"):
         f.append(g["mute"].upper())
-    return (" [" + ", ".join(f) + "]") if f else ""
+    if g.get("below_threshold"):
+        f.append(f"below your ignore threshold of {g.get('ignore_below')}/day")
+    out = (" [" + ", ".join(f) + "]") if f else ""
+    if g.get("note"):
+        out += f"\n    NOTE from the team: {g['note']}"
+    a = g.get("ai")
+    if a:
+        out += (f"\n    LOCAL-MODEL TRIAGE ({a.get('model')}, {round(100 * (a.get('confidence') or 0))}% sure, unverified): "
+                f"{a['verdict']} / {a['category']} - {a['summary']}"
+                + (f" Cause: {a['likely_cause']}" if a.get("likely_cause") else "")
+                + (f" Next: {a['next_step']}" if a.get("next_step") else ""))
+    return out
 
 
 def top(d, n=4):
@@ -233,7 +316,7 @@ def error_overview(hours: float = 24, profile: str = "") -> str:
     for v in vol:
         lines_per[v["profile"]] = lines_per.get(v["profile"], 0) + v["total"]
     out = [note + f"Last {hours}h — dashboard: {link(tab='patterns', hours=int(hours), profile=profile, level='error,suspect')}"]
-    hot = [g for g in pats if g.get("regression") or g.get("is_new") or g.get("is_spike")]
+    hot = [g for g in pats if (g.get("regression") or g.get("is_new") or g.get("is_spike")) and not g.get("below_threshold")]
     if hot:
         out.append("\n## Needs attention first (regressions / new / spiking)")
         for g in hot[:10]:
@@ -246,8 +329,8 @@ def error_overview(hours: float = 24, profile: str = "") -> str:
         out.append(f"\n## {prof}: {b['error']} errors, {b['suspect']} hidden errors "
                    f"({lines_per.get(prof, 0)} log lines total)")
         for n, g in sorted(b["pats"], key=lambda x: -x[0])[:5]:
-            out.append(f"- [{g['level']}] {g['etype']}: {g['sig'][:140]}{flags(g)} — {n}× in "
-                       f"{top(g['log_groups'], 2)}; last {t(g['last_seen'])}")
+            out.append(f"- [{g['level']}] {g['etype']}: {g['sig'][:140]} — {n}× in "
+                       f"{top(g['log_groups'], 2)}; last {t(g['last_seen'])}{flags(g)}")
     quiet = sorted(set(lines_per) - set(by))
     if quiet:
         out.append(f"\nNo errors: {', '.join(quiet)}")
@@ -610,6 +693,283 @@ def rescan_infrastructure(profile: str = "") -> str:
     15 minutes) - e.g. right after deploying or changing a schedule. Takes about a minute."""
     api("/api/infra/rescan", profile=profile)
     return "Re-scan started; results update in about a minute."
+
+
+def _find_group(function, profile):
+    rows = api("/api/ops/groups", profile=profile, hours=72)
+    m = [r for r in rows if r["function"] == function or r["group"] == function or (r["function"] or "").endswith(function)]
+    return m
+
+
+@mcp.tool()
+@guard
+def clients_status() -> str:
+    """Start here for "how are my clients doing?" or "did my push reduce errors?": every client with
+    errors / hidden errors for the last 1h, 6h and 24h vs the period before each, every deploy in the
+    last 24h with its before/after error rate, red / amber / green status and
+    the reasons (jobs not running, regressions, alarms, API 5xx, syncs that did nothing, new or
+    spiking errors, partner API problems, deploy results, limits, deprecated runtimes), plus errors,
+    runs, records and cost for the last 24h."""
+    cards = api("/api/ops/clients")
+    out = [f"Dashboard: {link(tab='clients')}"]
+    for c in cards:
+        trend = lambda a, b: "" if b is None else (" (up from %d)" % b if a > b * 1.2 and a - b > 2 else
+                                                   " (down from %d)" % b if a < b * 0.8 and b - a > 2 else "")
+        out.append(f"\n## {c['profile']}: {c['status'].upper()}")
+        out.append(f"errors 24h {c['errors_24h']}{trend(c['errors_24h'], c['errors_prev'])}, hidden {c['hidden_24h']}, "
+                   f"runs {c['runs_24h']} ({c['failed_runs_24h']} failed), records {c['records_24h']}"
+                   + (f" (usually ~{c['records_usual']}/day)" if c.get("records_usual") else "")
+                   + f", schedules {c['sched_ok']}/{c['sched_total']} ok, ~${c['cost_30d']}/30d"
+                   + (f", last deploy {c['last_deploy']['function']} {t(c['last_deploy']['at'])}: {c['last_deploy']['verdict']}"
+                      if c.get("last_deploy") else ""))
+        w = c.get("windows") or {}
+        if w:
+            def pc(cur, prev):
+                if prev is None:
+                    return ""
+                return f" (prev {prev})"
+            out.append("errors / hidden: " + " | ".join(
+                f"last {k}: {w[k]['errors']}{pc(w[k]['errors'], w[k]['prev_errors'])} / {w[k]['hidden']}"
+                f"{pc(w[k]['hidden'], w[k]['prev_hidden'])}" for k in ("1h", "6h", "24h")))
+        for d in c.get("recent_deploys") or []:
+            rate = (lambda x: f"{100 * x:.1f}%/run" if d["rate_per"] == "invocation" else f"{x:.1f}/h")
+            out.append(f"  deploy {d['function']} {t(d['at'])}: {d['verdict']}"
+                       + (f" (errors+hidden {rate(d['rate_before'])} -> {rate(d['rate_after'])}, "
+                          f"{d['window_hours']}h before vs {d['after_hours']}h after)" if d["before_loaded"] else ""))
+        out += [f"- {r}" for r in c["reasons"][:10]]
+    return finish(out)
+
+
+@mcp.tool()
+@guard
+def trace_record(record_id: str = "", profile: str = "", days: float = 7, include_step_functions: bool = True,
+                 job_id: str = "") -> str:
+    """Follow one record (HubSpot deal id, NetSuite id, email, order number...) through the
+    integrations: every log line, Lambda run and Step Functions execution (input/output) mentioning
+    it, as a timeline. Searches CloudWatch directly for just that ID up to `days` back. Narrow with
+    profile when you know the client - much faster. Takes 10s to a few minutes; if it's still
+    running, call again with the returned job_id."""
+    if not job_id:
+        if not record_id.strip():
+            return "Give a record_id (or a job_id from an earlier call)."
+        job_id = api("/api/ops/trace/start", term=record_id.strip(), profile=profile, days=days,
+                     sfn=1 if include_step_functions else 0)["id"]
+    j = {}
+    for _ in range(30):
+        j = api("/api/ops/trace", id=job_id)
+        if j.get("status") != "running":
+            break
+        time.sleep(1)
+    if j.get("error"):
+        return j["error"]
+    out = [f"Trace of \"{j['term']}\" over {j['days']:g} days — {j['status'].upper()}: {len(j['hits'])} lines in "
+           f"{len(j['timeline'])} runs, {len(j['sfn'])} Step Functions executions. job_id={job_id}",
+           f"Dashboard: {link(tab='trace', trace=j['term'], profile=profile)}"]
+    if j["status"] == "running":
+        out.append(f"Still searching ({j['accounts_done']}/{j['accounts']} accounts, {j['groups_searched']} log groups). "
+                   f"Call trace_record(job_id=\"{job_id}\") again for the rest.")
+    for e in j["sfn"]:
+        out.append(f"- STEP FUNCTIONS {t(e['start'])} | {e['profile']} | {e['state_machine']}/{e['execution']} | {e['status']}"
+                   f" | id in {'input' if e['in_input'] else 'output'} | {e['arn']}")
+    for g in j["timeline"]:
+        out.append(f"\n### {t(g['start'])} | {g['profile']} | {g['group']} | {g['outcome']} | stream {g['stream']}")
+        for l in g["lines"][:15]:
+            out.append(f"  {t(l['ts'])} [{l['level']}] {cap(l['message'], 600)}  (event_id: {l['id']})")
+        if len(g["lines"]) > 15:
+            out.append(f"  ... {len(g['lines']) - 15} more lines")
+    if j.get("partial") or j.get("errors"):
+        out.append("\nNotes: " + "; ".join((j.get("partial") or []) + (j.get("errors") or []))[:1500])
+    return finish(out)
+
+
+@mcp.tool()
+@guard
+def list_runs(function: str, profile: str = "", hours: float = 24, only_problems: bool = False) -> str:
+    """A Lambda's individual runs (newest first): end time, duration, records processed, errors,
+    hidden errors, memory, outcome (ok / failed / timeout / hidden errors / no records) and the first
+    problem line. Use get_run to read one run's full log."""
+    m = _find_group(function, profile)
+    if not m:
+        return f"No Lambda runs loaded for '{function}'{' in ' + profile if profile else ''} (check the name / profile)."
+    if len(m) > 1 and not profile:
+        return "That function exists in several accounts: " + ", ".join(sorted({x['profile'] for x in m})) + ". Pass profile."
+    g = m[0]
+    runs = api("/api/ops/runs", profile=g["profile"], region=g["region"], grp=g["group"], hours=hours)
+    if only_problems:
+        runs = [r for r in runs if r["outcome"] != "ok"]
+    out = [f"{g['profile']} | {g['group']}: {len(runs)} runs in {hours:g}h — dashboard: {link(tab='runs', profile=g['profile'])}"]
+    for r in runs[:80]:
+        out.append(f"- {t(r['end'])} | {r['duration_ms'] / 1000:.1f}s | records {r['records'] if r['records'] is not None else '-'} | "
+                   f"errors {r['errors']} hidden {r['hidden']} | {r['mem_used']}/{r['memory']} MB | {r['outcome'].upper()}"
+                   f"{' (cold start)' if r['cold_start'] else ''} | request_id {r['request_id']}"
+                   + (f"\n    first problem: {r['first_problem']['line'][:250]}" if r.get("first_problem") else ""))
+    return finish(out)
+
+
+@mcp.tool()
+@guard
+def get_run(function: str, request_id: str, profile: str = "") -> str:
+    """Everything one Lambda run logged, in order (request_id from list_runs) - the clearest way to
+    read what happened inside a single failing or empty run."""
+    m = _find_group(function, profile)
+    if not m:
+        return f"No Lambda runs loaded for '{function}'."
+    g = m[0]
+    r = api("/api/ops/run", profile=g["profile"], region=g["region"], grp=g["group"], request_id=request_id)
+    if not r:
+        return "Run not found in the loaded logs (it may be older than the 24-hour cache)."
+    out = [f"{g['profile']} | {g['group']} | request {request_id} | ended {t(r['end'])} | {r['duration_ms'] / 1000:.1f}s | "
+           f"{r['outcome'].upper()} | records {r['records']} | {r['mem_used']}/{r['memory']} MB | stream {r['stream']}"]
+    for l in r.get("lines_list", []):
+        out.append(f"{t(l['ts'])} [{l['level']}] {cap(l['message'], 2500)}")
+    return finish(out)
+
+
+@mcp.tool()
+@guard
+def did_nothing_check(profile: str = "") -> str:
+    """Syncs that ran without erroring but processed 0 records or far fewer than usual (from lines
+    like "Processed 25 deals"), and log groups that suddenly went quiet or silent compared with the
+    previous week (usually the source system stopped sending data)."""
+    rows = api("/api/ops/nothing", profile=profile)
+    out = [f"{len(rows)} findings — dashboard: {link(tab='runs', profile=profile)}"]
+    out += [f"- {d['profile']} | {d['group']} | {d['kind'].upper()}: {d['detail']}" for d in rows] or ["- nothing suspicious"]
+    return finish(out)
+
+
+@mcp.tool()
+@guard
+def locate_code(event_id: str) -> str:
+    """For an error line (event_id from get_log_lines), the files and lines in YOUR repos from its
+    stack trace: local path, VS Code link, GitHub link and the surrounding code. Functions are
+    matched to repo folders automatically (repos.json next to the dashboard can override)."""
+    r = local_code(api("/api/ops/code", id=event_id))
+    if r.get("error"):
+        return r["error"]
+    if not r.get("mapped"):
+        return (f"No repo folder found for function '{r.get('function')}'. Add it to repos.json next to the dashboard: "
+                f'{{"{r.get("function")}": "C:\\path\\to\\its\\folder"}}')
+    out = [f"Function {r['function']} -> repo {r['mapped']['repo']} ({r['mapped']['how']})"]
+    own = [f for f in r["frames"] if f.get("path")]
+    for f in own:
+        out += [f"\n{f['path']}:{f['line']} in {f['func'] or '?'}" + (f"  ({f['github']})" if f.get("github") else ""),
+                "```", f.get("snippet") or "", "```"]
+    if not own:
+        out.append("No stack-trace frames from your own code in this line (library-only or no traceback).")
+    return finish(out)
+
+
+@mcp.tool()
+@guard
+def add_note(error_type: str, signature: str, note: str, profile: str = "", ignore_below_per_day: int = 0) -> str:
+    """Attach a team note to an error pattern ("known HubSpot rate limit, retry handles it") - shown
+    in the dashboard and in every tool output for that pattern. ignore_below_per_day > 0 keeps it out
+    of the 'needs attention' lists while it stays under that daily count. Empty note removes it.
+    Only add notes when the user asks."""
+    api("/api/ops/note", etype=error_type, sig=signature, profile=profile, note=note,
+        ignore_below=ignore_below_per_day or "")
+    return "Note saved." if note or ignore_below_per_day else "Note removed."
+
+
+@mcp.tool()
+@guard
+def client_report(profile: str, days: float = 7) -> str:
+    """Client-facing health report for one client over `days`: Lambda and workflow success rates
+    (from CloudWatch metrics), records processed, errors vs the previous period, issues resolved,
+    open items, scheduled-job problems, changes deployed, third-party service issues and recommended
+    maintenance. Returned as markdown - offer to turn it into a doc. Printable version via the link."""
+    r = api("/api/ops/report", profile=profile, days=days)
+    if r.get("error"):
+        return r["error"]
+    return finish([r["markdown"], f"\nPrintable / PDF: {base()}/report?profile={urllib.parse.quote(profile)}&days={days:g}"])
+
+
+def _wait_job(jid, seconds=45):
+    j = {}
+    for _ in range(int(seconds / 1.5)):
+        j = api("/api/ai/job", id=jid)
+        if j.get("status") != "running":
+            return j
+        time.sleep(1.5)
+    return j
+
+
+@mcp.tool()
+@guard
+def summarize_logs(question: str = "", profile: str = "", level: str = "", log_group: str = "",
+                   log_group_prefix: str = "", search: str = "", error_type: str = "", signature: str = "",
+                   hours: float = 24, limit: int = 300, job_id: str = "") -> str:
+    """Have the LOCAL model (on the user's machine, free) read up to `limit` matching log lines and
+    return a short summary / answer to `question`, instead of pulling all the raw lines into this
+    conversation. Prefer this over get_log_lines when you need the gist of many lines; use
+    get_log_lines / get_line_context only for the few exact lines you need. Local-model output can
+    be wrong - verify anything important against the lines. If it's still working, call again with job_id."""
+    if not job_id:
+        r = api("/api/ai/summarize", kind="lines", question=question, profile=profile, level=level, grp=log_group,
+                grp_prefix=log_group_prefix, q=search, etype=error_type, sig=signature if error_type else "",
+                hours=hours, limit=max(10, min(limit, 800)))
+        if r.get("error"):
+            return r["error"] + " (Use get_log_lines instead.)"
+        job_id, n, ids = r["id"], r["lines"], r.get("event_ids") or []
+    else:
+        n, ids = None, []
+    j = _wait_job(job_id)
+    if j.get("status") == "running":
+        return f"The local model is still reading. Call summarize_logs(job_id=\"{job_id}\") again in ~30s."
+    if j.get("error"):
+        return f"Local model failed: {j['error']}. Use get_log_lines instead."
+    return finish([f"Local-model summary{f' of {n} lines' if n else ''} (verify key facts):", j.get("answer") or "",
+                   *([f"\nKey error lines (event_id for get_line_context / locate_code): {', '.join(ids)}"] if ids else [])])
+
+
+@mcp.tool()
+@guard
+def investigate(profile: str, function: str = "", error_type: str = "", signature: str = "", hours: float = 24) -> str:
+    """One call instead of four: for a client (optionally one function or one error pattern) returns
+    the top problem patterns with team notes and local-model triage, the full latest example, what the
+    function logged just before it, where it is in the code (if the repo is mapped), and the function's
+    recent run outcomes. Start here when asked "what's wrong with <client/function>?"."""
+    prefix = f"/aws/lambda/{function}" if function and not function.startswith("/") else function
+    rows = api("/api/summary", hours=hours, profile=profile, level="error,suspect", hide_muted=1,
+               grp_prefix=prefix or "", etype=error_type, sig=signature if error_type else "")
+    out = [f"Investigation: {profile}{' / ' + function if function else ''}, last {hours:g}h — "
+           f"dashboard: {link(tab='patterns', profile=profile, hours=int(hours))}"]
+    if not rows:
+        out.append("No errors or hidden errors (muted / fixed patterns excluded).")
+    for i, g in enumerate(rows[:3], 1):
+        out.append(f"\n## {i}. [{g['level']}] {g['etype']}: {g['sig'][:160]} — {g['count']}x{flags(g)}")
+        out.append(f"log groups: {top(g['log_groups'], 3)} | first {t(g['first_seen'])}, last {t(g['last_seen'])}")
+        if i > 2:
+            continue
+        ev = api("/api/events", profile=profile, etype=g["etype"], sig=g["sig"], hours=hours, limit=1)["events"]
+        if not ev:
+            continue
+        e = ev[0]
+        out += [f"latest ({t(e['ts'])}, event_id {e['id']}):", "```", cap(e["message"], 2000), "```"]
+        ctx = api("/api/context", id=e["id"], before=2, after=0.5)
+        before = [x for x in ctx.get("lines", []) if x["id"] != e["id"]][-12:]
+        if before:
+            out.append("logged just before:")
+            out += [f"  {t(x['ts'])} [{x['level']}] {cap(x['message'], 300)}" for x in before]
+        code = local_code(api("/api/ops/code", id=e["id"]))
+        own = [f for f in code.get("frames", []) if f.get("path")]
+        if own:
+            f = own[-1]
+            out += [f"code: {f['path']}:{f['line']}", "```", f.get("snippet") or "", "```"]
+    groups = api("/api/ops/groups", profile=profile, hours=hours)
+    if function:
+        groups = [g for g in groups if g["function"] == function]
+    elif rows:
+        top_groups = list(rows[0]["log_groups"])[:1]
+        groups = [g for g in groups if g["group"] in top_groups]
+    for g in groups[:1]:
+        runs = api("/api/ops/runs", profile=g["profile"], region=g["region"], grp=g["group"], hours=hours)
+        if runs:
+            from collections import Counter
+            oc = Counter(r["outcome"] for r in runs)
+            out.append(f"\nruns of {g['function']} ({hours:g}h): {len(runs)} total - " + ", ".join(f"{k} {v}" for k, v in oc.most_common())
+                       + f"; latest {t(runs[0]['end'])} {runs[0]['outcome']}, records {runs[0]['records']}")
+    return finish(out)
 
 
 def _rate(x, per):

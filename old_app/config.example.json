@@ -1,0 +1,19 @@
+{
+  "profiles": [],
+  "exclude_profiles": [],
+  "regions": [],
+  "log_group_prefixes": [],
+  "exclude_log_group_substrings": [],
+  "capture_all_logs": true,
+  "skip_platform_lines": ["START", "END", "INIT_START"],
+  "keep_hours": 24,
+  "step_functions": true,
+  "sfn_inspect_succeeded": true,
+  "sfn_stuck_minutes": 60,
+  "track_deploys": true,
+  "infra_scan": true,
+  "infra_refresh_minutes": 15,
+  "infra_scan_layer_packages": true,
+  "poll_seconds": 30,
+  "lookback_minutes": 60
+}

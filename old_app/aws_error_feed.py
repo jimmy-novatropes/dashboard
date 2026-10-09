@@ -60,6 +60,8 @@ except ImportError:
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import aws_infra  # noqa: E402  (infrastructure scan: schedules, layers, secrets, APIs, alarms)
+import aws_ops  # noqa: E402    (runs, did-nothing, trace, code links, notes, reports, clients)
+import aws_local  # noqa: E402  (optional local model via Ollama: triage + summaries)
 DAY_MS = 86_400_000
 LEVELS = ("error", "suspect", "warning", "info", "platform")
 
@@ -102,6 +104,16 @@ DEFAULTS = {
     "sfn_poll_seconds": 120,
     # Deploy tracking (lambda:ListFunctions). A deploy = the function's code fingerprint changed.
     "track_deploys": True,
+    # Code links: folder holding your repos (default: the folder this dashboard folder sits in),
+    # plus optional manual overrides in repos.json: {"function-name": "C:\\path\\to\\its\\folder"}
+    "repos_root": None,
+    "repos_file": "repos.json",
+    # Extra regexes (one capture group = the number) for "N records processed" lines
+    "record_count_patterns": [],
+    # Optional local model (Ollama) that triages errors and summarises logs on your machine,
+    # so Claude gets short answers instead of raw lines. Ignored if Ollama isn't running.
+    "local_llm": {"enabled": False, "url": "http://localhost:11434", "model": "gpt-oss:20b",
+                  "num_ctx": 16384, "triage_every_minutes": 5, "triage_per_cycle": 6, "triage_top_n": 8},
     # Infrastructure scan (schedules, Lambda config + layers, secrets metadata, API Gateway, alarms)
     "infra_scan": True,
     "infra_refresh_minutes": 15,
@@ -603,7 +615,16 @@ class Store:
                 m = next((v for k, v in mutes.items() if k[0] == g["etype"] and k[1] == g["sig"]), None)
             g["mute"] = m["status"] if m else None
             g["regression"] = bool(m and m["status"] == "fixed" and g["last_seen"] > m["at"])
-        return rows
+        return aws_local.attach_triage(self, aws_ops.attach_notes(self, rows, profile), profile)
+
+    def pattern_totals(self, profile, since_ms, until_ms):
+        """Error / hidden-error counts per pattern from the hourly baseline (kept 30 days)."""
+        with self.lock:
+            return {(r[0], r[1]): {"level": r[2], "n": r[3], "first": r[4] * 3_600_000, "last": r[5] * 3_600_000 + 3_599_999}
+                    for r in self.db.execute(
+                        "SELECT etype, sig, MAX(level), SUM(n), MIN(hour), MAX(hour) FROM pattern_hours "
+                        "WHERE profile = ? AND hour >= ? AND hour <= ? GROUP BY etype, sig",
+                        (profile, since_ms // 3_600_000, until_ms // 3_600_000))}
 
     def summary(self, f):
         w, p = self.where(f)
@@ -944,7 +965,10 @@ def build_digest(store, workers, cfg, profile=None):
         add("New since yesterday", [f"{g['etype']}: {g['sig'][:120]} ({g['count']}x, {', '.join(list(g['log_groups'])[:2])})"
                                     for g in pats if g.get("is_new")])
         add("Spiking", [f"{g['etype']}: {g['sig'][:120]} ({g['last24']} today vs {g['prev7_daily_avg']}/day)"
-                        for g in pats if g.get("is_spike")])
+                        for g in pats if g.get("is_spike") and not g.get("below_threshold")])
+        nothing = [d for w, snap, stats in views for d in aws_ops.did_nothing(store, snap, w.profile, w.region, now, EXTRA_RX)]
+        add("Ran but did nothing / went quiet", [f"{aws_ops.function_from_group(d['group']) or d['group']}: {d['detail']}"
+                                                 for d in nothing])
         tot_e = sum(g["count"] for g in pats if g["level"] == "error")
         tot_s = sum(g["count"] for g in pats if g["level"] == "suspect")
         add("Top errors (24h)", [f"{g['etype']}: {g['sig'][:120]} - {g['count']}x" for g in pats[:3]])
@@ -988,6 +1012,135 @@ def digest_text(dg):
     if quiet:
         lines.append("All quiet: " + ", ".join(quiet))
     return "\n".join(lines)
+
+
+EXTRA_RX = []
+_clients_cache = {"at": 0, "data": None}
+
+
+def ops_helpers(store, workers, cfg):
+    now = int(time.time() * 1000)
+
+    def schedules(profile):
+        return [r for w, snap, st in infra_views(store, workers, profile)
+                for r in aws_infra.schedule_health(snap, st, now, w.covered_from)]
+
+    def functions(profile):
+        return [r for w, snap, st in infra_views(store, workers, profile) for r in aws_infra.function_health(snap, st, now)]
+
+    def deploys(profile, since):
+        out = []
+        for d in store.list_deploys(profile, since):
+            out.append({**d, "verdict": deploy_impact(store, d, 24)["verdict"]})
+        return out
+
+    return {"infra": store.get_infra, "pattern_totals": store.pattern_totals, "mutes": store.list_mutes,
+            "schedules": schedules, "functions": functions, "deploys": deploys,
+            "partners": lambda p: partner_health(store, {"hours": 24, "profile": p}, cfg["partner_services"],
+                                                 cfg.get("partner_function_hints"))}
+
+
+def level_counts_window(store, profile, start, end):
+    with store.lock:
+        rows = store.db.execute("SELECT level, COUNT(*) FROM events WHERE profile = ? AND ts >= ? AND ts < ? "
+                                "AND level IN ('error','suspect') GROUP BY level", (profile, start, end)).fetchall()
+    d = dict(rows)
+    return {"errors": d.get("error", 0), "hidden": d.get("suspect", 0)}
+
+
+def error_windows(store, profile, data_from, now):
+    """Errors / hidden errors in the last 1h, 6h, 24h, each with the window just before it.
+    Uses the loaded lines when they cover the window, else the hourly counts (kept 30 days)."""
+    out = {}
+    for label, hrs in (("1h", 1), ("6h", 6), ("24h", 24)):
+        w = hrs * 3_600_000
+        cur = level_counts_window(store, profile, now - w, now)
+        if now - 2 * w >= data_from:
+            prev = level_counts_window(store, profile, now - 2 * w, now - w)
+        else:
+            pt = store.pattern_totals(profile, now - 2 * w, now - w - 1)
+            prev = ({"errors": sum(v["n"] for v in pt.values() if v["level"] == "error"),
+                     "hidden": sum(v["n"] for v in pt.values() if v["level"] == "suspect")} if pt else None)
+        out[label] = {**cur, "prev_errors": prev["errors"] if prev else None,
+                      "prev_hidden": prev["hidden"] if prev else None}
+    return out
+
+
+def clients_overview(store, workers, cfg, max_age=60):
+    if _clients_cache["data"] is not None and time.time() - _clients_cache["at"] < max_age:
+        return _clients_cache["data"]
+    now = int(time.time() * 1000)
+    status = store.get_status()
+    profiles = sorted({w.profile for w in workers})
+    cards = []
+    for prof in profiles:
+        views = infra_views(store, workers, prof)
+        conn_err = [status.get(w.key, {}).get("error") for w, _, _ in views if not status.get(w.key, {}).get("ok")]
+        sched, fns, alarms, api5, nothing = [], [], [], [], []
+        for w, snap, st in views:
+            sched += aws_infra.schedule_health(snap, st, now, w.covered_from)
+            fns += aws_infra.function_health(snap, st, now)
+            alarms += [a for a in snap.get("alarms", []) if a["state"] == "ALARM"]
+            api5 += [a for a in aws_infra.api_report(snap) if a["e5"]]
+            nothing += aws_ops.did_nothing(store, snap, w.profile, w.region, now, EXTRA_RX)
+        pats = store.annotate(store.summary({"hours": 24, "profile": prof, "level": "error,suspect", "hide_muted": "1"}), prof)
+        cur, prev = store.pattern_totals(prof, now - DAY_MS, now), store.pattern_totals(prof, now - 2 * DAY_MS, now - DAY_MS)
+        rt = aws_ops.run_totals(store, prof, now - DAY_MS, now)
+        hist = aws_ops.run_totals(store, prof, now - 8 * DAY_MS, now - DAY_MS)
+        hist_hours = max((now - DAY_MS) // 3_600_000 - min((v["from_hour"] for v in hist.values() if v["from_hour"]),
+                                                          default=(now - DAY_MS) // 3_600_000), 0)
+        data_from = max((w.covered_from for w, _, _ in views), default=now)
+        cov = {(w.profile, w.region): w.covered_from for w, _, _ in views}
+
+        def impact(d, win=6):
+            """Before/after for one deploy; 'before' must actually be loaded or the verdict is unknown."""
+            imp = deploy_impact(store, d, win)
+            loaded = cov.get((d["profile"], d["region"]), now) <= d["deployed_at"] - win * 3_600_000
+            return {"function": d["function"], "at": d["deployed_at"], "label": d["label"], "kind": d["kind"],
+                    "verdict": imp["verdict"] if loaded else "before not loaded", "before_loaded": loaded,
+                    "before": imp["before"]["error"] + imp["before"]["suspect"],
+                    "after": imp["after"]["error"] + imp["after"]["suspect"],
+                    "rate_per": imp["rate_per"], "rate_before": imp["rate_before"], "rate_after": imp["rate_after"],
+                    "after_hours": imp["after_hours"], "window_hours": win}
+        deps = store.list_deploys(prof, now - 7 * DAY_MS)
+        latest = {}
+        for d in deps:                                   # newest first: keep each function's latest deploy
+            latest.setdefault(d["function"], d)
+        last_dep = impact(deps[0]) if deps else None
+        recent = [impact(d) for d in latest.values() if d["deployed_at"] >= now - DAY_MS]
+        bad_deps = [x for x in recent if x["verdict"] in ("worse", "new errors")]
+        parts = {
+            "connected": not conn_err, "connection_error": (conn_err or [""])[0],
+            "sched_bad": [x for x in sched if x["status"] in ("not running", "missed runs", "target missing")],
+            "last_failed": [x for x in sched if x["status"] == "last run failed"],
+            "regressions": [g for g in pats if g.get("regression")],
+            "new": [g for g in pats if g.get("is_new") and not g.get("below_threshold")],
+            "spikes": [g for g in pats if g.get("is_spike")],
+            "alarms": alarms, "api5xx": api5, "nothing": nothing, "bad_deploys": bad_deps,
+            "partners": partner_health(store, {"hours": 6, "profile": prof}, cfg["partner_services"],
+                                       cfg.get("partner_function_hints"))[:3],
+            "near_limits": sum(1 for f in fns if any(("timeout" in x or "memory" in x) for x in f["flags"])),
+            "deprecated": sum(1 for f in fns if f["runtime_status"] == "deprecated"),
+            "errors_24h": sum(v["n"] for v in cur.values() if v["level"] == "error"),
+            "errors_prev": sum(v["n"] for v in prev.values() if v["level"] == "error"),
+            "hidden_24h": sum(v["n"] for v in cur.values() if v["level"] == "suspect"),
+            "hidden_prev": sum(v["n"] for v in prev.values() if v["level"] == "suspect"),
+            "runs_24h": sum(v["runs"] for v in rt.values()), "failed_runs_24h": sum(v["failed"] for v in rt.values()),
+            "records_24h": sum(v["records"] for v in rt.values()),
+            "records_usual": round(sum(v["records"] for v in hist.values()) / (hist_hours / 24)) if hist_hours >= 48 else None,
+            "sched_ok": sum(1 for x in sched if x["status"] == "ok"), "sched_total": len(sched),
+            "last_deploy": last_dep, "cost_30d": round(sum(f["cost_30d"] for f in fns), 2),
+            "windows": error_windows(store, prof, data_from, now),
+            "recent_deploys": sorted(recent, key=lambda x: -x["at"])[:6],
+            "functions": len(fns), "accounts": [w.key for w, _, _ in views]}
+        cards.append(aws_ops.client_card(prof, parts))
+    # Most critical first: most errors in the last 24h (then last 1h, hidden errors, status as tie-breakers)
+    order = {"red": 0, "amber": 1, "green": 2}
+    win = lambda c, k, f: ((c.get("windows") or {}).get(k) or {}).get(f) or 0   # the numbers shown on the card
+    cards.sort(key=lambda c: (-(win(c, "24h", "errors") or c["errors_24h"] or 0), -win(c, "1h", "errors"),
+                              -win(c, "24h", "hidden"), order[c["status"]], -c["red"], c["profile"]))
+    _clients_cache.update(at=time.time(), data=cards)
+    return cards
 
 
 def parse_aws_time(text):
@@ -1460,7 +1613,9 @@ class Worker(threading.Thread):
                 if meta["retention_days"] and end < now - meta["retention_days"] * DAY_MS:
                     continue      # already expired in CloudWatch
                 try:
-                    self.pull(logs, group, start, end, cap, False)
+                    # only the last keep_hours get every line; older ranges get error-type lines only
+                    # (Trace a record searches CloudWatch directly for anything older)
+                    self.pull(logs, group, start, end, cap, False, want_all=end > now - self.keep_ms)
                 except logs.exceptions.ResourceNotFoundException:
                     continue
                 except Exception as ex:
@@ -1562,6 +1717,13 @@ def build_workers(cfg, store):
 
 # --------------------------------------------------------------------------- web
 
+TRACES = aws_ops.TraceJobs()
+LLM = None
+AIJOBS = None
+TRIAGE = None
+CODE = None
+
+
 def make_handler(store, workers, cfg):
     class H(BaseHTTPRequestHandler):
         def log_message(self, *a):
@@ -1580,6 +1742,114 @@ def make_handler(store, workers, cfg):
 
         def json(self, obj):
             self.send(200, json.dumps(obj), "application/json")
+
+        def ai(self, path, q):
+            if path == "/api/ai/status":
+                st = LLM.check(force=bool(q.get("force")))
+                return self.json({**{k: v for k, v in st.items() if k != "models"}, "model": LLM.model,
+                                  "triaged": TRIAGE.done if TRIAGE else 0,
+                                  "working_on": TRIAGE.running_now if TRIAGE else None,
+                                  "last_error": TRIAGE.last_error if TRIAGE else None})
+            if path == "/api/ai/triage_map":
+                return self.json({f"{k[0]}|{k[1]}|{k[2]}": v for k, v in aws_local.get_triage(store).items()})
+            if path == "/api/ai/job":
+                return self.json(AIJOBS.get(q.get("id", "")) or {"error": "unknown job"})
+            if path == "/api/ai/summarize":
+                if not LLM.ready:
+                    return self.json({"error": "Local model not available: " + LLM.state["detail"]})
+                kind, question = q.get("kind", "lines"), q.get("question", "")
+                if kind == "run":
+                    r = aws_ops.get_run(store, q["profile"], q["region"], q["grp"], q["request_id"], EXTRA_RX) or {}
+                    lines = [dict(l, group=q["grp"]) for l in r.get("lines_list", [])]
+                elif kind == "trace":
+                    j = TRACES.get(q.get("id", "")) or {"hits": []}
+                    lines = sorted(j["hits"], key=lambda h: h["ts"])
+                    question = question or f"Follow record {j.get('term')} through the systems: what happened to it, in order?"
+                else:
+                    f = {k: q.get(k) for k in ("profile", "level", "grp", "grp_prefix", "q", "hours", "etype", "sig",
+                                               "since_ms", "until_ms") if q.get(k)}
+                    f.setdefault("hours", "24")
+                    evs, total = store.list_events(f, int(q.get("limit") or 400))
+                    lines = sorted(evs, key=lambda e: e["ts"])
+                    question = question or ""
+                    if total > len(evs):
+                        question = (question + f" (Note: showing the newest {len(evs)} of {total} matching lines.)").strip()
+                if not lines:
+                    return self.json({"error": "No lines matched."})
+                jid = AIJOBS.start(question, aws_local.lines_text(lines, LLM.max_input_chars - 2000), kind)
+                return self.json({"id": jid, "lines": len(lines),
+                                  "event_ids": [l.get("id") for l in lines if l.get("level") in ("error", "suspect")][:8]})
+            if path == "/api/ai/triage_now":
+                if not LLM.ready:
+                    return self.json({"error": "Local model not available: " + LLM.state["detail"]})
+                rows = store.annotate(store.summary({"hours": 24, "profile": q.get("profile"), "level": "error,suspect",
+                                                     "etype": q["etype"], "sig": q.get("sig", "")}), q.get("profile"))
+                if not rows:
+                    return self.json({"error": "pattern not found in the last 24h"})
+                prof = q.get("profile") or next(iter(rows[0]["profiles"]))
+                threading.Thread(target=TRIAGE.triage_one, args=(prof, rows[0]), daemon=True).start()
+                return self.json({"ok": True, "message": "Triage started; it shows up in a minute or two."})
+            self.send(404, "not found", "text/plain")
+
+        def ops(self, path, q):
+            now = int(time.time() * 1000)
+            prof = q.get("profile") or None
+            if path == "/api/ops/clients":
+                return self.json(clients_overview(store, workers, cfg, 0 if q.get("fresh") else 60))
+            if path == "/api/ops/groups":
+                rows = aws_ops.lambda_groups(store, prof, now - float(q.get("hours") or 24) * 3_600_000)
+                return self.json([{"profile": p, "region": r, "group": g, "function": aws_ops.function_from_group(g)}
+                                  for p, r, g in sorted(rows)])
+            if path == "/api/ops/runs":
+                hrs = float(q.get("hours") or 24)
+                return self.json(aws_ops.build_runs(store, q["profile"], q["region"], q["grp"], now - int(hrs * 3_600_000),
+                                                    now, EXTRA_RX))
+            if path == "/api/ops/run":
+                return self.json(aws_ops.get_run(store, q["profile"], q["region"], q["grp"], q["request_id"], EXTRA_RX) or {})
+            if path == "/api/ops/nothing":
+                return self.json([d for w, snap, _ in infra_views(store, workers, prof)
+                                  for d in aws_ops.did_nothing(store, snap, w.profile, w.region, now, EXTRA_RX)])
+            if path == "/api/ops/trace/start":
+                ws = [w for w in workers if not prof or w.profile == prof]
+                jid = TRACES.start(store, ws, q["term"].strip(), float(q.get("days") or 7), q.get("sfn", "1") != "0",
+                                   classify_level)
+                return self.json({"id": jid})
+            if path == "/api/ops/trace":
+                j = TRACES.get(q.get("id", ""))
+                if not j:
+                    return self.json({"error": "unknown trace id"})
+                j["timeline"] = aws_ops.trace_timeline(j)
+                return self.json(j)
+            if path in ("/api/ops/code", "/api/ops/code_index"):
+                names = set()
+                for w in workers:
+                    names |= {f["name"] for f in (store.get_infra(w.key) or {}).get("functions", [])}
+                names |= {aws_ops.function_from_group(g) for _, _, g in aws_ops.lambda_groups(store, since=now - DAY_MS)}
+                CODE.build(sorted(n for n in names if n))
+                if path == "/api/ops/code_index":
+                    return self.json({"root": CODE.root, "functions": CODE.map,
+                                      "unmapped": sorted(n for n in names if n and n not in CODE.map)})
+                ev, _ = store.context(q.get("id", ""), 0, 0, 1)
+                if not ev:
+                    return self.json({"error": "event not loaded"})
+                fn = aws_ops.function_from_group(ev["group"])
+                return self.json({"function": fn, "mapped": CODE.map.get(fn), "frames": CODE.locate(fn, ev["message"]),
+                                  "message": ev["message"]})
+            if path == "/api/ops/notes":
+                return self.json(aws_ops.all_notes(store))
+            if path == "/api/ops/note":
+                aws_ops.set_note(store, q["etype"], q.get("sig", ""), q.get("profile", ""), q.get("note", ""),
+                                 q.get("ignore_below") or None)
+                _clients_cache["at"] = 0
+                return self.json({"ok": True})
+            if path in ("/api/ops/report", "/report"):
+                if not prof:
+                    return self.json({"error": "profile is required"})
+                r = aws_ops.client_report(store, workers, prof, float(q.get("days") or 7), ops_helpers(store, workers, cfg))
+                if path == "/report":
+                    return self.send(200, aws_ops.report_html(r), "text/html; charset=utf-8")
+                return self.json({"report": r, "markdown": aws_ops.report_markdown(r)})
+            self.send(404, "not found", "text/plain")
 
         def infra(self, path, q):
             now = int(time.time() * 1000)
@@ -1653,6 +1923,10 @@ def make_handler(store, workers, cfg):
                 return self.json(store.annotate(store.summary(q), q.get("profile")))
             if u.path.startswith("/api/infra/") or u.path.startswith("/api/digest"):
                 return self.infra(u.path, q)
+            if u.path.startswith("/api/ai/"):
+                return self.ai(u.path, q)
+            if u.path.startswith(("/api/ops/", "/report")):
+                return self.ops(u.path, q)
             if u.path == "/api/mute":
                 store.set_mute(q["etype"], q.get("sig", ""), q.get("profile", ""),
                                "fixed" if q.get("status") == "fixed" else "muted", q.get("note", ""))
@@ -1784,6 +2058,18 @@ tr.click:hover{background:var(--bg);cursor:pointer}
 .stack span{display:block;height:100%}
 .totals{display:flex;gap:16px;margin-bottom:10px;color:var(--mute);font-size:13px;flex-wrap:wrap}.totals b{color:var(--fg);font-size:16px}
 .view{display:none}.view.on{display:block}
+@media (max-width:760px){
+ header{position:static;padding:8px 10px}
+ .tabs{flex-wrap:nowrap;overflow-x:auto;-webkit-overflow-scrolling:touch;padding-bottom:4px}
+ .tabs button{flex:0 0 auto}
+ #export,#pause,#notif,label[for],.row label{display:none}
+ #q{width:100%;flex:1 1 100%}
+ #status .chip{display:none}#status .chip.bad{display:inline-block}
+ main{padding:8px 10px}.help{display:none}
+ .cards{grid-template-columns:1fr}
+ table{display:block;overflow-x:auto}
+ .meta{gap:6px}.first{white-space:normal}
+}
 .badge{display:inline-block;font-size:10px;font-weight:700;letter-spacing:.04em;padding:1px 6px;border-radius:4px;margin:2px 4px 0 0;vertical-align:middle}
 .b-new{background:var(--acc);color:#fff}.b-spike{background:var(--sus);color:#000}.b-reg{background:var(--err);color:#fff}
 .b-muted,.b-fixed{border:1px solid var(--line);color:var(--mute)}
@@ -1793,18 +2079,44 @@ tr.click:hover{background:var(--bg);cursor:pointer}
 #regress a{color:inherit;cursor:pointer;text-decoration:underline}
 .inputbox{margin-top:8px;font-size:12px}.inputbox h4{margin:8px 0 2px;font-size:12px;color:var(--mute)}
 .inputbox pre{display:block;max-height:300px}
+.cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(330px,1fr));gap:12px}
+.cc{background:var(--panel);border:1px solid var(--line);border-top:4px solid var(--ok);border-radius:10px;padding:12px 14px}
+.cc.red{border-top-color:var(--err)}.cc.amber{border-top-color:var(--sus)}
+.cc h3{margin:0;font-size:16px;display:flex;justify-content:space-between;align-items:center;cursor:pointer}
+.pill{font-size:11px;font-weight:700;padding:2px 8px;border-radius:99px;color:#fff;background:var(--ok);text-transform:uppercase}
+.pill.red{background:var(--err)}.pill.amber{background:var(--sus);color:#000}
+.kv{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin:10px 0}.kv div{font-size:11px;color:var(--mute)}.kv b{display:block;font-size:15px;color:var(--fg)}
+.up{color:var(--err)}.down{color:var(--ok)}
+.cc ul{margin:6px 0 0 16px;padding:0;font-size:12.5px}.cc .foot{margin-top:8px;font-size:12px;color:var(--mute);display:flex;gap:10px;flex-wrap:wrap}
+.cc .foot a{color:var(--acc);cursor:pointer}
+.note{font-size:12px;color:var(--acc);font-style:italic;margin-top:2px}
+.win{width:100%;border:0;margin:10px 0 2px;background:none}.win th,.win td{border:0;padding:2px 4px;font-size:12px}
+.win th{color:var(--mute);font-weight:500;cursor:default}.win td{text-align:right;font-variant-numeric:tabular-nums}
+.win td b{font-size:15px;color:var(--fg)}.win td .chg{display:block;font-size:10.5px;color:var(--mute)}
+.win td .chg.up{color:var(--err)}.win td .chg.down{color:var(--ok)}
+.ai{font-size:12px;margin-top:3px;padding:3px 8px;border-radius:6px;background:rgba(77,171,247,.10);border-left:3px solid var(--acc)}
+.ai b{text-transform:uppercase;font-size:10.5px;letter-spacing:.04em}.ai .v-actionable{color:var(--err)}.ai .v-noise{color:var(--ok)}
+.ai .v-external{color:var(--sus)}.ai .v-unclear{color:var(--mute)}
+.aibox{margin-top:8px;padding:8px 10px;border-radius:6px;background:rgba(77,171,247,.08);font-size:13px;white-space:pre-wrap}
+.deps{margin:8px 0 0;font-size:12px}.deps div{display:flex;gap:6px;align-items:baseline;padding:2px 0;border-top:1px dashed var(--line)}
+.deps .fn{flex:1;font-family:ui-monospace,Menlo,monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.run-lines{display:none}.run-lines.on{display:table-row}.run-lines td{background:var(--bg)}
+.tl{border-left:2px solid var(--line);margin-left:6px;padding-left:12px}.tl .ev{margin-bottom:4px}
 </style></head><body>
 <header>
  <div class="row">
   <h1>AWS Error Feed</h1>
   <div class="tabs">
-   <button data-v="errors" class="on">Errors<span class="n" id="n-error"></span></button>
+   <button data-v="clients" class="on">Clients</button>
+   <button data-v="errors">Errors<span class="n" id="n-error"></span></button>
    <button data-v="suspect">Hidden errors?<span class="n" id="n-suspect"></span></button>
    <button data-v="all">All logs<span class="n" id="n-all"></span></button>
    <button data-v="patterns">Patterns</button>
    <button data-v="volume">Volume</button>
    <button data-v="deploys">Deploys</button>
    <button data-v="partners">Partner APIs</button>
+   <button data-v="runs">Runs</button>
+   <button data-v="trace">Trace a record</button>
    <button data-v="schedules">Schedules<span class="n" id="n-sched"></span></button>
    <button data-v="inventory">Inventory</button>
    <button data-v="apis">APIs &amp; alarms</button>
@@ -1837,9 +2149,24 @@ tr.click:hover{background:var(--bg);cursor:pointer}
  <div id="regress"></div>
  <div id="hist"></div>
  <div id="status"></div>
+ <div id="aiStatus" class="small" style="margin-top:6px"></div>
 </header>
 <main>
- <div id="v-feed" class="view on">
+ <div id="v-clients" class="view on">
+  <p class="help">Status of every client at a glance: <b style="color:var(--err)">red</b> = something is broken (jobs not running, regressions, alarms, server errors, syncs that did nothing), <b style="color:var(--sus)">amber</b> = worth a look, <b style="color:var(--ok)">green</b> = all quiet. Click a client to open its errors; "report" opens a printable health report.</p>
+  <div id="clientCards" class="cards"></div></div>
+ <div id="v-runs" class="view">
+  <p class="help">Each Lambda run as one row: when it ran, how long, records processed, errors and outcome. Click a run to see everything it logged. Above: functions that ran but processed nothing / far less than usual, or went quiet.</p>
+  <div id="nothingBox"></div>
+  <div class="row" style="margin:8px 0"><select id="runGroup" style="min-width:320px"></select><label><input type="checkbox" id="runProblems"> only runs with problems</label></div>
+  <table><thead><tr><th>Ended</th><th class="num">Duration</th><th class="num">Records</th><th class="num">Errors</th><th class="num">Hidden</th><th class="num">Memory</th><th>Outcome</th><th>First problem</th></tr></thead><tbody id="runBody"></tbody></table></div>
+ <div id="v-trace" class="view">
+  <p class="help">Find every log line, Lambda run and Step Functions execution that mentions an ID (HubSpot deal, NetSuite record, email…). Searches CloudWatch directly for that ID, so it can go back weeks without loading all logs. Use the profile picker to search one client (faster).</p>
+  <div class="row" style="margin-bottom:10px"><input id="trTerm" placeholder="Record ID, e.g. 991 or jane@acme.com" size="34">
+   <select id="trDays"><option value="1">last day</option><option value="7" selected>last 7 days</option><option value="14">last 14 days</option><option value="30">last 30 days</option></select>
+   <label><input type="checkbox" id="trSfn" checked> include Step Functions inputs</label><button id="trGo">Trace</button><button id="trSum" class="act">🤖 summarize the trace</button><span id="trStatus" class="small"></span></div>
+  <div id="trBody"></div></div>
+ <div id="v-feed" class="view">
   <p class="help" id="feedHelp"></p>
   <div id="feed"></div><div id="empty" class="empty">Nothing here for this range yet.</div></div>
  <div id="v-patterns" class="view">
@@ -1944,12 +2271,14 @@ function card(e,isNew){
    <span>${esc(e.group)}</span><span class="lvl">${esc(e.level)}</span>${e.level==='error'||e.level==='suspect'?`<span class="etype">${esc(e.etype)}</span>`:''}
    ${e.hint?`<span class="why">flagged: ${esc(e.hint)}</span>`:''}
    <a href="${consoleUrl(e)}" target="_blank">open in console ↗</a></div>
-   ${e.regression?'<span class="badge b-reg">REGRESSION</span>':''}
+   ${e.regression?'<span class="badge b-reg">REGRESSION</span>':''}${noteFor(e,e.profile)?`<div class="note">📝 ${esc(noteFor(e,e.profile).note)}</div>`:''}${aiLine(AITRIAGE[e.etype+'|'+e.sig+'|'+e.profile])}
    <div class="first">${highlight(headline(e),e.hint)}</div><pre>${highlight(e.message,e.hint)}</pre>
-   ${e.level==='error'||e.level==='suspect'?`<div><button class="act" data-a="mute" title="Hide this pattern for ${esc(e.profile)}">mute</button><button class="act" data-a="fixed" title="Hide until it happens again (then it's flagged as a regression)">mark fixed</button>${e.group.startsWith('stepfunctions:')?'<button class="act" data-a="input">show run input</button>':''}</div><div class="inputbox"></div>`:''}`;
+   ${e.level==='error'||e.level==='suspect'?`<div><button class="act" data-a="mute" title="Hide this pattern for ${esc(e.profile)}">mute</button><button class="act" data-a="fixed" title="Hide until it happens again (then it's flagged as a regression)">mark fixed</button><button class="act" data-a="note">note</button>${/File "|\sat .*:\d+:\d+/.test(e.message)?'<button class="act" data-a="code">open code</button>':''}${e.group.startsWith('stepfunctions:')?'<button class="act" data-a="input">show run input</button>':''}</div><div class="inputbox"></div>`:''}`;
   d.querySelector('.first').onclick=()=>{d.classList.toggle('open'); d.classList.contains('open')?openIds.add(e.id):openIds.delete(e.id)};
   d.querySelectorAll('.act').forEach(b=>b.onclick=ev=>{ev.stopPropagation();
     if(b.dataset.a==='input')return showInput(e,d.querySelector('.inputbox'));
+    if(b.dataset.a==='code')return showCode(e,d.querySelector('.inputbox'));
+    if(b.dataset.a==='note')return editNote(e.etype,e.sig,e.profile);
     mute(e.etype,e.sig,e.profile,b.dataset.a)});
   return d;
 }
@@ -1976,7 +2305,8 @@ function renderSummary(){
     <td class="num"><span class="bar" style="width:${Math.max(3,60*g.count/max)}px;background:var(${col[g.level]||'--err'})"></span>${g.count}</td>
     <td>${g.regression?'<span class="badge b-reg">REGRESSION</span>':''}${g.is_new?'<span class="badge b-new">NEW</span>':''}${g.is_spike?`<span class="badge b-spike">SPIKE ×${g.spike_ratio}</span>`:''}${g.mute&&!g.regression?`<span class="badge b-${g.mute}">${g.mute.toUpperCase()}</span>`:''}<br>
       <b>${esc(g.etype)}</b><br><span class="small" style="color:var(--mute)">${esc(g.level)}${g.hint?` · ${esc(g.hint)}`:''}</span>
-      <div>${g.mute?`<button class="act" data-a="unmute">unmute</button>`:'<button class="act" data-a="muted">mute</button><button class="act" data-a="fixed">mark fixed</button>'}</div></td>
+      ${g.note?`<div class="note">📝 ${esc(g.note)}${g.ignore_below?` (ignore under ${g.ignore_below}/day)`:''}</div>`:''}${aiLine(g.ai)}
+      <div>${g.mute?`<button class="act" data-a="unmute">unmute</button>`:'<button class="act" data-a="muted">mute</button><button class="act" data-a="fixed">mark fixed</button>'}<button class="act" data-a="note">note</button></div></td>
     <td class="sig" title="${esc(g.sample)}">${highlight(g.sig||'—',g.hint)}</td>
     <td class="small">${list(g.profiles)}</td><td class="small">${list(g.log_groups)}</td>
     <td class="small">${new Date(g.first_seen).toLocaleString()}</td>
@@ -1985,7 +2315,7 @@ function renderSummary(){
   document.querySelectorAll('#sumBody tr.click').forEach(tr=>{tr.onclick=()=>{const g=sumRows[tr.dataset.i];
     setSig({etype:g.etype,sig:g.sig}); show(g.level==='error'?'errors':g.level==='suspect'?'suspect':'all')};
     tr.querySelectorAll('.act').forEach(b=>b.onclick=ev=>{ev.stopPropagation(); const g=sumRows[tr.dataset.i], prof=$('fProfile').value;
-      b.dataset.a==='unmute'?unmute(g.etype,g.sig,prof):mute(g.etype,g.sig,prof,b.dataset.a)})});
+      b.dataset.a==='note'?editNote(g.etype,g.sig,prof):b.dataset.a==='unmute'?unmute(g.etype,g.sig,prof):mute(g.etype,g.sig,prof,b.dataset.a)})});
 }
 async function loadVolume(){
   const p=params(false); p.delete('level');
@@ -2010,7 +2340,7 @@ async function counts(){
 async function refresh(newIds,force){
   if(busy)return; busy=true;
   try{
-    const HEAVY={volume:loadVolume,deploys:loadDeploys,partners:loadPartners,schedules:loadSchedules,inventory:loadInventory,apis:loadApis,digest:loadDigest};
+    const HEAVY={clients:loadClients,runs:loadRuns,trace:pollTrace,volume:loadVolume,deploys:loadDeploys,partners:loadPartners,schedules:loadSchedules,inventory:loadInventory,apis:loadApis,digest:loadDigest};
     if(tab==='patterns'||HEAVY[tab]){
       if(force||Date.now()-lastHeavy>30000){ lastHeavy=Date.now();
         tab==='patterns'?(sumRows=await getJ('/api/summary?'+params(false)),renderSummary()):await HEAVY[tab](); }
@@ -2118,6 +2448,105 @@ async function loadDigest(){
     +`<p class="small"><button class="act" id="copyDig">copy as text</button></p>`;
   $('copyDig').onclick=()=>navigator.clipboard.writeText(r.text);
 }
+function chg(cur,prev){
+  if(prev==null)return '<span class="chg">—</span>';
+  if(!prev&&!cur)return '<span class="chg">same</span>';
+  if(!prev)return `<span class="chg up">new (was 0)</span>`;
+  const p=Math.round(100*(cur-prev)/prev); const cls=p>=20&&cur-prev>2?'up':p<=-20&&prev-cur>2?'down':'';
+  return `<span class="chg ${cls}" title="previous period: ${prev}">${p>0?'▲ +':p<0?'▼ ':''}${p}% vs ${prev}</span>`;
+}
+function winTable(w){
+  if(!w)return '';
+  const cols=['1h','6h','24h'];
+  return `<table class="win"><tr><th></th>${cols.map(k=>`<th style="text-align:right">last ${k}</th>`).join('')}</tr>
+   <tr><th>Errors</th>${cols.map(k=>`<td><b>${w[k].errors}</b>${chg(w[k].errors,w[k].prev_errors)}</td>`).join('')}</tr>
+   <tr><th>Hidden</th>${cols.map(k=>`<td><b>${w[k].hidden}</b>${chg(w[k].hidden,w[k].prev_hidden)}</td>`).join('')}</tr></table>`;
+}
+function depList(ds){
+  if(!ds||!ds.length)return '';
+  const V={fixed:'--ok',better:'--ok',clean:'--ok','no change':'--mute','too early':'--mute','before not loaded':'--mute',worse:'--err','new errors':'--err'};
+  const r=(x,per)=>per==='invocation'?(100*x).toFixed(1)+'%/run':x.toFixed(1)+'/h';
+  return `<div class="deps"><div style="border:0;color:var(--mute)">Deploys in the last 24h (errors+hidden, ${ds[0].window_hours}h before vs after)</div>`+ds.map(d=>`<div title="${esc(d.label||'')}"><span class="fn">${esc(d.function)}</span><span class="small">${ago(d.at)}</span>
+    <span class="small">${d.before_loaded?`${r(d.rate_before,d.rate_per)} → ${r(d.rate_after,d.rate_per)}`:''}</span>
+    <span style="color:var(${V[d.verdict]||'--mute'});font-weight:600">${esc(d.verdict)}</span></div>`).join('')+'</div>';
+}
+async function loadClients(){
+  const cards=await getJ('/api/ops/clients'); const red=cards.filter(c=>c.status==='red').length, amb=cards.filter(c=>c.status==='amber').length;
+  $('count').textContent=`${red} red · ${amb} amber · ${cards.length-red-amb} green`;
+  const tr=(a,b)=>b==null?'':a>b*1.2&&a-b>2?`<span class="up">▲</span>`:a<b*0.8&&b-a>2?`<span class="down">▼</span>`:'';
+  $('clientCards').innerHTML=cards.map((c,i)=>`<div class="cc ${c.status}"><h3 data-i="${i}"><span style="opacity:.55;font-weight:400;margin-right:6px">#${i+1}</span>${esc(c.profile)}<span class="pill ${c.status}">${c.status==='red'?'needs attention':c.status==='amber'?'watch':'healthy'}</span></h3>
+    ${winTable(c.windows)}
+    <div class="kv"><div>Runs 24h<b>${c.runs_24h}${c.failed_runs_24h?` <span class="up" style="font-size:12px">${c.failed_runs_24h} failed</span>`:''}</b></div>
+     <div>Records 24h<b>${c.records_24h||'—'}${c.records_usual?` <span class="small" style="color:var(--mute)">/ ~${c.records_usual}</span>`:''}</b></div>
+     <div>Schedules<b>${c.sched_total?`${c.sched_ok}/${c.sched_total} ok`:'—'}</b></div></div>
+    ${depList(c.recent_deploys)}
+    ${c.reasons.length?`<ul>${c.reasons.slice(0,6).map(r=>`<li>${esc(r)}</li>`).join('')}${c.reasons.length>6?`<li>+${c.reasons.length-6} more</li>`:''}</ul>`:'<div class="small" style="color:var(--ok)">Nothing needs attention.</div>'}
+    <div class="foot"><span>~$${c.cost_30d}/30d</span>${c.last_deploy&&!(c.recent_deploys||[]).length?`<span>Last deploy: ${esc(c.last_deploy.function)} ${ago(c.last_deploy.at)}</span>`:''}
+     <a data-go="errors" data-p="${esc(c.profile)}">errors</a><a data-go="runs" data-p="${esc(c.profile)}">runs</a><a data-go="schedules" data-p="${esc(c.profile)}">schedules</a>
+     <a href="/report?profile=${encodeURIComponent(c.profile)}&days=7" target="_blank">weekly report ↗</a></div></div>`).join('')
+    ||'<div class="empty">Loading clients… (first scan takes about a minute)</div>';
+  document.querySelectorAll('#clientCards h3').forEach(h=>h.onclick=()=>{$('fProfile').value=cards[h.dataset.i].profile; show('errors')});
+  document.querySelectorAll('#clientCards a[data-go]').forEach(a=>a.onclick=()=>{$('fProfile').value=a.dataset.p; show(a.dataset.go)});
+}
+let runGroups=[];
+async function loadRuns(){
+  const pf=$('fProfile').value, p=new URLSearchParams(); if(pf)p.set('profile',pf);
+  const [groups,nothing]=await Promise.all([getJ('/api/ops/groups?'+p),getJ('/api/ops/nothing?'+p)]);
+  $('nothingBox').innerHTML=nothing.length?`<div class="ev suspect" style="padding:8px 12px"><b>Possibly did nothing / went quiet</b><ul style="margin:4px 0 0 18px;padding:0;font-size:13px">${nothing.map(d=>`<li><b>${esc(d.profile)}</b> · ${esc(d.group)} — ${esc(d.kind)}: ${esc(d.detail)}</li>`).join('')}</ul></div>`:'';
+  const cur=$('runGroup').value; runGroups=groups;
+  $('runGroup').innerHTML=groups.map((g,i)=>`<option value="${i}">${esc(g.profile)} · ${esc(g.function||g.group)}</option>`).join('')||'<option>No Lambda runs loaded yet</option>';
+  if(cur&&groups[cur])$('runGroup').value=cur;
+  const g=groups[$('runGroup').value]; if(!g){$('runBody').innerHTML='';return}
+  let runs=await getJ('/api/ops/runs?'+new URLSearchParams({profile:g.profile,region:g.region,grp:g.group,hours:$('fHours').value||24}));
+  if($('runProblems').checked)runs=runs.filter(r=>r.outcome!=='ok');
+  $('count').textContent=`${runs.length} runs`;
+  const OC={ok:'--ok',timeout:'--err',failed:'--err','hidden errors':'--sus','no records':'--sus'};
+  $('runBody').innerHTML=runs.slice(0,400).map((r,i)=>`<tr class="click" data-i="${i}"><td class="small">${new Date(r.end).toLocaleString()}${r.cold_start?' <span class="badge b-muted">cold</span>':''}</td>
+    <td class="num">${(r.duration_ms/1000).toFixed(1)}s</td><td class="num">${r.records??'—'}</td><td class="num">${r.errors||''}</td><td class="num">${r.hidden||''}</td>
+    <td class="num small">${r.mem_used}/${r.memory} MB</td><td><span class="chip" style="border-color:var(${OC[r.outcome]});color:var(${OC[r.outcome]})">${esc(r.outcome)}</span></td>
+    <td class="small sig">${r.first_problem?esc(r.first_problem.line.slice(0,160)):''}</td></tr><tr class="run-lines" id="rl${i}"><td colspan="8"></td></tr>`).join('')
+    ||'<tr><td colspan="8" class="empty">No runs in this range.</td></tr>';
+  document.querySelectorAll('#runBody tr.click').forEach(tr=>tr.onclick=async()=>{const r=runs[tr.dataset.i], row=$('rl'+tr.dataset.i);
+    if(row.classList.toggle('on')&&!row.dataset.loaded){row.dataset.loaded=1;
+      const full=await getJ('/api/ops/run?'+new URLSearchParams({profile:g.profile,region:g.region,grp:g.group,request_id:r.request_id}));
+      row.firstElementChild.innerHTML=`<div class="small">Request ${esc(r.request_id)} · stream ${esc(r.stream)} · <button class="act" id="sum${tr.dataset.i}">🤖 summarize this run</button></div><div id="sumbox${tr.dataset.i}"></div><pre style="display:block;max-height:420px">${(full.lines_list||[]).map(l=>esc(new Date(l.ts).toLocaleTimeString()+'  ['+l.level+']  '+l.message)).join('\n')||'(no lines captured for this run)'}</pre>`;
+      $('sum'+tr.dataset.i).onclick=ev=>{ev.stopPropagation(); aiSummarize({kind:'run',profile:g.profile,region:g.region,grp:g.group,request_id:r.request_id},$('sumbox'+tr.dataset.i))}}});
+}
+let trJob=null,trTimer=null;
+async function startTrace(){
+  const term=$('trTerm').value.trim(); if(!term)return;
+  const p=new URLSearchParams({term,days:$('trDays').value,sfn:$('trSfn').checked?'1':'0'}); if($('fProfile').value)p.set('profile',$('fProfile').value);
+  trJob=(await getJ('/api/ops/trace/start?'+p)).id; $('trBody').innerHTML=''; pollTrace();
+}
+async function pollTrace(){
+  clearTimeout(trTimer); if(!trJob)return;
+  const j=await getJ('/api/ops/trace?id='+trJob);
+  $('trStatus').textContent=j.status==='running'?`searching… ${j.accounts_done}/${j.accounts} accounts, ${j.groups_searched} log groups, ${j.hits.length} lines found`:
+    `done — ${j.hits.length} lines in ${j.timeline.length} runs, ${j.sfn.length} Step Functions executions`;
+  $('count').textContent=`${j.hits.length} lines`;
+  const sf=j.sfn.length?`<h4 style="margin:6px 0">Step Functions executions with “${esc(j.term)}” in their ${'input/output'}</h4><table><tbody>${j.sfn.map(e=>`<tr><td class="small">${when(e.start)}</td><td>${esc(e.profile)}</td><td class="sig">${esc(e.state_machine)} / ${esc(e.execution)}</td><td><span class="chip" style="${e.status==='SUCCEEDED'?'':'border-color:var(--err);color:var(--err)'}">${esc(e.status)}</span></td><td><a target="_blank" href="https://${e.region}.console.aws.amazon.com/states/home?region=${e.region}#/v2/executions/details/${encodeURIComponent(e.arn)}">open ↗</a></td></tr>`).join('')}</tbody></table>`:'';
+  $('trBody').innerHTML=sf+(j.timeline.length?`<h4 style="margin:12px 0 6px">Timeline (oldest first)</h4>`:'')+j.timeline.map(g=>`<div style="margin-bottom:10px"><div class="meta"><b>${when(g.start)}</b><span>${esc(g.profile)}</span><span class="sig">${esc(g.group)}</span><span class="lvl" style="color:var(${g.outcome==='error'?'--err':g.outcome==='ok'?'--ok':'--sus'})">${esc(g.outcome)}</span><span>${g.lines.length} line(s)</span></div>
+    <div class="tl">${g.lines.map(l=>`<div class="ev ${l.level==='error'?'error':l.level}" style="padding:4px 10px"><span class="small">${new Date(l.ts).toLocaleTimeString()} · ${esc(l.level)}${l.source==='cloudwatch'?' · from CloudWatch':''}</span><div class="sig" style="font-size:12px;white-space:pre-wrap">${highlight(l.message.slice(0,1200),j.term)}</div></div>`).join('')}</div></div>`).join('')
+    +(j.partial.length||j.errors.length?`<p class="small" style="color:var(--sus)">${esc([...j.partial,...j.errors].slice(0,8).join(' · '))}</p>`:'');
+  if(j.status==='running')trTimer=setTimeout(pollTrace,2000);
+}
+let NOTES={}, AITRIAGE={};
+async function loadTriage(){try{AITRIAGE=await getJ('/api/ai/triage_map')}catch(e){}}
+async function loadNotes(){try{(await getJ('/api/ops/notes')).forEach(n=>NOTES[n.etype+'|'+n.sig+'|'+n.profile]=n)}catch(e){}}
+const noteFor=(e,p)=>NOTES[e.etype+'|'+e.sig+'|'+(p||'')]||NOTES[e.etype+'|'+e.sig+'|'];
+async function editNote(etype,sig,profile){
+  const cur=NOTES[etype+'|'+sig+'|'+(profile||'')]||{}; const note=prompt('Note for this error pattern (shown here and to Claude). Leave empty to remove.',cur.note||'');
+  if(note===null)return; const th=prompt('Ignore when fewer than N per day? (optional number)',cur.ignore_below||'');
+  await getJ('/api/ops/note?'+new URLSearchParams({etype,sig,profile:profile||'',note,ignore_below:th||''})); NOTES={}; await loadNotes(); refresh(null,true);
+}
+async function showCode(e,box){
+  box.innerHTML='<div class="small">Looking up the code…</div>';
+  const r=await getJ('/api/ops/code?id='+encodeURIComponent(e.id));
+  if(r.error){box.innerHTML=`<div class="small">${esc(r.error)}</div>`;return}
+  if(!r.mapped){box.innerHTML=`<div class="small">Couldn't find the repo folder for <b>${esc(r.function||e.group)}</b>. Add it to repos.json next to the dashboard: {"${esc(r.function||'function-name')}": "C:\\path\\to\\its\\folder"}</div>`;return}
+  const own=r.frames.filter(f=>f.path);
+  box.innerHTML=`<div class="small">Repo: ${esc(r.mapped.repo)} (${esc(r.mapped.how)})</div>`+(own.length?own.map(f=>`<h4>${esc(f.path)} line ${f.line}${f.func?' in '+esc(f.func):''} — <a href="${f.vscode}">open in VS Code</a>${f.github?` · <a href="${f.github}" target="_blank">GitHub ↗</a>`:''}</h4><pre>${esc(f.snippet||'')}</pre>`).join(''):'<div class="small">No stack-trace lines from your own code in this error.</div>');
+}
 async function loadPartners(){
   const p=params(false); p.delete('level'); p.delete('hide_muted');
   const rows=await getJ('/api/partners?'+p);
@@ -2145,7 +2574,7 @@ function show(v){
   tab=v; document.querySelectorAll('.tabs button').forEach(b=>b.classList.toggle('on',b.dataset.v===v));
   const feed=['errors','suspect','all'].includes(v);
   $('v-feed').classList.toggle('on',feed); $('v-patterns').classList.toggle('on',v==='patterns'); $('v-volume').classList.toggle('on',v==='volume'); $('v-deploys').classList.toggle('on',v==='deploys'); $('v-partners').classList.toggle('on',v==='partners');
-  ['schedules','inventory','apis','digest'].forEach(x=>$('v-'+x).classList.toggle('on',v===x));
+  ['schedules','inventory','apis','digest','clients','runs','trace'].forEach(x=>$('v-'+x).classList.toggle('on',v===x));
   $('fLevel').style.display=(v==='all'||v==='patterns')?'':'none';
   if(v==='patterns'&&!$('fLevel').dataset.touched)$('fLevel').value='error,suspect';
   if(v==='all'&&!$('fLevel').dataset.touched)$('fLevel').value='error,suspect,warning,info';
@@ -2173,8 +2602,31 @@ function updateProfiles(){
   if(sel.options.length===profs.length+1)return;
   sel.innerHTML='<option value="">All profiles</option>'+profs.map(p=>`<option>${esc(p)}</option>`).join(''); sel.value=cur;
 }
+async function aiStatus(){
+  try{ const a=await getJ('/api/ai/status');
+    $('aiStatus').innerHTML=a.ok?`🤖 Local model <b>${esc(a.model)}</b> ready · ${a.triaged} patterns triaged this session${a.working_on?` · now: ${esc(a.working_on)}`:''}${a.last_error?` · <span style="color:var(--sus)">${esc(a.last_error)}</span>`:''}`
+      :`<span style="color:var(--mute)">🤖 Local model off — ${esc(a.detail)}</span>`;
+    AI_OK=a.ok; }catch(e){}
+}
+let AI_OK=false;
+function aiLine(t){
+  if(!t)return '';
+  return `<div class="ai">🤖 <b class="v-${esc(t.verdict)}">${esc(t.verdict)}</b> · ${esc(t.category)} — ${esc(t.summary)}${t.next_step?`<br><span class="small">Next: ${esc(t.next_step)}</span>`:''}<span class="small" style="opacity:.6"> (${Math.round((t.confidence||0)*100)}%, ${esc(t.model)})</span></div>`;
+}
+async function aiSummarize(params,box){
+  if(!AI_OK){box.innerHTML='<div class="small">Local model is off (see the 🤖 line at the top).</div>';return}
+  box.innerHTML='<div class="aibox">🤖 Reading the lines on your machine… (can take up to a minute)</div>';
+  const r=await getJ('/api/ai/summarize?'+new URLSearchParams(params));
+  if(r.error){box.innerHTML=`<div class="small">${esc(r.error)}</div>`;return}
+  const poll=async()=>{const j=await getJ('/api/ai/job?id='+r.id);
+    if(j.status==='running')return setTimeout(poll,2500);
+    box.innerHTML=`<div class="aibox">🤖 ${esc(j.answer||j.error||'')}</div>`};
+  poll();
+}
+let aiTick=0;
 async function status(){
   if(regTick++%3===0)loadRegress();
+  if(aiTick++%6===0)aiStatus();
   try{
     const s=await getJ('/api/status'), now=Date.now(), vals=Object.values(s);
     vals.forEach(v=>v.profile&&knownProfiles.add(v.profile)); updateProfiles();
@@ -2195,10 +2647,12 @@ async function status(){
   }catch(e){}
 }
 function onRange(){ const h=$('fHours').value;
-  if(h&&!['deploys','schedules','inventory','apis','digest'].includes(tab)) fetch('/api/backfill?hours='+h);   // these views don't need old logs
+  if(h&&!['deploys','schedules','inventory','apis','digest','clients','trace'].includes(tab)) fetch('/api/backfill?hours='+h);   // these views don't need old logs
   refresh(null,true); status(); }
 let qt; $('q').oninput=()=>{clearTimeout(qt);qt=setTimeout(()=>refresh(null,true),300)};
-$('fHours').onchange=onRange; $('invView').onchange=()=>refresh(null,true); $('invFlagged').onchange=()=>refresh(null,true);
+$('fHours').onchange=onRange; $('runGroup').onchange=()=>refresh(null,true); $('runProblems').onchange=()=>refresh(null,true);
+$('trGo').onclick=startTrace; $('trSum').onclick=()=>{if(trJob)aiSummarize({kind:'trace',id:trJob},$('trBody').insertBefore(document.createElement('div'),$('trBody').firstChild))};
+loadTriage(); setInterval(loadTriage,60000); $('trTerm').onkeydown=e=>{if(e.key==='Enter')startTrace()}; loadNotes(); $('invView').onchange=()=>refresh(null,true); $('invFlagged').onchange=()=>refresh(null,true);
 $('rescan').onclick=async()=>{await getJ('/api/infra/rescan'+($('fProfile').value?'?profile='+encodeURIComponent($('fProfile').value):'')); $('rescan').textContent='scanning… (about a minute)'}; $('showMuted').onchange=()=>refresh(null,true); $('pFilter').onchange=renderSummary; $('dWin').onchange=()=>refresh(null,true); $('fProfile').onchange=()=>refresh(null,true);
 $('fLevel').onchange=()=>{$('fLevel').dataset.touched=1;refresh(null,true)};
 document.querySelectorAll('.tabs button').forEach(b=>b.onclick=()=>show(b.dataset.v));
@@ -2218,7 +2672,8 @@ $('notifySus').checked=store.get('notifySus')==='1'; $('notifySus').onchange=e=>
   if(u.get('level')){const sel=$('fLevel'); if(![...sel.options].some(o=>o.value===u.get('level'))){const o=document.createElement('option');o.value=u.get('level');o.textContent=u.get('level');sel.appendChild(o)} sel.value=u.get('level'); sel.dataset.touched=1}
   if(u.get('grp'))grpFilter=u.get('grp');
   if(u.get('etype'))sigFilter={etype:u.get('etype'),sig:u.get('sig')||''};
-  renderChips(); show(['errors','suspect','all','patterns','volume','deploys','partners','schedules','inventory','apis','digest'].includes(u.get('tab'))?u.get('tab'):'errors');})();
+  renderChips(); show(['errors','suspect','all','patterns','volume','deploys','partners','schedules','inventory','apis','digest','clients','runs','trace'].includes(u.get('tab'))?u.get('tab'):'clients');
+  if(u.get('trace')){$('trTerm').value=u.get('trace'); show('trace'); startTrace()}})();
 onRange(); tick(); setInterval(tick,5000); setInterval(status,5000);
 </script></body></html>"""
 
@@ -2230,9 +2685,14 @@ def main():
     ap.add_argument("-c", "--config", help="path to config.json (optional)")
     ap.add_argument("--port", type=int)
     ap.add_argument("--no-browser", action="store_true")
+    ap.add_argument("--log", help="write output to this file (for running in the background with pythonw)")
     ap.add_argument("--list-profiles", action="store_true",
                     help="print the profiles/regions this app will watch, then exit")
     args = ap.parse_args()
+    if args.log or sys.stdout is None:          # pythonw has no console
+        f = open(args.log or os.path.join(HERE, "dashboard.log"), "a", encoding="utf-8", buffering=1)
+        sys.stdout = sys.stderr = f
+        print(f"\n=== started {time.strftime('%Y-%m-%d %H:%M:%S')} ===")
 
     cfg = load_config(args.config)
     if args.port:
@@ -2252,6 +2712,16 @@ def main():
 
     db = cfg["db_file"] if os.path.isabs(cfg["db_file"]) else os.path.join(HERE, cfg["db_file"])
     store = Store(db, cfg)
+    aws_ops.init_db(store)
+    aws_local.init_db(store)
+    global LLM, AIJOBS, TRIAGE
+    LLM = aws_local.LocalLLM(cfg)
+    AIJOBS = aws_local.Jobs(LLM)
+    global CODE, EXTRA_RX
+    EXTRA_RX[:] = [re.compile(x, re.I) for x in cfg["record_count_patterns"]]
+    root = cfg["repos_root"] or os.path.dirname(HERE)
+    rf = cfg["repos_file"] if os.path.isabs(cfg["repos_file"]) else os.path.join(HERE, cfg["repos_file"])
+    CODE = aws_ops.CodeIndex(root, rf)
 
     workers = build_workers(cfg, store)
     if not workers:
@@ -2271,15 +2741,22 @@ def main():
         keys = [w.key for w in workers]
         n = 0
         while True:
-            time.sleep(300)
+            time.sleep(300 if n else 60)      # first pass a minute after start, then every 5 minutes
             now = int(time.time() * 1000)
             store.rollup(now - 3 * 3_600_000, now)          # keep the hourly baseline current
+            try:
+                aws_ops.rollup_runs(store, workers, now - 3 * 3_600_000, now, EXTRA_RX)
+            except Exception as ex:
+                print("run rollup failed:", ex)
             n += 1
             if n % 3 == 0:
                 store.delete_orphans(now - cfg["keep_hours"] * 3_600_000, keys)
                 store.prune_baseline(cfg["baseline_days"])
                 store.shrink()
     threading.Thread(target=pruner, daemon=True).start()
+    TRIAGE = aws_local.Triage(LLM, store, workers, cfg, lambda eid: store.context(eid, 120_000, 30_000))
+    TRIAGE.start()
+    print("Local model:", LLM.check(force=True)["detail"])
 
     print(f"Watching {len(workers)} profile/region pair(s):")
     for w in workers:
