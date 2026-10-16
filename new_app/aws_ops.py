@@ -61,8 +61,40 @@ COUNT_RX = [
 ]
 
 
+def structured(msg):
+    """A structured log line from oflog: one JSON object with an "event" key, else None."""
+    s = (msg or "").strip()
+    if not (s.startswith("{") and s.endswith("}") and '"event"' in s):
+        return None
+    try:
+        d = json.loads(s)
+    except ValueError:
+        return None
+    return d if isinstance(d, dict) and isinstance(d.get("event"), str) else None
+
+
+_COUNT_KEY = re.compile(r"(?:^|_)(?:count|records|processed|created|updated|upserted|synced)$", re.I)
+
+
+def structured_count(d):
+    """Records handled by a run, from its run_summary line."""
+    if d.get("event") != "run_summary":
+        return None
+    res = d.get("results") if isinstance(d.get("results"), dict) else {}
+    for src in (d, res):
+        for k in ("processed", "records", "records_processed"):
+            if isinstance(src.get(k), (int, float)) and not isinstance(src.get(k), bool):
+                return int(src[k])
+    nums = [v for k, v in res.items() if _COUNT_KEY.search(k) and "page" not in k.lower()
+            and isinstance(v, (int, float)) and not isinstance(v, bool)]
+    return int(sum(nums)) if nums else None
+
+
 def extract_count(msg, extra=()):
     """Biggest 'N records' style number in a line, or None."""
+    d = structured(msg)
+    if d:
+        return structured_count(d)
     best = None
     for rx in list(extra) + COUNT_RX:
         for m in rx.finditer(msg):

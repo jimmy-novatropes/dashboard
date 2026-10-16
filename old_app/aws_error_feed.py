@@ -213,8 +213,41 @@ SFN_ERRFIELD_RX = re.compile(r'"error"\s*:\s*"([^"]+)"')
 SFN_CAUSE_RX = re.compile(r'"cause"\s*:\s*"((?:[^"\\]|\\.)*)"')
 
 
+def structured_level(d):
+    """Level for an oflog JSON line: its own "level", plus runs that finished with failed records."""
+    lvl = str(d.get("level") or "INFO").upper()
+    if lvl in ("ERROR", "CRITICAL", "FATAL", "EXCEPTION"):
+        return "error", ""
+    if d.get("event") == "run_summary" and d.get("status") != "failed":
+        res = d.get("results") if isinstance(d.get("results"), dict) else {}
+        failed = d.get("records_failed") or res.get("failed")
+        if failed:
+            return "suspect", f"run finished with {failed} failed record(s)"
+    if lvl.startswith("WARN"):
+        return "warning", ""
+    return "info", ""
+
+
+def structured_signature(d, level):
+    """Group oflog lines by their stable event name, not the changing message."""
+    ev, partner = d["event"], d.get("partner")
+    etype = ev + (f" ({partner})" if partner and str(partner) not in ev else "")
+    if d.get("event") == "run_summary" and level == "suspect":
+        return "run_summary: records failed", normalize(str(d.get("function") or ""))
+    first = (d.get("first_errors") or [{}])[0] if isinstance(d.get("first_errors"), list) else {}
+    parts = [",".join(map(str, d.get("categories") or [])) or None, d.get("error_type"),
+             d.get("path") or d.get("where"), (first or {}).get("message") or d.get("error")]
+    if not any(parts):
+        parts.append(d.get("msg"))
+    status = f"{d['status']} " if d.get("status") is not None else ""     # keep 429 vs 500 apart
+    return etype, (status + normalize(" ".join(str(p) for p in parts if p not in (None, ""))))[:200]
+
+
 def classify_level(msg):
     """Return (level, hint). hint = the words that made a 'suspect' line look like an error."""
+    d = aws_ops.structured(msg)
+    if d:
+        return structured_level(d)
     m = SFN_TYPE_RX.search(msg)
     if m:
         if m.group(1).startswith("Execution"):
@@ -294,6 +327,9 @@ def error_signature(msg):
 
 
 def signature(msg, level, hint):
+    d = aws_ops.structured(msg)
+    if d:
+        return structured_signature(d, level)
     m = SFN_TYPE_RX.search(msg)
     if m:
         err, cause = SFN_ERRFIELD_RX.search(msg), SFN_CAUSE_RX.search(msg)
