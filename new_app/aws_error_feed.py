@@ -2084,6 +2084,27 @@ def make_handler(store, workers, cfg):
                 return self.json({"digest": dg, "text": digest_text(dg)})
             self.send(404, "not found", "text/plain")
 
+        def do_POST(self):
+            u = urlparse(self.path)
+            if u.path != "/api/ai/read":
+                return self.send(404, "not found", "text/plain")
+            n = int(self.headers.get("Content-Length") or 0)
+            if n > 12_000_000:
+                return self.send(413, "too large", "text/plain")
+            try:
+                body = json.loads(self.rfile.read(n).decode("utf-8") or "{}")
+            except ValueError:
+                return self.send(400, "bad json", "text/plain")
+            if not LLM.ready:
+                return self.json({"error": "Local model not available: " + LLM.state["detail"]})
+            docs = [{"name": str(d.get("name") or "text")[:300], "text": str(d.get("text") or "")}
+                    for d in (body.get("docs") or []) if isinstance(d, dict)]
+            if not docs:
+                return self.json({"error": "Nothing to read."})
+            jid = AIJOBS.start_docs(str(body.get("question") or ""), docs, str(body.get("kind") or "read")[:20])
+            return self.json({"id": jid, "parts": (AIJOBS.get(jid) or {}).get("parts", 1),
+                              "chars": sum(len(d["text"]) for d in docs)})
+
         def do_GET(self):
             u = urlparse(self.path)
             q = {k: v[0] for k, v in parse_qs(u.query, keep_blank_values=True).items()}

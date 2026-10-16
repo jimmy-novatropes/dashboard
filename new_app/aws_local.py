@@ -50,6 +50,26 @@ or functions are involved. Use at most 8 short bullet points. Quote exact error 
 Do not invent anything that is not in the lines. If asked a question, answer it first in one sentence."""
 
 
+READ_SYSTEM = """You read source code, diffs, git history or documents for a developer so they don't have to
+read everything themselves. Lines are numbered as "  123| code". Be brief and concrete:
+- If there is a question, answer it first in 1-3 sentences.
+- Then the key points: what each file/part does, the important functions/sections WITH file:line
+  references (e.g. handler.py:120-185), inputs/outputs, external APIs called, and anything that
+  looks wrong, risky or unfinished.
+- At most 15 short bullets. Quote exact names. Never invent code, lines or behaviour that isn't shown;
+  if something isn't visible, say so."""
+
+MAP_SYSTEM = """You are reading ONE PART of a larger set of files for a developer. Lines are numbered as
+"  123| code". Write compact notes for this part only: per file, what it does, its key functions/sections
+with file:line references, external calls, and anything relevant to the question or that looks wrong.
+At most 8 bullets per file. No introduction. Never invent anything not shown."""
+
+REDUCE_SYSTEM = """You are given notes that were written about different parts of a set of files. Combine
+them into one brief answer for the developer: answer the question first (if any) in 1-3 sentences, then
+at most 15 bullets with the key points, keeping the file:line references. Remove duplicates. Never add
+anything that isn't in the notes."""
+
+
 class LocalLLM:
     def __init__(self, cfg):
         c = cfg.get("local_llm") or {}
@@ -86,6 +106,11 @@ class LocalLLM:
     @property
     def ready(self):
         return self.check()["ok"]
+
+    @property
+    def chunk_chars(self):
+        """How much text fits in one call: the model's context minus room for instructions + answer."""
+        return max(4000, min(self.max_input_chars, (self.num_ctx - 1800) * 3))
 
     # ------------------------------------------------------------ generation
     def chat(self, system, user, as_json=False, timeout=300, max_tokens=700, kind="other"):
@@ -281,6 +306,82 @@ class Jobs:
     def get(self, jid):
         j = self.jobs.get(jid)
         return dict(j) if j else None
+
+    def start_docs(self, question, docs, kind="read"):
+        """Read a set of documents [{name, text}] - one call if they fit, otherwise notes per part
+        (map) combined into one answer (reduce). Runs in the background; poll with get()."""
+        key = hashlib.sha1((self.llm.model + kind + question + json.dumps(docs, sort_keys=True)).encode()).hexdigest()
+        jid = uuid.uuid4().hex[:10]
+        if key in self.cache:
+            self.jobs[jid] = {"id": jid, "status": "done", "answer": self.cache[key], "cached": True}
+            return jid
+        budget = self.llm.chunk_chars - 600
+        parts = _pack_docs(docs, budget)
+        job = {"id": jid, "status": "running", "answer": None, "started": time.time(),
+               "parts": len(parts), "done_parts": 0}
+        with self.lock:
+            self.jobs[jid] = job
+
+        def work():
+            try:
+                q = f"Question: {question}\n\n" if question else ""
+                if len(parts) == 1:
+                    ans = self.llm.chat(READ_SYSTEM, q + parts[0], timeout=900, max_tokens=900, kind=kind)
+                else:
+                    notes = []
+                    for p in parts:
+                        notes.append(self.llm.chat(MAP_SYSTEM, q + p, timeout=900, max_tokens=600, kind=kind))
+                        job["done_parts"] += 1
+                    while len("\n\n".join(notes)) > budget and len(notes) > 1:     # reduce in groups
+                        groups, cur = [], []
+                        for n in notes:
+                            if cur and len("\n\n".join(cur + [n])) > budget:
+                                groups.append(cur)
+                                cur = []
+                            cur.append(n[:budget])
+                        groups.append(cur)
+                        notes = [self.llm.chat(REDUCE_SYSTEM, q + "Notes:\n\n" + "\n\n---\n\n".join(g),
+                                               timeout=900, max_tokens=700, kind=kind) for g in groups]
+                    ans = self.llm.chat(REDUCE_SYSTEM, q + "Notes:\n\n" + "\n\n---\n\n".join(notes),
+                                        timeout=900, max_tokens=900, kind=kind)
+                job["answer"], job["status"] = ans, "done"
+                self.cache[key] = ans
+            except Exception as ex:
+                job["status"], job["error"] = "error", str(ex)[:300]
+        threading.Thread(target=work, daemon=True).start()
+        return jid
+
+
+def _numbered(text, start=1):
+    return "\n".join(f"{i:>5}| {line}" for i, line in enumerate(text.splitlines(), start))
+
+
+def _pack_docs(docs, budget):
+    """Numbered text for each document, split by lines where a file is too big, packed into parts."""
+    pieces = []
+    for d in docs:
+        lines = (d.get("text") or "").splitlines()
+        name = d.get("name") or "text"
+        start, cur, size = 1, [], 0
+        for i, line in enumerate(lines, 1):
+            line = line[:1000]
+            if cur and size + len(line) + 8 > budget - 200:
+                pieces.append(f"=== {name} (lines {start}-{i - 1} of {len(lines)}) ===\n" + _numbered("\n".join(cur), start))
+                start, cur, size = i, [], 0
+            cur.append(line)
+            size += len(line) + 8
+        if cur or not lines:
+            label = f"lines {start}-{len(lines)} of {len(lines)}" if start > 1 else f"{len(lines)} lines"
+            pieces.append(f"=== {name} ({label}) ===\n" + _numbered("\n".join(cur), start))
+    parts, cur = [], ""
+    for p in pieces:
+        if cur and len(cur) + len(p) + 2 > budget:
+            parts.append(cur)
+            cur = ""
+        cur = (cur + "\n\n" + p) if cur else p
+    if cur:
+        parts.append(cur)
+    return parts or ["(empty)"]
 
 
 # ============================================================================ savings counter

@@ -78,6 +78,11 @@ but processed nothing. Fixing code: locate_code turns an error's stack trace int
 with the code around the failing line. Team notes on patterns appear as "NOTE from the team" -
 respect them (e.g. don't re-investigate known, accepted issues). client_report = weekly report.
 
+Saving context for code and documents: before reading a big file, a whole folder, a long diff or
+git history yourself, use local_read(path, question) or local_git(repo, what, question): the local
+model reads it and returns a short summary with file:line references. Then open only the exact lines
+you need to change. Its summaries can be wrong - verify before editing.
+
 Saving context: lines tagged LOCAL-MODEL TRIAGE come from a small model on the user's machine -
 use them to prioritise, but verify before acting. For "what's wrong with X" start with investigate
 (one call). To understand many lines, use summarize_logs (the local model reads them) instead of
@@ -170,6 +175,20 @@ def api(path, **params):
             raise FeedDown(
                 f"The AWS Error Feed dashboard isn't reachable at {BASE} ({ex}). Start it with "
                 f"`python aws_error_feed.py` in {HERE}.") from None
+
+
+def api_post(path, payload, timeout=60):
+    data = json.dumps(payload).encode("utf-8")
+    for attempt in range(2):
+        req = urllib.request.Request(f"{base()}{path}", data=data, headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return json.loads(r.read().decode("utf-8"))
+        except (urllib.error.URLError, ConnectionError) as ex:
+            if attempt == 0 and not isinstance(getattr(ex, "reason", None), TimeoutError):
+                _active["at"] = 0
+                continue
+            raise FeedDown(f"The dashboard at {base()} didn't accept the request ({ex}).") from None
 
 
 _code_index = {}
@@ -1061,6 +1080,175 @@ def did_my_fix_work(function: str, profile: str = "", window_hours: float = 24,
     return finish(out)
 
 
+# --------------------------------------------------------------------------- local reading (code, docs, git)
+import fnmatch
+import re as _re
+
+SKIP_DIRS = {".git", "node_modules", "venv", ".venv", "env", "__pycache__", ".idea", ".vscode", "dist", "build",
+             ".serverless", "site-packages", ".pytest_cache", ".mypy_cache", "archive", "coverage", ".next"}
+# never sent anywhere: secrets, keys, credentials, local databases
+DENY = _re.compile(r"(^\.env|secret|credential|password|\.pem$|\.key$|\.pfx$|\.p12$|id_rsa|\.db$|\.sqlite|"
+                   r"\.db-wal$|\.db-shm$|\.aws)", _re.I)
+TEXT_EXT = {".py", ".js", ".ts", ".tsx", ".jsx", ".json", ".yml", ".yaml", ".toml", ".ini", ".cfg", ".md", ".txt",
+            ".csv", ".tsv", ".sql", ".sh", ".ps1", ".bat", ".html", ".css", ".xml", ".asl", ".graphql", ".java",
+            ".cs", ".go", ".rb", ".php", ".r", ".ipynb", ".tf", ".hcl", ".env.example", ".log", ""}
+MAX_FILE = 400_000
+MAX_TOTAL = 4_000_000
+
+
+def _roots():
+    roots = [r for r in (REPOS or "").split(";") if r.strip()]
+    roots.append(os.path.dirname(HERE))                   # the dashboard repo itself
+    return [os.path.realpath(r.strip()) for r in roots]
+
+
+def _resolve(path):
+    """A path inside the allowed folders (your repos root and the dashboard), absolute or relative."""
+    p = path.strip().strip('"')
+    cands = [p] if os.path.isabs(p) else [os.path.join(r, p) for r in _roots()]
+    for c in cands:
+        real = os.path.realpath(c)
+        if any(real == r or real.startswith(r + os.sep) for r in _roots()) and os.path.exists(real):
+            return real
+    raise ValueError(f"'{path}' isn't inside the allowed folders ({'; '.join(_roots())}). "
+                     f"Set AWS_ERROR_FEED_REPOS to your repos folder (several: separate with ;).")
+
+
+def _is_text(path):
+    try:
+        with open(path, "rb") as f:
+            return b"\0" not in f.read(4096)
+    except OSError:
+        return False
+
+
+def _collect(path, include, max_files):
+    docs, skipped, total = [], [], 0
+    base_dir = path if os.path.isdir(path) else os.path.dirname(path)
+    files = [path] if os.path.isfile(path) else []
+    if os.path.isdir(path):
+        for dp, dns, fns in os.walk(path):
+            dns[:] = sorted(d for d in dns if d not in SKIP_DIRS and not d.startswith("."))
+            for fn in sorted(fns):
+                files.append(os.path.join(dp, fn))
+    pats = [x.strip() for x in include.split(",") if x.strip()]
+    for f in files:
+        rel = os.path.relpath(f, base_dir).replace("\\", "/")
+        name = os.path.basename(f)
+        if pats and not any(fnmatch.fnmatch(name, x) or fnmatch.fnmatch(rel, x) for x in pats):
+            continue
+        if DENY.search(name):
+            skipped.append(f"{rel} (looks like secrets/credentials - never sent)")
+            continue
+        ext = os.path.splitext(name)[1].lower()
+        if ext not in TEXT_EXT or not _is_text(f):
+            continue
+        size = os.path.getsize(f)
+        if size > MAX_FILE:
+            skipped.append(f"{rel} (too big: {size // 1000} KB)")
+            continue
+        if len(docs) >= max_files or total + size > MAX_TOTAL:
+            skipped.append(f"{rel} (limit reached)")
+            continue
+        try:
+            text = open(f, encoding="utf-8", errors="replace").read()
+        except OSError:
+            continue
+        docs.append({"name": rel, "text": text})
+        total += len(text)
+    return docs, skipped
+
+
+def _read_job(docs, question, kind, header, skipped=(), job_id=""):
+    if not job_id:
+        r = api_post("/api/ai/read", {"question": question, "docs": docs, "kind": kind})
+        if r.get("error"):
+            return r["error"]
+        job_id = r["id"]
+        header += f" ({r.get('chars', 0) // 1000}k chars, {r.get('parts', 1)} part(s))"
+    j = _wait_job(job_id, seconds=50)
+    if j.get("status") == "running":
+        prog = f" ({j.get('done_parts')}/{j.get('parts')} parts read)" if j.get("parts", 1) > 1 else ""
+        return (f"The local model is still reading{prog}. Call {kind == 'git' and 'local_git' or 'local_read'}"
+                f"(job_id=\"{job_id}\") again in ~30s.")
+    if j.get("error"):
+        return f"Local model failed: {j['error']}. Read the files directly instead."
+    out = [header + " - local-model summary, verify before editing:", j.get("answer") or ""]
+    if skipped:
+        out.append("Skipped: " + "; ".join(list(skipped)[:12]) + (f" (+{len(skipped) - 12} more)" if len(skipped) > 12 else ""))
+    return finish(out)
+
+
+@mcp.tool()
+@guard
+def local_read(path: str = "", question: str = "", include: str = "", max_files: int = 60, job_id: str = "") -> str:
+    """Have the LOCAL model (on the user's tower, free) read a file or a whole folder from the user's
+    repos and return a short summary with file:line references, or an answer to `question`
+    (e.g. "where is the HubSpot token refreshed?", "what does this handler do?"). Use this BEFORE
+    reading big files or many files yourself, then open only the lines you need. `path` is absolute
+    or relative to the repos folder (e.g. "hrs/serverless_lambdas/hrs_deals"); `include` filters files,
+    e.g. "*.py,*.yml". Skips .git, venvs, node_modules, binaries and anything that looks like secrets.
+    If it's still working, call again with job_id."""
+    if job_id:
+        return _read_job(None, question, "read", "Read", job_id=job_id)
+    try:
+        real = _resolve(path)
+    except ValueError as ex:
+        return str(ex)
+    docs, skipped = _collect(real, include, max(1, min(max_files, 200)))
+    if not docs:
+        return f"No readable text files found at {real}" + (f" (skipped: {'; '.join(skipped[:5])})" if skipped else ".")
+    return _read_job(docs, question, "read", f"Read {len(docs)} file(s) from {real}", skipped)
+
+
+_REF_OK = _re.compile(r"^[\w./~^@{}:+-]{1,100}$")
+
+
+@mcp.tool()
+@guard
+def local_git(repo: str = "", what: str = "log", ref: str = "", n: int = 30, path: str = "", question: str = "",
+              job_id: str = "") -> str:
+    """Have the LOCAL model read git history or changes and summarise them, instead of pulling a
+    long log or diff into the conversation. what = "log" (last n commits with changed files),
+    "diff" (uncommitted changes, or `ref` like "main...my-branch" / "HEAD~3"), or "show" (one
+    commit `ref`). `path` limits it to a sub-folder/file. Read-only: never changes the repo."""
+    if job_id:
+        return _read_job(None, question, "git", "Git", job_id=job_id)
+    try:
+        real = _resolve(repo)
+    except ValueError as ex:
+        return str(ex)
+    if ref and not _REF_OK.match(ref):
+        return f"'{ref}' doesn't look like a git ref."
+    n = max(1, min(int(n or 30), 300))
+    if what == "log":
+        cmd = ["git", "log", f"-n{n}", "--stat", "--date=short", "--format=commit %h  %ad  %an%n    %s%n"]
+        cmd += [ref] if ref else []
+    elif what == "diff":
+        cmd = ["git", "diff", "--stat", "--patch"] + ([ref] if ref else ["HEAD"])
+    elif what == "show":
+        if not ref:
+            return "show needs a commit: ref=\"<hash>\""
+        cmd = ["git", "show", "--stat", "--patch", ref]
+    else:
+        return 'what must be "log", "diff" or "show".'
+    if path:
+        cmd += ["--", path]
+    try:
+        r = subprocess.run(cmd, cwd=real, capture_output=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as ex:
+        return f"git failed: {ex}"
+    text = r.stdout.decode("utf-8", errors="replace")
+    if r.returncode != 0:
+        return "git error: " + r.stderr.decode("utf-8", errors="replace")[:500]
+    if not text.strip():
+        return "Nothing to show (no commits / no changes)."
+    if len(text) > MAX_TOTAL:
+        text = text[:MAX_TOTAL] + "\n... (cut)"
+    title = f"git {what} {ref}".strip() + (f" -- {path}" if path else "")
+    return _read_job([{"name": title, "text": text}], question, "git", f"{title} in {real}")
+
+
 @mcp.tool()
 @guard
 def usage_savings(days: int = 7) -> str:
@@ -1071,7 +1259,7 @@ def usage_savings(days: int = 7) -> str:
     k = lambda n: f"{n / 1000:.1f}k" if n >= 1000 else str(n)
     tot = r["total"]
     out = [f"Savings, last {days} day(s) (tokens estimated as characters / {r['chars_per_token']}):",
-           f"TOTAL: local model read ~{k(tot['local_read'])} tokens of logs ({tot['summaries']} summaries, "
+           f"TOTAL: local model read ~{k(tot['local_read'])} tokens of logs/code ({tot['summaries']} summaries/reads, "
            f"{tot['triaged']} triaged patterns) and passed on ~{k(tot['local_wrote'])}; Claude received "
            f"~{k(tot['claude_received'])} from {tot['claude_calls']} tool calls -> ~{tot['saved_pct']}% of the "
            f"log reading happened locally (~{k(tot['avoided'])} tokens avoided)."]
