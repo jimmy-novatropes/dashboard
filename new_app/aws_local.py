@@ -60,6 +60,7 @@ class LocalLLM:
         self.max_input_chars = int(c.get("max_input_chars") or 40000)
         self.state = {"ok": False, "detail": "not checked yet", "checked": 0}
         self.lock = threading.Lock()          # one generation at a time (it's one GPU)
+        self.meter = None                     # meter(kind, chars_read, chars_written) - savings counter
 
     # ------------------------------------------------------------ health
     def check(self, force=False):
@@ -87,10 +88,11 @@ class LocalLLM:
         return self.check()["ok"]
 
     # ------------------------------------------------------------ generation
-    def chat(self, system, user, as_json=False, timeout=300, max_tokens=700):
+    def chat(self, system, user, as_json=False, timeout=300, max_tokens=700, kind="other"):
+        user = user[: self.max_input_chars]
         body = {"model": self.model, "stream": False,
                 "messages": [{"role": "system", "content": system},
-                             {"role": "user", "content": user[: self.max_input_chars]}],
+                             {"role": "user", "content": user}],
                 "options": {"num_ctx": self.num_ctx, "temperature": 0.2, "num_predict": max_tokens}}
         if as_json:
             body["format"] = "json"
@@ -113,6 +115,11 @@ class LocalLLM:
                         body.pop("think")          # model doesn't support the think option
                         continue
                     raise RuntimeError(f"Ollama error {ex.code}: {detail[:200]}")
+        if self.meter:
+            try:
+                self.meter(kind, len(user), len(text))
+            except Exception:
+                pass
         if not as_json:
             return text
         m = re.search(r"\{.*\}", text, re.S)
@@ -129,6 +136,9 @@ def init_db(store):
             CREATE TABLE IF NOT EXISTS ai_triage(
                 etype TEXT, sig TEXT, profile TEXT, at INTEGER, model TEXT, count INTEGER, data TEXT,
                 PRIMARY KEY(etype, sig, profile));
+            CREATE TABLE IF NOT EXISTS ai_usage(
+                day TEXT, source TEXT, kind TEXT, calls INTEGER, in_chars INTEGER, out_chars INTEGER,
+                PRIMARY KEY(day, source, kind));
         """)
         store.db.commit()
 
@@ -206,7 +216,7 @@ class Triage(threading.Thread):
                 + f"\nLog groups: {', '.join(list(g['log_groups'])[:5])}\n"
                 + (f"Team note: {g['note']}\n" if g.get("note") else "")
                 + f"\nSample lines:\n{samples}\n\nWhat the same log stream printed around the latest one:\n{ctx_txt}")
-        res = self.llm.chat(TRIAGE_SYSTEM, user, as_json=True, timeout=600, max_tokens=500)
+        res = self.llm.chat(TRIAGE_SYSTEM, user, as_json=True, timeout=600, max_tokens=500, kind="triage")
         res = {"verdict": res.get("verdict") if res.get("verdict") in VERDICTS else "unclear",
                "category": res.get("category") if res.get("category") in CATEGORIES else "unknown",
                "summary": str(res.get("summary", ""))[:400], "likely_cause": str(res.get("likely_cause", ""))[:300],
@@ -259,7 +269,8 @@ class Jobs:
         def work():
             try:
                 q = f"Question: {question}\n\n" if question else ""
-                ans = self.llm.chat(SUMMARY_SYSTEM, q + "Log lines:\n" + text, timeout=900, max_tokens=900)
+                ans = self.llm.chat(SUMMARY_SYSTEM, q + "Log lines:\n" + text, timeout=900, max_tokens=900,
+                                    kind=kind)
                 job["answer"], job["status"] = ans, "done"
                 self.cache[key] = ans
             except Exception as ex:
@@ -270,6 +281,58 @@ class Jobs:
     def get(self, jid):
         j = self.jobs.get(jid)
         return dict(j) if j else None
+
+
+# ============================================================================ savings counter
+# Tokens are estimated as characters / 4 (close enough for English + log text).
+CHARS_PER_TOKEN = 4
+
+
+def record_usage(store, source, kind, in_chars, out_chars, calls=1):
+    """source 'local' = the local model read in_chars and wrote out_chars;
+    source 'claude' = a connector tool returned out_chars to Claude (in_chars unused)."""
+    day = time.strftime("%Y-%m-%d")
+    with store.lock:
+        store.db.execute(
+            "INSERT INTO ai_usage VALUES (?,?,?,?,?,?) ON CONFLICT(day, source, kind) DO UPDATE SET "
+            "calls=calls+excluded.calls, in_chars=in_chars+excluded.in_chars, out_chars=out_chars+excluded.out_chars",
+            (day, source, kind[:60], calls, int(in_chars), int(out_chars)))
+        store.db.commit()
+
+
+def savings(store, days=7):
+    """Per day: what the local model read (that Claude didn't have to), what it handed on,
+    and everything the connector returned to Claude."""
+    since = time.strftime("%Y-%m-%d", time.localtime(time.time() - (days - 1) * 86400))
+    with store.lock:
+        rows = store.db.execute("SELECT day, source, kind, calls, in_chars, out_chars FROM ai_usage "
+                                "WHERE day >= ? ORDER BY day", (since,)).fetchall()
+    tok = lambda c: round(c / CHARS_PER_TOKEN)
+    per = {}
+    for day, src, kind, calls, i, o in rows:
+        d = per.setdefault(day, {"day": day, "summaries": 0, "triaged": 0, "local_read": 0, "local_wrote": 0,
+                                 "claude_received": 0, "claude_calls": 0, "tools": {}})
+        if src == "local":
+            d["local_read"] += tok(i)
+            d["local_wrote"] += tok(o)
+            d["summaries" if kind != "triage" else "triaged"] += calls
+        else:
+            d["claude_received"] += tok(o)
+            d["claude_calls"] += calls
+            d["tools"][kind] = d["tools"].get(kind, 0) + tok(o)
+    out = []
+    for d in per.values():
+        # avoided = what the local model read minus the short answer it passed on
+        d["avoided"] = max(0, d["local_read"] - d["local_wrote"])
+        total = d["avoided"] + d["claude_received"]
+        d["saved_pct"] = round(100 * d["avoided"] / total) if total else 0
+        d["tools"] = dict(sorted(d["tools"].items(), key=lambda kv: -kv[1])[:8])
+        out.append(d)
+    tot = {k: sum(d[k] for d in out) for k in ("summaries", "triaged", "local_read", "local_wrote",
+                                                 "claude_received", "claude_calls", "avoided")}
+    t = tot["avoided"] + tot["claude_received"]
+    tot["saved_pct"] = round(100 * tot["avoided"] / t) if t else 0
+    return {"days": out[::-1], "total": tot, "chars_per_token": CHARS_PER_TOKEN}
 
 
 def lines_text(lines, max_chars):

@@ -240,16 +240,32 @@ def finish(lines):
     return cap("\n".join(lines), MAX_OUT)
 
 
+def _report_usage(tool, chars):
+    """Tell the dashboard how much this tool sent to Claude (for the savings counter). Never blocks."""
+    def go():
+        try:
+            u = f"{base()}/api/ai/claude_usage?" + urllib.parse.urlencode({"tool": tool, "chars": chars})
+            urllib.request.urlopen(u, timeout=5).read()
+        except Exception:
+            pass
+    import threading
+    threading.Thread(target=go, daemon=True).start()
+
+
 def guard(fn):
-    """Turn 'dashboard not running' into a readable answer instead of a tool crash."""
+    """Turn 'dashboard not running' into a readable answer instead of a tool crash,
+    and count what each tool hands to Claude."""
     import functools
 
     @functools.wraps(fn)
     def wrap(*a, **kw):
         try:
-            return fn(*a, **kw)
+            out = fn(*a, **kw)
         except FeedDown as ex:
             return str(ex)
+        if isinstance(out, str):
+            _report_usage(fn.__name__, len(out))
+        return out
     return wrap
 
 
@@ -1042,6 +1058,29 @@ def did_my_fix_work(function: str, profile: str = "", window_hours: float = 24,
         out.append("\nEarlier deploys: " + "; ".join(
             f"{t(x['deployed_at'])} {x['kind']}{' ' + x['label'] if x.get('label') else ''}"
             for x in r["previous"]))
+    return finish(out)
+
+
+@mcp.tool()
+@guard
+def usage_savings(days: int = 7) -> str:
+    """How much reading the local model (on the user's tower) did instead of Claude, per day:
+    tokens it read, tokens it passed on, and everything this connector returned to Claude.
+    Use when the user asks whether the local model is saving Claude usage."""
+    r = api("/api/ai/savings", days=days)
+    k = lambda n: f"{n / 1000:.1f}k" if n >= 1000 else str(n)
+    tot = r["total"]
+    out = [f"Savings, last {days} day(s) (tokens estimated as characters / {r['chars_per_token']}):",
+           f"TOTAL: local model read ~{k(tot['local_read'])} tokens of logs ({tot['summaries']} summaries, "
+           f"{tot['triaged']} triaged patterns) and passed on ~{k(tot['local_wrote'])}; Claude received "
+           f"~{k(tot['claude_received'])} from {tot['claude_calls']} tool calls -> ~{tot['saved_pct']}% of the "
+           f"log reading happened locally (~{k(tot['avoided'])} tokens avoided)."]
+    for d in r["days"]:
+        tools = ", ".join(f"{t} ~{k(v)}" for t, v in d["tools"].items())
+        out.append(f"- {d['day']}: local read ~{k(d['local_read'])}, Claude received ~{k(d['claude_received'])} "
+                   f"({d['claude_calls']} calls), ~{d['saved_pct']}% saved" + (f". Biggest: {tools}" if tools else ""))
+    out.append("Background triage counts as avoided only if Claude would otherwise have read those lines; "
+               "summaries are a direct saving. Claude's own reasoning and code work aren't included.")
     return finish(out)
 
 

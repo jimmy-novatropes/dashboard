@@ -1888,6 +1888,11 @@ def make_handler(store, workers, cfg):
                                   "triaged": TRIAGE.done if TRIAGE else 0,
                                   "working_on": TRIAGE.running_now if TRIAGE else None,
                                   "last_error": TRIAGE.last_error if TRIAGE else None})
+            if path == "/api/ai/savings":
+                return self.json(aws_local.savings(store, int(q.get("days") or 7)))
+            if path == "/api/ai/claude_usage":          # the connector reports what it returned to Claude
+                aws_local.record_usage(store, "claude", q.get("tool") or "?", 0, int(q.get("chars") or 0))
+                return self.json({"ok": True})
             if path == "/api/ai/triage_map":
                 return self.json({f"{k[0]}|{k[1]}|{k[2]}": v for k, v in aws_local.get_triage(store).items()})
             if path == "/api/ai/job":
@@ -2745,6 +2750,9 @@ async function aiStatus(){
     $('aiStatus').innerHTML=a.ok?`🤖 Local model <b>${esc(a.model)}</b> ready · ${a.triaged} patterns triaged this session${a.working_on?` · now: ${esc(a.working_on)}`:''}${a.last_error?` · <span style="color:var(--sus)">${esc(a.last_error)}</span>`:''}`
       :`<span style="color:var(--mute)">🤖 Local model off — ${esc(a.detail)}</span>`;
     AI_OK=a.ok; }catch(e){}
+  try{ const s=(await getJ('/api/ai/savings?days=1')).total, k=n=>n>=1000?(n/1000).toFixed(n>=10000?0:1)+'k':String(n);
+    if(s.local_read||s.claude_received) $('aiStatus').innerHTML+=` · <span title="Estimated tokens (characters ÷ 4). Tower read = log text the local model read instead of Claude. Claude received = everything the connector sent to Claude today.">💰 Today: tower read <b>~${k(s.local_read)}</b> tokens · Claude received <b>~${k(s.claude_received)}</b> · <b>~${s.saved_pct}%</b> saved</span>`;
+  }catch(e){}
 }
 let AI_OK=false;
 function aiLine(t){
@@ -2857,6 +2865,7 @@ def main():
     aws_local.init_db(store)
     global LLM, AIJOBS, TRIAGE
     LLM = aws_local.LocalLLM(cfg)
+    LLM.meter = lambda kind, i, o: aws_local.record_usage(store, "local", kind, i, o)
     AIJOBS = aws_local.Jobs(LLM)
     global CODE, EXTRA_RX
     EXTRA_RX[:] = [re.compile(x, re.I) for x in cfg["record_count_patterns"]]
