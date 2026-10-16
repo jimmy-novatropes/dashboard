@@ -782,7 +782,9 @@ def _ago(ms):
 def client_card(profile, parts):
     """parts: precomputed pieces for one client -> card with status + reasons."""
     red, amber = [], []
-    if not parts["connected"]:
+    if parts.get("starting"):
+        amber.append("Connecting… first pull in progress")
+    elif not parts["connected"]:
         red.append(f"Can't connect to AWS: {parts['connection_error']}")
     for s in parts["sched_bad"]:
         red.append(f"Schedule {s['name']}: {s['status']}")

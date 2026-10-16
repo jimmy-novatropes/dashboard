@@ -90,6 +90,12 @@ DEFAULTS = {
     "keep_hours": 24,
     "poll_seconds": 30,
     "lookback_minutes": 60,      # how far back to look the very first time
+    # Fast start: the first pull after starting only catches up this many hours, so the feed is
+    # live within a minute; the rest of the keep_hours window then fills in the background.
+    "startup_hours": 2,
+    # If errors.db grows past this, it's slimmed once at start (keeps the last keep_hours of lines,
+    # 7 days of error / hidden-error lines, and everything else: notes, mutes, deploys, baselines).
+    "slim_db_over_mb": 800,
     "group_refresh_minutes": 10,
     "max_groups_per_region": 300,
     "live_max_events_per_group": 10000,            # per poll; beyond this it's sampled
@@ -140,10 +146,18 @@ DEFAULTS = {
 
 
 def load_config(path):
-    cfg = dict(DEFAULTS)
+    """Defaults, then config.json next to this script (if there is one), or the file given with -c.
+    Nested settings such as local_llm are merged, so you only list the keys you change."""
+    cfg = json.loads(json.dumps(DEFAULTS))
+    path = path or (os.path.join(HERE, "config.json") if os.path.exists(os.path.join(HERE, "config.json")) else None)
     if path:
-        with open(path) as f:
-            cfg.update(json.load(f))
+        with open(path, encoding="utf-8-sig") as f:
+            for k, v in json.load(f).items():
+                if isinstance(v, dict) and isinstance(cfg.get(k), dict):
+                    cfg[k].update(v)
+                else:
+                    cfg[k] = v
+        print("Config:", path)
     return cfg
 
 
@@ -334,6 +348,103 @@ def reset_old_db(path):
           f"re-pulled from AWS as needed.")
 
 
+def slim_db(path, cfg):
+    """One-time compaction when errors.db has grown too big: copy what matters into a fresh file
+    (last keep_hours of lines, 7 days of error / hidden-error / warning lines, all other tables),
+    then swap it in. Much faster than deleting millions of rows in place."""
+    limit = cfg.get("slim_db_over_mb") or 0
+    if not limit or not os.path.exists(path):
+        return
+    size = os.path.getsize(path) + (os.path.getsize(path + "-wal") if os.path.exists(path + "-wal") else 0)
+    if size < limit * 1_048_576:
+        return
+    t0, new = time.time(), path + ".slim"
+    print(f"{os.path.basename(path)} is {size / 1_073_741_824:.1f} GB - slimming it once (takes a minute or two)…",
+          flush=True)
+    for s in ("", "-wal", "-shm", "-journal"):
+        if os.path.exists(new + s):
+            os.remove(new + s)
+    now = int(time.time() * 1000)
+    keep_from, err_from = now - int(cfg["keep_hours"] * 3_600_000), now - 7 * DAY_MS
+    c = sqlite3.connect(new, isolation_level=None)   # autocommit: one bad chunk never poisons the rest
+    try:
+        c.execute("PRAGMA auto_vacuum=INCREMENTAL")
+        c.execute("PRAGMA journal_mode=MEMORY")      # failed statements roll back cleanly
+        c.execute("PRAGMA synchronous=OFF")
+        c.execute("ATTACH DATABASE ? AS src", (path,))
+        objs = c.execute("SELECT type, name, tbl_name, sql FROM src.sqlite_master WHERE sql IS NOT NULL").fetchall()
+        for typ, name, _, sql in objs:
+            if typ == "table" and name != "sqlite_sequence":
+                c.execute(sql)
+        lines_lost = False
+        for typ, name, _, sql in objs:
+            if typ != "table" or name == "sqlite_sequence":
+                continue
+            if name == "events":
+                # in chunks of rowid, so a damaged part of the file only loses that chunk
+                top = c.execute("SELECT max(seq) FROM src.events").fetchone()[0] or 0
+                n = bad = 0
+                for hi in range(top, 0, -50_000):
+                    try:
+                        n += c.execute("INSERT INTO main.events SELECT * FROM src.events WHERE seq BETWEEN ? AND ? "
+                                       "AND (ts >= ? OR (ts >= ? AND level IN ('error','suspect','warning')))",
+                                       (hi - 49_999, hi, keep_from, err_from)).rowcount
+                    except sqlite3.DatabaseError:
+                        bad += 1
+                print(f"  kept {n:,} log lines" + (f" ({bad} damaged chunk(s) skipped)" if bad else ""), flush=True)
+                lines_lost = lines_lost or bad > 0
+                continue
+            try:
+                c.execute(f'INSERT INTO main."{name}" SELECT * FROM src."{name}"')
+            except sqlite3.DatabaseError as ex:      # e.g. a damaged file (the failed copy is rolled back)
+                print(f"  couldn't copy {name} ({ex}) - skipped", flush=True)
+        for typ, name, _, sql in objs:
+            if typ in ("index", "trigger", "view"):
+                c.execute(sql)
+        # older ranges were dropped: forget they were loaded, so picking them pulls them fresh
+        for key, cf, lp, tg in c.execute("SELECT key, covered_from, last_polled, target FROM coverage "
+                                         "WHERE key LIKE 'v2|%' OR key LIKE 'sfn|%' OR key LIKE 'exp|%'").fetchall():
+            if key.startswith("exp|"):
+                c.execute("UPDATE coverage SET covered_from=0 WHERE key=?", (key,))
+            elif lines_lost and key.startswith("v2|"):
+                c.execute("UPDATE coverage SET covered_from=?, last_polled=0, target=? WHERE key=?",
+                          (now, keep_from, key))
+            else:
+                c.execute("UPDATE coverage SET covered_from=?, target=? WHERE key=?",
+                          (max(cf or 0, keep_from), max(tg or 0, keep_from) if tg else tg, key))
+        c.commit()
+        c.execute("DETACH DATABASE src")
+    except Exception as ex:
+        c.close()
+        for s in ("", "-wal", "-shm", "-journal"):
+            if os.path.exists(new + s):
+                os.remove(new + s)
+        if "malformed" in str(ex) or "not a database" in str(ex):
+            # unreadable: it's only a cache, so set it aside and start a fresh one
+            aside = path + ".damaged"
+            try:
+                for s in ("", "-wal", "-shm"):
+                    if os.path.exists(path + s):
+                        os.replace(path + s, aside + s)
+                print(f"  the file is damaged ({ex}); moved it to {os.path.basename(aside)} (safe to delete) "
+                      f"and starting a fresh cache", flush=True)
+            except OSError:
+                sys.exit(f"Couldn't move {os.path.basename(path)} - is another copy of the feed still running?")
+            return
+        print(f"  slimming failed ({ex}); keeping the existing file", flush=True)
+        return
+    c.close()
+    try:
+        for s in ("-wal", "-shm", ""):
+            if os.path.exists(path + s):
+                os.remove(path + s)
+    except OSError:
+        sys.exit(f"Couldn't replace {os.path.basename(path)} - is another copy of the feed still running? "
+                 f"Stop it and start this again.")
+    os.replace(new, path)
+    print(f"  done in {time.time() - t0:.0f}s - now {os.path.getsize(path) / 1_048_576:.0f} MB", flush=True)
+
+
 class Store:
     def __init__(self, path, cfg):
         self.lock = threading.Lock()
@@ -346,6 +457,7 @@ class Store:
         self.db.executescript(f"""
             PRAGMA auto_vacuum=INCREMENTAL;
             PRAGMA journal_mode=WAL;
+            PRAGMA journal_size_limit=67108864;
             CREATE TABLE IF NOT EXISTS events(
                 seq INTEGER PRIMARY KEY AUTOINCREMENT, id TEXT UNIQUE, ts INTEGER,
                 profile TEXT, account TEXT, region TEXT, grp TEXT, stream TEXT,
@@ -402,23 +514,33 @@ class Store:
             self.db.commit()
             return cur.rowcount
 
+    def _delete_batched(self, where, params, batch=5000):
+        """Delete in small chunks, releasing the lock in between, so a big clean-up never
+        freezes the feed or balloons the -wal file."""
+        total = 0
+        while True:
+            with self.lock:
+                n = self.db.execute(f"DELETE FROM events WHERE seq IN (SELECT seq FROM events WHERE {where} "
+                                    f"LIMIT {batch})", params).rowcount
+                self.db.commit()
+            total += n
+            if n < batch:
+                break
+            time.sleep(0.05)
+        if total > 50_000:
+            self.shrink()
+        return total
+
     def delete_older(self, cutoff, profile, region):
         """Drop one account/region's lines older than cutoff."""
-        with self.lock:
-            n = self.db.execute("DELETE FROM events WHERE profile=? AND region=? AND ts < ?",
-                                (profile, region, cutoff)).rowcount
-            self.db.commit()
-        return n
+        return self._delete_batched("profile=? AND region=? AND ts < ?", (profile, region, cutoff))
 
     def delete_orphans(self, cutoff, keys):
         """Drop old lines from accounts that are no longer watched."""
-        with self.lock:
-            q = "DELETE FROM events WHERE ts < ?"
-            if keys:
-                q += f" AND profile || '/' || region NOT IN ({','.join('?' * len(keys))})"
-            n = self.db.execute(q, [cutoff] + list(keys)).rowcount
-            self.db.commit()
-        return n
+        q = "ts < ?"
+        if keys:
+            q += f" AND profile || '/' || region NOT IN ({','.join('?' * len(keys))})"
+        return self._delete_batched(q, [cutoff] + list(keys))
 
     def shrink(self):
         """Give freed space back to the disk."""
@@ -1076,6 +1198,7 @@ def clients_overview(store, workers, cfg, max_age=60):
     for prof in profiles:
         views = infra_views(store, workers, prof)
         conn_err = [status.get(w.key, {}).get("error") for w, _, _ in views if not status.get(w.key, {}).get("ok")]
+        starting = bool(conn_err) and all(e == "starting…" for e in conn_err)
         sched, fns, alarms, api5, nothing = [], [], [], [], []
         for w, snap, st in views:
             sched += aws_infra.schedule_health(snap, st, now, w.covered_from)
@@ -1110,7 +1233,7 @@ def clients_overview(store, workers, cfg, max_age=60):
         recent = [impact(d) for d in latest.values() if d["deployed_at"] >= now - DAY_MS]
         bad_deps = [x for x in recent if x["verdict"] in ("worse", "new errors")]
         parts = {
-            "connected": not conn_err, "connection_error": (conn_err or [""])[0],
+            "connected": not conn_err, "connection_error": (conn_err or [""])[0], "starting": starting,
             "sched_bad": [x for x in sched if x["status"] in ("not running", "missed runs", "target missing")],
             "last_failed": [x for x in sched if x["status"] == "last run failed"],
             "regressions": [g for g in pats if g.get("regression")],
@@ -1439,10 +1562,25 @@ class Worker(threading.Thread):
         self.last_expire_check = 0
         cov = store.get_coverage(self.cov_key)
         if cov:
-            # after a long break, only catch up on the cache window, not the whole gap
-            self.cursor = max(cov["last_polled"] or 0, now - self.keep_ms)
             self.covered_from = cov["covered_from"]
             self.target = cov["target"] or self.covered_from
+            keep_from = now - self.keep_ms
+            if now >= self.hist_expires:
+                # an older range picked earlier has expired: don't resume pulling weeks of history
+                self.target = max(self.target, keep_from)
+                self.covered_from = max(self.covered_from, keep_from)
+                self.sfn_covered_from = max(self.sfn_covered_from, keep_from)
+            # fast start: catch up only the last startup_hours live; the rest of the gap is
+            # backfilled in the background after the feed is up
+            fast_from = now - int(cfg["startup_hours"] * 3_600_000)
+            last = cov["last_polled"] or 0
+            if last < fast_from:
+                # gap between the last poll and now: refill it backwards from fast_from
+                # (lines already in the cache are skipped as duplicates)
+                self.cursor = self.covered_from = fast_from
+                self.target = min(self.target, keep_from)
+            else:
+                self.cursor = last
         else:
             self.cursor = self.covered_from = self.target = now - cfg["lookback_minutes"] * 60_000
             self.save()
@@ -2631,6 +2769,7 @@ async function status(){
     const s=await getJ('/api/status'), now=Date.now(), vals=Object.values(s);
     vals.forEach(v=>v.profile&&knownProfiles.add(v.profile)); updateProfiles();
     $('status').innerHTML=Object.entries(s).map(([k,v])=>{
+      if(!v.ok && (v.error||'starting…')==='starting…') return `<span class="chip" title="first pull in progress">◌ ${esc(k)} — connecting…</span>`;
       if(!v.ok) return `<span class="chip bad" title="${esc(v.error||'starting…')}">● ${esc(k)} — ${esc((v.error||'starting…').slice(0,90))}</span>`;
       const pct=v.backfilling?Math.round(100*(now-v.covered_from)/Math.max(1,now-v.target)):100;
       return `<span class="chip good" title="${v.groups} log groups · history loaded back to ${day(v.covered_from)}${v.sampled?` · ${v.sampled} times a log group was too busy to pull every line (errors still pulled)`:''}"><b>●</b> ${esc(k)} (${esc(v.account||'?')}) · ${v.groups} groups${v.state_machines?` · ${v.state_machines} state machines`:''}${v.lambdas?` · ${v.lambdas} lambdas`:''}${v.lambda_error?` · <span style="color:var(--sus)" title="${esc(v.lambda_error)}">deploys: ${/AccessDenied/.test(v.lambda_error)?'no permission':'error'}</span>`:''}${v.sfn_error?` · <span style="color:var(--sus)" title="${esc(v.sfn_error)}">step functions: ${/AccessDenied/.test(v.sfn_error)?'no permission':'error'}</span>`:''}${v.backfilling?` · loading ${pct}%`:''}${v.sampled?' · sampled':''}</span>`}).join('');
@@ -2711,6 +2850,8 @@ def main():
         return
 
     db = cfg["db_file"] if os.path.isabs(cfg["db_file"]) else os.path.join(HERE, cfg["db_file"])
+    reset_old_db(db)
+    slim_db(db, cfg)
     store = Store(db, cfg)
     aws_ops.init_db(store)
     aws_local.init_db(store)
