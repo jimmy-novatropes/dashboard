@@ -2086,7 +2086,7 @@ def make_handler(store, workers, cfg):
 
         def do_POST(self):
             u = urlparse(self.path)
-            if u.path != "/api/ai/read":
+            if u.path not in ("/api/ai/read", "/api/ai/prompt", "/api/ai/filemap", "/api/ai/filemap_known"):
                 return self.send(404, "not found", "text/plain")
             n = int(self.headers.get("Content-Length") or 0)
             if n > 12_000_000:
@@ -2095,8 +2095,19 @@ def make_handler(store, workers, cfg):
                 body = json.loads(self.rfile.read(n).decode("utf-8") or "{}")
             except ValueError:
                 return self.send(400, "bad json", "text/plain")
+            if u.path == "/api/ai/filemap_known":
+                return self.json(AIJOBS.filemap_known(body.get("files") or []))
             if not LLM.ready:
                 return self.json({"error": "Local model not available: " + LLM.state["detail"]})
+            if u.path == "/api/ai/prompt":
+                tpl = str(body.get("template") or "")
+                if tpl not in aws_local.TEMPLATES:
+                    return self.json({"error": f"unknown template {tpl}"})
+                return self.json({"id": AIJOBS.start_prompt(tpl, str(body.get("text") or ""),
+                                                            str(body.get("question") or ""))})
+            if u.path == "/api/ai/filemap":
+                files = [f for f in (body.get("files") or []) if isinstance(f, dict)]
+                return self.json({"id": AIJOBS.start_filemap(files), "files": len(files)})
             docs = [{"name": str(d.get("name") or "text")[:300], "text": str(d.get("text") or "")}
                     for d in (body.get("docs") or []) if isinstance(d, dict)]
             if not docs:
@@ -2945,7 +2956,7 @@ def main():
     global LLM, AIJOBS, TRIAGE
     LLM = aws_local.LocalLLM(cfg)
     LLM.meter = lambda kind, i, o: aws_local.record_usage(store, "local", kind, i, o)
-    AIJOBS = aws_local.Jobs(LLM)
+    AIJOBS = aws_local.Jobs(LLM, store)
     global CODE, EXTRA_RX
     EXTRA_RX[:] = [re.compile(x, re.I) for x in cfg["record_count_patterns"]]
     root = cfg["repos_root"] or os.path.dirname(HERE)

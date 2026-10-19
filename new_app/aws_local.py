@@ -161,6 +161,7 @@ def init_db(store):
             CREATE TABLE IF NOT EXISTS ai_triage(
                 etype TEXT, sig TEXT, profile TEXT, at INTEGER, model TEXT, count INTEGER, data TEXT,
                 PRIMARY KEY(etype, sig, profile));
+            CREATE TABLE IF NOT EXISTS ai_cache(k TEXT PRIMARY KEY, at INTEGER, text TEXT);
             CREATE TABLE IF NOT EXISTS ai_usage(
                 day TEXT, source TEXT, kind TEXT, calls INTEGER, in_chars INTEGER, out_chars INTEGER,
                 PRIMARY KEY(day, source, kind));
@@ -271,11 +272,134 @@ class Triage(threading.Thread):
 
 
 # ============================================================================ on-demand jobs
+class PCache:
+    """Answers kept in errors.db, so a restart doesn't re-read the same files / logs (30 days)."""
+
+    def __init__(self, store, days=30):
+        self.store, self.mem = store, {}
+        with store.lock:
+            store.db.execute("DELETE FROM ai_cache WHERE at < ?", (int(time.time()) - days * 86400,))
+            store.db.commit()
+
+    def get(self, k):
+        if k in self.mem:
+            return self.mem[k]
+        with self.store.lock:
+            r = self.store.db.execute("SELECT text FROM ai_cache WHERE k = ?", (k,)).fetchone()
+        if r:
+            self.mem[k] = r[0]
+            return r[0]
+        return None
+
+    def __contains__(self, k):
+        return self.get(k) is not None
+
+    def __getitem__(self, k):
+        v = self.get(k)
+        if v is None:
+            raise KeyError(k)
+        return v
+
+    def __setitem__(self, k, v):
+        self.mem[k] = v
+        with self.store.lock:
+            self.store.db.execute("INSERT OR REPLACE INTO ai_cache VALUES (?,?,?)", (k, int(time.time()), v))
+            self.store.db.commit()
+
+
+# Single-shot templates (laptop-side tools choose one by name)
+TEMPLATES = {
+    "edit": ("""You edit code for a developer. You get part of a file with line numbers ("  12| code") and an
+instruction that applies to lines START-END. Return ONLY the complete new text for lines START-END:
+no line numbers, no markdown fences, no explanation. Keep the existing indentation, style and names.
+Change only what the instruction asks. If it can't be done safely from what you see, return exactly
+one line: CANNOT: <short reason>""", 1600),
+    "commit": ("""Write a git commit message for this diff. First line: a summary of at most 72 characters in
+the imperative mood. Then a blank line and up to 6 short bullet points of what changed (and why, if
+visible). Plain text, no markdown headers, nothing invented.""", 400),
+    "fix": ("""You get an error brief from an AWS Lambda / Step Functions integration: the error, what the
+function logged just before it, the code around the failing line, recent runs and team notes.
+Reply with: 1) Likely root cause (1-2 sentences). 2) Where: file:line(s) to change. 3) Suggested
+fix (a few lines of code if obvious). 4) How to verify. Base everything on the brief; if the
+evidence doesn't support a conclusion, say "uncertain" and what to check next. Max 12 lines.""", 700),
+    "narrative": ("""Write a short, client-friendly executive summary (3-5 sentences) of this integration health
+report: overall status, what went wrong (if anything) and what was done or is planned. Plain
+language, no jargon, nothing that isn't in the report.""", 400),
+    "run": ("""Summarise this command output (tests / build / script run) for a developer: overall result first
+(passed/failed, counts), then each failure: test or step name, file:line and the key error or
+assertion message. Ignore passing noise. At most 12 bullets.""", 700),
+    "filemap": ("""Describe what this file does in ONE line of at most 20 words. No preamble, no markdown.""", 60),
+}
+
+
 class Jobs:
     """Summaries can take a while on a local GPU, so they run as jobs; callers poll."""
 
-    def __init__(self, llm):
-        self.llm, self.jobs, self.cache, self.lock = llm, {}, {}, threading.Lock()
+    def __init__(self, llm, store=None):
+        self.llm, self.jobs, self.lock = llm, {}, threading.Lock()
+        self.cache = PCache(store) if store is not None else {}
+
+    def start_prompt(self, template, text, question="", kind=None):
+        """One call with a named template (edit / commit / fix / narrative / run / filemap)."""
+        system, max_tokens = TEMPLATES[template]
+        kind = kind or template
+        text = text[: self.llm.chunk_chars - 400]
+        key = hashlib.sha1((self.llm.model + "tpl:" + template + question + text).encode()).hexdigest()
+        jid = uuid.uuid4().hex[:10]
+        if key in self.cache:
+            self.jobs[jid] = {"id": jid, "status": "done", "answer": self.cache[key], "cached": True}
+            return jid
+        job = {"id": jid, "status": "running", "answer": None, "started": time.time()}
+        with self.lock:
+            self.jobs[jid] = job
+
+        def work():
+            try:
+                q = f"{question}\n\n" if question else ""
+                ans = self.llm.chat(system, q + text, timeout=900, max_tokens=max_tokens, kind=kind)
+                job["answer"], job["status"] = ans, "done"
+                self.cache[key] = ans
+            except Exception as ex:
+                job["status"], job["error"] = "error", str(ex)[:300]
+        threading.Thread(target=work, daemon=True).start()
+        return jid
+
+    def filemap_known(self, items):
+        """{name: purpose} for files whose content hash was already described."""
+        out = {}
+        for it in items:
+            v = self.cache.get("fm:" + self.llm.model + ":" + str(it.get("sha")))
+            if v:
+                out[it["name"]] = v
+        return out
+
+    def start_filemap(self, files):
+        """Describe each file in one line (cached by content hash). Background; poll with get()."""
+        jid = uuid.uuid4().hex[:10]
+        job = {"id": jid, "status": "running", "answer": None, "started": time.time(), "parts": len(files),
+               "done_parts": 0, "purposes": {}}
+        with self.lock:
+            self.jobs[jid] = job
+        system, max_tokens = TEMPLATES["filemap"]
+
+        def work():
+            try:
+                for f in files:
+                    k = "fm:" + self.llm.model + ":" + str(f.get("sha"))
+                    v = self.cache.get(k)
+                    if not v:
+                        txt = _numbered((f.get("text") or "")[: self.llm.chunk_chars - 600])
+                        v = self.llm.chat(system, f"File: {f.get('name')}\n\n{txt}", timeout=600,
+                                          max_tokens=max_tokens, kind="repo_map").strip().splitlines()[0][:200] \
+                            if (f.get("text") or "").strip() else "(empty)"
+                        self.cache[k] = v
+                    job["purposes"][f.get("name")] = v
+                    job["done_parts"] += 1
+                job["status"] = "done"
+            except Exception as ex:
+                job["status"], job["error"] = "error", str(ex)[:300]
+        threading.Thread(target=work, daemon=True).start()
+        return jid
 
     def start(self, question, text, kind="summary"):
         key = hashlib.sha1((self.llm.model + kind + question + text).encode()).hexdigest()

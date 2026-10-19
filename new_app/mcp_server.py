@@ -45,7 +45,7 @@ BASE = URLS[0]
 AUTOSTART = os.environ.get("AWS_ERROR_FEED_AUTOSTART", "1") != "0"
 REPOS = os.environ.get("AWS_ERROR_FEED_REPOS") or None
 _active = {"url": None, "at": 0.0}
-MAX_OUT = 60_000          # keep tool results a sensible size for the conversation
+MAX_OUT = 40_000          # keep tool results a sensible size for the conversation
 
 INSTRUCTIONS = """\
 Read-only access to the user's AWS Error Feed dashboard, which watches CloudWatch Logs and
@@ -77,6 +77,13 @@ deal 991?"): trace_record. Run-level: list_runs / get_run; did_nothing_check for
 but processed nothing. Fixing code: locate_code turns an error's stack trace into repo file paths
 with the code around the failing line. Team notes on patterns appear as "NOTE from the team" -
 respect them (e.g. don't re-investigate known, accepted issues). client_report = weekly report.
+
+Coding with fewer tokens: find_code(query, repo) returns only matching lines (file:line) - use it
+instead of opening files to search; repo_map(repo) gives the repo layout with one-line purposes;
+fix_brief(profile, ...) bundles everything needed to fix one error plus a local diagnosis;
+local_run(command, repo) runs tests/checks and returns only failures; local_draft_change(path,
+start, end, instruction) lets the local model write a small edit and returns a diff (apply=True writes
+it); draft_commit_message(repo) drafts a commit message. Review local-model output before relying on it.
 
 Saving context for code and documents: before reading a big file, a whole folder, a long diff or
 git history yourself, use local_read(path, question) or local_git(repo, what, question): the local
@@ -249,6 +256,38 @@ def flags(g):
     return out
 
 
+_NUM = __import__("re").compile(r"\d+")
+
+
+def _brief_lines(lines, max_lines=120):
+    """Collapse repeated lines (same text apart from numbers) and keep problem lines with context."""
+    rows, last_key = [], None
+    for l in lines:
+        key = (l["level"], _NUM.sub("#", l["message"][:200]))
+        if key == last_key:
+            rows[-1]["n"] += 1
+            continue
+        last_key = key
+        rows.append({"l": l, "n": 1})
+    def fmt(r):
+        l = r["l"]
+        width = 2500 if l["level"] in ("error", "suspect") else 300
+        return f"{t(l['ts'])} [{l['level']}] {cap(l['message'], width)}" + (f"  (×{r['n']} similar)" if r["n"] > 1 else "")
+    if len(rows) <= max_lines:
+        return [fmt(r) for r in rows]
+    keep = set(range(10)) | set(range(len(rows) - 10, len(rows)))
+    for i, r in enumerate(rows):
+        if r["l"]["level"] in ("error", "suspect"):
+            keep |= set(range(max(0, i - 3), i + 1))
+    out, prev = [], -1
+    for i in sorted(keep):
+        if i - prev > 1:
+            out.append(f"   … {i - prev - 1} line(s) omitted (detail=\"full\" shows all)")
+        out.append(fmt(rows[i]))
+        prev = i
+    return out
+
+
 def top(d, n=4):
     items = list(d.items())
     s = ", ".join(f"{k} ({v})" for k, v in items[:n])
@@ -363,8 +402,8 @@ def error_overview(hours: float = 24, profile: str = "") -> str:
     for prof, b in sorted(by.items(), key=lambda x: -(x[1]["error"] * 3 + x[1]["suspect"])):
         out.append(f"\n## {prof}: {b['error']} errors, {b['suspect']} hidden errors "
                    f"({lines_per.get(prof, 0)} log lines total)")
-        for n, g in sorted(b["pats"], key=lambda x: -x[0])[:5]:
-            out.append(f"- [{g['level']}] {g['etype']}: {g['sig'][:140]} — {n}× in "
+        for n, g in sorted(b["pats"], key=lambda x: -x[0])[:3]:
+            out.append(f"- [{g['level']}] {g['etype']}: {g['sig'][:110]} — {n}× in "
                        f"{top(g['log_groups'], 2)}; last {t(g['last_seen'])}{flags(g)}")
     quiet = sorted(set(lines_per) - set(by))
     if quiet:
@@ -376,14 +415,16 @@ def error_overview(hours: float = 24, profile: str = "") -> str:
 @mcp.tool()
 @guard
 def list_error_patterns(hours: float = 24, profile: str = "", level: str = "error,suspect",
-                        log_group_prefix: str = "", search: str = "", limit: int = 25,
-                        only_new_or_spiking: bool = False, include_muted: bool = False) -> str:
+                        log_group_prefix: str = "", search: str = "", limit: int = 12,
+                        only_new_or_spiking: bool = False, include_muted: bool = False,
+                        detail: str = "brief") -> str:
     """Recurring problems grouped by type and message (ids/numbers ignored), with counts, which
     log groups they come from, first/last seen and the latest full example.
     level: comma list of error,suspect,warning,info,platform. log_group_prefix e.g.
     '/aws/lambda/anew-' or 'stepfunctions:'. search: free text. Each pattern is tagged NEW (first
     seen in the last 24h), SPIKE (well above its 7-day average) or REGRESSION (marked fixed, came back).
-    Muted / fixed patterns are hidden unless include_muted."""
+    Muted / fixed patterns are hidden unless include_muted. detail="brief" (default) gives a short
+    example per pattern; detail="full" adds per-pattern links and longer examples."""
     note = ensure_range(hours)
     rows = api("/api/summary", hours=hours, profile=profile, level=level,
                grp_prefix=log_group_prefix, q=search, hide_muted="" if include_muted else 1)
@@ -402,8 +443,9 @@ def list_error_patterns(hours: float = 24, profile: str = "", level: str = "erro
                 *([f"trend: {g['last24']} in last 24h vs {g['prev7_daily_avg']}/day over the previous week"]
                   if g.get("last24") is not None else []),
                 f"lines: get_log_lines(error_type={json.dumps(g['etype'])}, signature={json.dumps(g['sig'])}, hours={hours})",
-                f"dashboard: {link(tab='errors' if g['level'] == 'error' else 'suspect' if g['level'] == 'suspect' else 'all', hours=int(hours), etype=g['etype'], sig=g['sig'])}",
-                "latest example:", "```", cap(g["sample"], 1500), "```"]
+                *([f"dashboard: {link(tab='errors' if g['level'] == 'error' else 'suspect' if g['level'] == 'suspect' else 'all', hours=int(hours), etype=g['etype'], sig=g['sig'])}"]
+                  if detail == "full" else []),
+                "latest example:", "```", cap(g["sample"], 1500 if detail == "full" else 600), "```"]
     return finish(out)
 
 
@@ -819,10 +861,12 @@ def trace_record(record_id: str = "", profile: str = "", days: float = 7, includ
 
 @mcp.tool()
 @guard
-def list_runs(function: str, profile: str = "", hours: float = 24, only_problems: bool = False) -> str:
+def list_runs(function: str, profile: str = "", hours: float = 24, only_problems: bool = False,
+              limit: int = 30, detail: str = "brief") -> str:
     """A Lambda's individual runs (newest first): end time, duration, records processed, errors,
     hidden errors, memory, outcome (ok / failed / timeout / hidden errors / no records) and the first
-    problem line. Use get_run to read one run's full log."""
+    problem line. detail="brief" (default) folds runs of consecutive clean OK runs into one line;
+    detail="full" lists every run (up to `limit`). Use get_run to read one run's log."""
     m = _find_group(function, profile)
     if not m:
         return f"No Lambda runs loaded for '{function}'{' in ' + profile if profile else ''} (check the name / profile)."
@@ -833,19 +877,42 @@ def list_runs(function: str, profile: str = "", hours: float = 24, only_problems
     if only_problems:
         runs = [r for r in runs if r["outcome"] != "ok"]
     out = [f"{g['profile']} | {g['group']}: {len(runs)} runs in {hours:g}h — dashboard: {link(tab='runs', profile=g['profile'])}"]
-    for r in runs[:80]:
+    shown, ok_run = 0, []
+
+    def flush_ok():
+        if not ok_run:
+            return
+        if len(ok_run) == 1 or detail == "full":
+            for x in ok_run:
+                out.append(f"- {t(x['end'])} | {x['duration_ms'] / 1000:.1f}s | records {x['records'] if x['records'] is not None else '-'} | OK | request_id {x['request_id']}")
+        else:
+            recs = [x["records"] for x in ok_run if x["records"] is not None]
+            out.append(f"- {len(ok_run)} OK runs {t(ok_run[-1]['end'])} → {t(ok_run[0]['end'])}, "
+                       f"avg {sum(x['duration_ms'] for x in ok_run) / len(ok_run) / 1000:.1f}s"
+                       + (f", records {min(recs)}–{max(recs)}" if recs else "") + " (no problems)")
+        ok_run.clear()
+    for r in runs[: max(1, min(limit, 300))]:
+        if detail != "full" and r["outcome"] == "ok" and not r.get("first_problem") and not r["errors"] and not r["hidden"]:
+            ok_run.append(r)
+            continue
+        flush_ok()
         out.append(f"- {t(r['end'])} | {r['duration_ms'] / 1000:.1f}s | records {r['records'] if r['records'] is not None else '-'} | "
                    f"errors {r['errors']} hidden {r['hidden']} | {r['mem_used']}/{r['memory']} MB | {r['outcome'].upper()}"
                    f"{' (cold start)' if r['cold_start'] else ''} | request_id {r['request_id']}"
                    + (f"\n    first problem: {r['first_problem']['line'][:250]}" if r.get("first_problem") else ""))
+    flush_ok()
+    if len(runs) > limit:
+        out.append(f"(+{len(runs) - limit} older runs; raise limit to see them)")
     return finish(out)
 
 
 @mcp.tool()
 @guard
-def get_run(function: str, request_id: str, profile: str = "") -> str:
-    """Everything one Lambda run logged, in order (request_id from list_runs) - the clearest way to
-    read what happened inside a single failing or empty run."""
+def get_run(function: str, request_id: str, profile: str = "", detail: str = "brief") -> str:
+    """What one Lambda run logged, in order (request_id from list_runs) - the clearest way to read
+    what happened inside a single failing or empty run. detail="brief" (default) collapses repeated
+    lines and keeps every error / hidden-error line with what came just before it; detail="full"
+    returns every line. For a summary instead, use summarize_logs."""
     m = _find_group(function, profile)
     if not m:
         return f"No Lambda runs loaded for '{function}'."
@@ -855,8 +922,12 @@ def get_run(function: str, request_id: str, profile: str = "") -> str:
         return "Run not found in the loaded logs (it may be older than the 24-hour cache)."
     out = [f"{g['profile']} | {g['group']} | request {request_id} | ended {t(r['end'])} | {r['duration_ms'] / 1000:.1f}s | "
            f"{r['outcome'].upper()} | records {r['records']} | {r['mem_used']}/{r['memory']} MB | stream {r['stream']}"]
-    for l in r.get("lines_list", []):
-        out.append(f"{t(l['ts'])} [{l['level']}] {cap(l['message'], 2500)}")
+    lines = r.get("lines_list", [])
+    if detail == "full":
+        for l in lines:
+            out.append(f"{t(l['ts'])} [{l['level']}] {cap(l['message'], 2500)}")
+        return finish(out)
+    out += _brief_lines(lines)
     return finish(out)
 
 
@@ -908,15 +979,21 @@ def add_note(error_type: str, signature: str, note: str, profile: str = "", igno
 
 @mcp.tool()
 @guard
-def client_report(profile: str, days: float = 7) -> str:
+def client_report(profile: str, days: float = 7, tower_summary: bool = False) -> str:
     """Client-facing health report for one client over `days`: Lambda and workflow success rates
     (from CloudWatch metrics), records processed, errors vs the previous period, issues resolved,
     open items, scheduled-job problems, changes deployed, third-party service issues and recommended
-    maintenance. Returned as markdown - offer to turn it into a doc. Printable version via the link."""
+    maintenance. Returned as markdown - offer to turn it into a doc. Printable version via the link.
+    tower_summary=True adds a short client-friendly summary paragraph written by the local model."""
     r = api("/api/ops/report", profile=profile, days=days)
     if r.get("error"):
         return r["error"]
-    return finish([r["markdown"], f"\nPrintable / PDF: {base()}/report?profile={urllib.parse.quote(profile)}&days={days:g}"])
+    out = [r["markdown"], f"\nPrintable / PDF: {base()}/report?profile={urllib.parse.quote(profile)}&days={days:g}"]
+    if tower_summary:
+        jid, ans, err = _tower_job("narrative", r["markdown"], seconds=60)
+        out.insert(0, f"**Summary** (drafted by the local model - review): {ans.strip()}\n" if ans else
+                   f"(No local summary: {err or 'still being written, try again shortly'})\n")
+    return finish(out)
 
 
 def _wait_job(jid, seconds=45):
@@ -1247,6 +1324,459 @@ def local_git(repo: str = "", what: str = "log", ref: str = "", n: int = 30, pat
         text = text[:MAX_TOTAL] + "\n... (cut)"
     title = f"git {what} {ref}".strip() + (f" -- {path}" if path else "")
     return _read_job([{"name": title, "text": text}], question, "git", f"{title} in {real}")
+
+
+# --------------------------------------------------------------------------- find code (no model)
+import difflib as _difflib
+import hashlib as _hashlib
+import shlex as _shlex
+
+CODE_EXT = {".py", ".js", ".ts", ".tsx", ".jsx", ".json", ".yml", ".yaml", ".toml", ".ini", ".cfg", ".md", ".sql",
+            ".sh", ".ps1", ".bat", ".html", ".css", ".xml", ".asl", ".graphql", ".java", ".cs", ".go", ".rb",
+            ".php", ".tf", ".hcl"}
+DATA_EXT = {".csv", ".tsv", ".xlsx", ".xls", ".log", ".txt", ".parquet", ".zip", ".pdf", ".png", ".jpg"}
+STOP = set("the a an and or of to in on for is are was be by with from at as it this that where what how which "
+           "does do set get when who why find code line lines file files function functions".split())
+DECL = _re.compile(r"^\s*(?:async\s+)?(?:def|class|function|export\s+(?:default\s+)?(?:function|class|const)|const\s+\w+\s*=\s*(?:async\s*)?\(|"
+                   r"[\w-]+:\s*$|CREATE\s+(?:TABLE|VIEW|FUNCTION))", _re.I)
+
+
+def _code_files(root, include="", limit=4000):
+    pats = [x.strip() for x in include.split(",") if x.strip()]
+    files = [root] if os.path.isfile(root) else []
+    if os.path.isdir(root):
+        for dp, dns, fns in os.walk(root):
+            dns[:] = sorted(d for d in dns if d not in SKIP_DIRS and not d.startswith("."))
+            for fn in sorted(fns):
+                files.append(os.path.join(dp, fn))
+                if len(files) > limit:
+                    break
+    out = []
+    base_dir = root if os.path.isdir(root) else os.path.dirname(root)
+    for f in files:
+        name, rel = os.path.basename(f), os.path.relpath(f, base_dir).replace("\\", "/")
+        if DENY.search(name):
+            continue
+        if pats and not any(fnmatch.fnmatch(name, x) or fnmatch.fnmatch(rel, x) for x in pats):
+            continue
+        if not pats and os.path.splitext(name)[1].lower() not in CODE_EXT:
+            continue
+        try:
+            if os.path.getsize(f) > MAX_FILE:
+                continue
+        except OSError:
+            continue
+        out.append((f, rel))
+    return out
+
+
+def _top_roots():
+    rs = sorted({r for r in _roots() if os.path.isdir(r)}, key=len)
+    return [r for i, r in enumerate(rs) if not any(r.startswith(o + os.sep) for o in rs[:i])]
+
+
+@mcp.tool()
+@guard
+def find_code(query: str, repo: str = "", include: str = "", max_results: int = 30, context: int = 1) -> str:
+    """Search the user's repos ON THE LAPTOP and return only the best-matching lines with file:line
+    (no model, instant). Use this instead of opening whole files to find where something is.
+    `query`: words (ranked by how many match; definitions rank higher) or a regex as /pattern/.
+    `repo`: folder relative to the repos root (e.g. "hrs" or "anew/serverless_lambdas"); empty = all.
+    `include`: file filter, e.g. "*.py,*.yml" (default: code/config files, not data exports)."""
+    try:
+        root = _resolve(repo) if repo else None
+    except ValueError as ex:
+        return str(ex)
+    roots = [root] if root else _top_roots()
+    q = query.strip()
+    rx = _re.compile(q[1:-1], _re.I) if len(q) > 2 and q.startswith("/") and q.endswith("/") else None
+    terms = [] if rx else [w for w in _re.findall(r"[A-Za-z_][A-Za-z0-9_.-]{2,}", q.lower()) if w not in STOP]
+    if not rx and not terms:
+        return "Give at least one word of 3+ letters (or a /regex/)."
+    phrase = q.lower() if not rx and " " in q else None
+    hits, scanned = [], 0
+    for r in roots:
+        for f, rel in _code_files(r, include):
+            scanned += 1
+            try:
+                lines = open(f, encoding="utf-8", errors="replace").read().splitlines()
+            except OSError:
+                continue
+            shown_rel = os.path.relpath(f, r if os.path.isdir(r) else os.path.dirname(r)).replace("\\", "/")
+            fname = rel.lower()
+            for i, line in enumerate(lines):
+                low = line.lower()
+                if rx:
+                    if not rx.search(line):
+                        continue
+                    score = 2 + (3 if DECL.match(line) else 0)
+                else:
+                    n = sum(1 for w in terms if w in low)
+                    if not n or n < (len(terms) + 1) // 2:
+                        continue
+                    score = 2 * n + (3 if DECL.match(line) else 0) + (5 if phrase and phrase in low else 0) \
+                        + sum(1 for w in terms if w in fname)
+                hits.append((score, shown_rel, i, lines))
+    if not hits:
+        return f"No matches for {query!r} in {scanned} file(s)" + (f" under {root}" if root else "") + "."
+    hits.sort(key=lambda h: (-h[0], h[1], h[2]))
+    top_hits = hits[: max(1, min(max_results, 100))]
+    by_file = {}
+    for s, rel, i, lines in top_hits:
+        by_file.setdefault(rel, []).append((i, lines))
+    out = [f"{len(hits)} matching line(s) in {scanned} file(s){' under ' + root if root else ''}; best {len(top_hits)}:"]
+    ctx = max(0, min(context, 3))
+    for rel, items in by_file.items():
+        out.append(f"\n{rel}")
+        done = set()
+        for i, lines in sorted(items, key=lambda x: x[0]):
+            for j in range(max(0, i - ctx), min(len(lines), i + ctx + 1)):
+                if j in done:
+                    continue
+                done.add(j)
+                mark = ">" if j == i else " "
+                out.append(f"{mark}{j + 1:>5}| {lines[j][:200]}")
+    out.append("\nOpen only the lines you need; local_read(path, question) explains a file without reading it all.")
+    return finish(out)
+
+
+# --------------------------------------------------------------------------- repo map (cached)
+_SYM = {
+    ".py": _re.compile(r"^(?:async\s+)?(?:def|class)\s+(\w+)", _re.M),
+    ".js": _re.compile(r"^(?:export\s+)?(?:async\s+)?(?:function\s+(\w+)|const\s+(\w+)\s*=\s*(?:async\s*)?\()", _re.M),
+    ".ts": _re.compile(r"^(?:export\s+)?(?:async\s+)?(?:function\s+(\w+)|const\s+(\w+)\s*=\s*(?:async\s*)?\(|class\s+(\w+))", _re.M),
+}
+_map_jobs = {}
+
+
+def _symbols(text, ext):
+    rx = _SYM.get(ext) or (_SYM[".js"] if ext in (".jsx", ".tsx") else None)
+    if not rx:
+        return []
+    out = []
+    for m in rx.finditer(text):
+        name = next((g for g in m.groups() if g), None) if m.groups() else m.group(1)
+        if name and not name.startswith("_") and name not in out:
+            out.append(name)
+    return out
+
+
+@mcp.tool()
+@guard
+def repo_map(repo: str, describe: bool = True, max_entries: int = 250) -> str:
+    """A compact map of a repo: folders, files with line counts, their top-level functions/classes and
+    (from the tower's local model, cached by file content) a one-line purpose per file. Use it at the
+    start of a coding task instead of listing/reading folders. First call for a repo starts describing
+    files in the background; later calls are instant and only re-describe files that changed."""
+    try:
+        root = _resolve(repo)
+    except ValueError as ex:
+        return str(ex)
+    files = _code_files(root, "")
+    info, data_counts = [], {}
+    for dp, dns, fns in os.walk(root):
+        dns[:] = [d for d in dns if d not in SKIP_DIRS and not d.startswith(".")]
+        for fn in fns:
+            ext = os.path.splitext(fn)[1].lower()
+            if ext in DATA_EXT:
+                d = os.path.relpath(dp, root).replace("\\", "/")
+                data_counts.setdefault(d, {}).setdefault(ext, 0)
+                data_counts[d][ext] += 1
+    for f, rel in files[:1500]:
+        try:
+            text = open(f, encoding="utf-8", errors="replace").read()
+        except OSError:
+            continue
+        ext = os.path.splitext(f)[1].lower()
+        info.append({"name": rel, "sha": _hashlib.sha1(text.encode("utf-8", "replace")).hexdigest(),
+                     "lines": text.count("\n") + 1, "syms": _symbols(text, ext), "text": text})
+    purposes, note = {}, ""
+    if describe and info:
+        try:
+            purposes = api_post("/api/ai/filemap_known", {"files": [{"name": i["name"], "sha": i["sha"]} for i in info]})
+        except FeedDown:
+            purposes = {}
+        missing = [i for i in info if i["name"] not in purposes and i["name"].endswith(
+            (".py", ".js", ".ts", ".tsx", ".jsx", ".sql", ".yml", ".yaml", ".asl", ".json")) and i["lines"] > 3]
+        job = _map_jobs.get(root)
+        if job:
+            try:
+                j = api("/api/ai/job", id=job)
+                purposes.update({k: v for k, v in (j.get("purposes") or {}).items()})
+                if j.get("status") == "running":
+                    note = f"(The tower is describing files: {j.get('done_parts')}/{j.get('parts')} done - call again later for the rest.)"
+                else:
+                    _map_jobs.pop(root, None)
+            except FeedDown:
+                pass
+        missing = [i for i in missing if i["name"] not in purposes]
+        if missing and root not in _map_jobs:
+            batch = [{"name": i["name"], "sha": i["sha"], "text": i["text"][:60000]} for i in missing[:400]]
+            try:
+                r = api_post("/api/ai/filemap", {"files": batch})
+                if r.get("id"):
+                    _map_jobs[root] = r["id"]
+                    note = f"(Started describing {len(batch)} file(s) on the tower - purposes appear on later calls.)"
+                elif r.get("error"):
+                    note = f"(No purposes: {r['error']})"
+            except FeedDown as ex:
+                note = f"(No purposes: {ex})"
+    by_dir = {}
+    for i in info:
+        d = os.path.dirname(i["name"]) or "."
+        by_dir.setdefault(d, []).append(i)
+    out = [f"Repo map: {root} — {len(info)} code/config files" + (f" {note}" if note else "")]
+    shown = 0
+    for d in sorted(by_dir):
+        items = by_dir[d]
+        dc = data_counts.get(d if d != "." else ".", {})
+        extra = f"  + data: " + ", ".join(f"{n} {e}" for e, n in sorted(dc.items())) if dc else ""
+        out.append(f"\n{d}/  ({len(items)} files){extra}")
+        if shown >= max_entries:
+            out.append("   (files not listed - raise max_entries or map a sub-folder)")
+            continue
+        for i in sorted(items, key=lambda x: x["name"]):
+            shown += 1
+            syms = (" · " + ", ".join(i["syms"][:8]) + ("…" if len(i["syms"]) > 8 else "")) if i["syms"] else ""
+            p = purposes.get(i["name"])
+            out.append(f"  {os.path.basename(i['name'])} ({i['lines']})" + (f" — {p}" if p else "") + syms)
+    other = {d: c for d, c in data_counts.items() if d not in by_dir and d != "."}
+    if other:
+        out.append("\nData-only folders: " + "; ".join(f"{d}/ ({sum(c.values())} files)" for d, c in sorted(other.items())[:20]))
+    return finish(out)
+
+
+# --------------------------------------------------------------------------- fix brief
+def _tower_job(template, text, question="", seconds=50):
+    """(job_id if still running, answer, error)"""
+    r = api_post("/api/ai/prompt", {"template": template, "text": text, "question": question})
+    if r.get("error"):
+        return None, None, r["error"]
+    j = _wait_job(r["id"], seconds=seconds)
+    if j.get("status") == "running":
+        return r["id"], None, None
+    if j.get("error"):
+        return None, None, j["error"]
+    return None, j.get("answer") or "", None
+
+
+@mcp.tool()
+@guard
+def fix_brief(profile: str, function: str = "", error_type: str = "", signature: str = "", hours: float = 24,
+              job_id: str = "") -> str:
+    """Everything needed to fix ONE error in a single compact call: the top (or given) error pattern,
+    team note + local triage, the latest example, what the function logged just before it, the code
+    around the failing line (from the laptop's repo), recent run outcomes, plus a diagnosis and
+    suggested fix written by the tower's local model (verify it). Use this when about to fix an error;
+    use investigate for a broader look at a client. If the diagnosis is still being written, call again
+    with job_id."""
+    if job_id:
+        j = _wait_job(job_id, seconds=50)
+        if j.get("status") == "running":
+            return f"Still writing the diagnosis - call fix_brief(profile=\"{profile}\", job_id=\"{job_id}\") again shortly."
+        return finish(["TOWER DIAGNOSIS (local model - verify before editing):", j.get("answer") or j.get("error") or ""])
+    prefix = f"/aws/lambda/{function}" if function and not function.startswith("/") else function
+    rows = api("/api/summary", hours=hours, profile=profile, level="error,suspect", hide_muted=1,
+               grp_prefix=prefix or "", etype=error_type, sig=signature if error_type else "")
+    if not rows:
+        return f"No errors or hidden errors for {profile}{' / ' + function if function else ''} in {hours:g}h."
+    g = rows[0]
+    b = [f"FIX BRIEF: {profile} — [{g['level']}] {g['etype']}: {g['sig'][:200]} — {g['count']}x in {hours:g}h{flags(g)}",
+         f"log groups: {top(g['log_groups'], 3)} | first {t(g['first_seen'])}, last {t(g['last_seen'])}"]
+    ev = api("/api/events", profile=profile, etype=g["etype"], sig=g["sig"], hours=hours, limit=1)["events"]
+    if ev:
+        e = ev[0]
+        b += [f"\nlatest ({t(e['ts'])}, event_id {e['id']}):", cap(e["message"], 1800)]
+        ctx = api("/api/context", id=e["id"], before=2, after=0.5)
+        before = [x for x in ctx.get("lines", []) if x["id"] != e["id"]][-8:]
+        if before:
+            b.append("\nlogged just before:")
+            b += [f"  {t(x['ts'])} [{x['level']}] {cap(x['message'], 220)}" for x in before]
+        code = local_code(api("/api/ops/code", id=e["id"]))
+        own = [f for f in code.get("frames", []) if f.get("path")]
+        if own:
+            f = own[-1]
+            b += [f"\ncode: {f['path']}:{f['line']}", f.get("snippet") or ""]
+        elif code.get("mapped"):
+            b.append(f"\nrepo folder: {code['mapped']} (no stack frame in the message - use find_code)")
+        if str(e.get("group", "")).startswith("stepfunctions:"):
+            b.append("(Step Functions failure: get_step_function_input gives the exact input to reproduce it.)")
+    groups = [x for x in api("/api/ops/groups", profile=profile, hours=hours) if x["group"] in list(g["log_groups"])[:1]]
+    for grp in groups[:1]:
+        runs = api("/api/ops/runs", profile=grp["profile"], region=grp["region"], grp=grp["group"], hours=hours)
+        if runs:
+            from collections import Counter
+            oc = Counter(r["outcome"] for r in runs)
+            b.append(f"\nruns of {grp['function']}: {len(runs)} - " + ", ".join(f"{k} {v}" for k, v in oc.most_common())
+                     + f"; latest {t(runs[0]['end'])} {runs[0]['outcome']}")
+    brief = "\n".join(b)
+    try:
+        jid, ans, err = _tower_job("fix", brief)
+    except FeedDown as ex:
+        jid, ans, err = None, None, str(ex)
+    tail = (["\nTOWER DIAGNOSIS (local model - verify before editing):", ans] if ans else
+            [f"\n(No local diagnosis: {err})"] if err else
+            [f"\n(The tower is still writing a diagnosis: fix_brief(profile=\"{profile}\", job_id=\"{jid}\").)"])
+    return finish([brief, *tail])
+
+
+# --------------------------------------------------------------------------- run tests / checks
+_SAFE_CMDS = [["pytest"], ["python", "-m", "pytest"], ["python", "-m", "py_compile"], ["python", "-m", "unittest"],
+              ["py", "-m", "pytest"], ["py", "-m", "py_compile"], ["python3", "-m", "pytest"],
+              ["npm", "test"], ["npm", "run", "test"], ["npm", "run", "lint"], ["node", "--test"],
+              ["git", "status"], ["serverless", "print"], ["sls", "print"]]
+_BAD_CHARS = _re.compile(r"[;&|<>`$\n\r]")
+
+
+def _allowed(argv):
+    if any(argv[:len(p)] == p for p in _SAFE_CMDS):
+        return True
+    # python <test script> e.g. python local_tests/run_tests.py
+    return len(argv) >= 2 and argv[0] in ("python", "python3", "py") and _re.search(r"(^|[/\\])(test|tests|local_tests)[/\\]|(^|[/\\])test_\w+\.py$|_tests?\.py$|run_tests\.py$", argv[1]) is not None
+
+
+@mcp.tool()
+@guard
+def local_run(command: str, repo: str, timeout_s: int = 600, job_id: str = "") -> str:
+    """Run a SAFE check command on the laptop inside a repo and get back only what matters: exit code
+    plus failures (the tower's model reads long output). Allowed: pytest / python -m pytest|unittest|
+    py_compile, python <test script> (e.g. local_tests/run_tests.py), npm test / npm run test|lint,
+    node --test, git status, serverless print. No shell operators. Never deploys or changes anything."""
+    if job_id:
+        j = _wait_job(job_id, seconds=50)
+        if j.get("status") == "running":
+            return f"Still summarising - call local_run(command=..., repo=..., job_id=\"{job_id}\") again shortly."
+        return finish(["Summary of the output (local model):", j.get("answer") or j.get("error") or ""])
+    if _BAD_CHARS.search(command):
+        return "Not allowed: no shell operators (; & | < > ` $)."
+    try:
+        argv = _shlex.split(command, posix=(os.name != "nt"))
+        real = _resolve(repo)
+    except ValueError as ex:
+        return str(ex)
+    if not argv or not _allowed(argv):
+        return "Not an allowed command. Allowed: " + "; ".join(" ".join(p) for p in _SAFE_CMDS) + "; python <test script>."
+    t0 = time.time()
+    try:
+        r = subprocess.run(argv, cwd=real if os.path.isdir(real) else os.path.dirname(real), capture_output=True,
+                           timeout=max(10, min(timeout_s, 1800)), stdin=subprocess.DEVNULL)
+    except FileNotFoundError:
+        return f"'{argv[0]}' isn't installed / on PATH on this machine."
+    except subprocess.TimeoutExpired:
+        return f"Timed out after {timeout_s}s."
+    text = (r.stdout + b"\n" + r.stderr).decode("utf-8", errors="replace").strip()
+    head = f"`{command}` in {real}: exit code {r.returncode} ({time.time() - t0:.0f}s, {len(text.splitlines())} lines of output)"
+    if len(text) <= 3000:
+        return finish([head, "```", text, "```"])
+    keylines = [l for l in text.splitlines() if _re.search(r"FAILED|ERROR|Error|Traceback|assert|passed|failed", l)][-25:]
+    try:
+        jid, ans, err = _tower_job("run", text[-60000:], f"Command: {command} (exit code {r.returncode})")
+    except FeedDown:
+        jid, ans, err = None, None, "tower unreachable"
+    out = [head]
+    if ans:
+        out += ["Summary (local model):", ans]
+    elif jid:
+        out.append(f"(Summary still being written: local_run(command=..., repo=..., job_id=\"{jid}\").)")
+    out += ["Key lines:", "```", *[l[:300] for l in keylines], "```"]
+    return finish(out)
+
+
+# --------------------------------------------------------------------------- drafts by the tower
+@mcp.tool()
+@guard
+def draft_commit_message(repo: str) -> str:
+    """The tower's local model writes a commit message for the staged changes (or, if nothing is
+    staged, all uncommitted changes). Only drafts text - never commits."""
+    try:
+        real = _resolve(repo)
+    except ValueError as ex:
+        return str(ex)
+    def git(*a):
+        return subprocess.run(["git", *a], cwd=real, capture_output=True, timeout=60).stdout.decode("utf-8", "replace")
+    diff = git("diff", "--cached", "--stat", "--patch")
+    which = "staged"
+    if not diff.strip():
+        diff, which = git("diff", "HEAD", "--stat", "--patch"), "uncommitted"
+    if not diff.strip():
+        return "No changes to describe."
+    jid, ans, err = _tower_job("commit", diff[:200000], seconds=60)
+    if err:
+        return f"The local model couldn't write it: {err}"
+    if not ans:
+        return f"The tower is still writing it - try again in a moment."
+    return finish([f"Draft commit message for the {which} changes (local model - review it):", "```", ans.strip(), "```"])
+
+
+@mcp.tool()
+@guard
+def local_draft_change(path: str, start_line: int, end_line: int, instruction: str, apply: bool = False,
+                       job_id: str = "") -> str:
+    """Let the tower's local model WRITE a small code change, so Claude doesn't have to generate it:
+    give a file, the line range to rewrite (from find_code / local_read) and a precise instruction
+    (e.g. "log the HubSpot error with oflog.check_response instead of print"). Returns a unified diff to
+    review. Call again with the same arguments and apply=True to write it (the result is cached, so it's
+    the same diff). Python files are syntax-checked before writing. Best for small, well-defined edits
+    (<= 150 lines); write complex logic yourself."""
+    try:
+        real = _resolve(path)
+    except ValueError as ex:
+        return str(ex)
+    if not os.path.isfile(real) or DENY.search(os.path.basename(real)):
+        return "Not a file I can edit."
+    raw = open(real, "rb").read()
+    crlf = b"\r\n" in raw
+    text = raw.decode("utf-8", errors="replace").replace("\r\n", "\n")
+    lines = text.split("\n")
+    s, e = max(1, int(start_line)), min(len(lines), int(end_line))
+    if e < s or e - s > 150:
+        return "Give a range of 1-150 lines (start_line <= end_line)."
+    lo, hi = max(1, s - 40), min(len(lines), e + 40)
+    excerpt = "\n".join((">>> " if s <= i <= e else "    ") + f"{i:>5}| {lines[i - 1]}" for i in range(lo, hi + 1))
+    prompt = (f"File: {os.path.basename(real)}\nInstruction for lines {s}-{e} (marked >>>): {instruction}\n"
+              f"Return the new text for lines {s}-{e} only.\n\n{excerpt}")
+    if job_id:
+        j = _wait_job(job_id, seconds=60)
+        jid, ans, err = (job_id, None, None) if j.get("status") == "running" else (None, j.get("answer"), j.get("error"))
+    else:
+        jid, ans, err = _tower_job("edit", prompt, seconds=90)
+    if err:
+        return f"The local model couldn't draft it ({err}) - make this change yourself."
+    if ans is None:
+        return (f"The tower is still writing it - call local_draft_change(... same arguments ..., job_id=\"{jid}\") again shortly.")
+    new = _re.sub(r"^\s*```[\w-]*\n", "", ans.rstrip())
+    new = _re.sub(r"\n```\s*$", "", new).strip("\n")
+    if new.strip().startswith("CANNOT:"):
+        return "The local model declined: " + new.strip() + " - make this change yourself."
+    new_lines = [l.rstrip() for l in new.split("\n")]
+    # models sometimes drop the block's indentation: shift it back to where the original lines were
+    ind = lambda l: len(l) - len(l.lstrip(" \t"))
+    orig = [l for l in lines[s - 1:e] if l.strip()]
+    newnb = [l for l in new_lines if l.strip()]
+    if orig and newnb:
+        want, got = ind(orig[0]), min(ind(l) for l in newnb)
+        if got < want:
+            pad = orig[0][:want - got] if orig[0][:want - got].strip() == "" else " " * (want - got)
+            new_lines = [(pad + l) if l.strip() else l for l in new_lines]
+    updated = lines[:s - 1] + new_lines + lines[e:]
+    rel = os.path.basename(real)
+    diff = list(_difflib.unified_diff(lines, updated, f"a/{rel}", f"b/{rel}", n=2, lineterm=""))
+    if not diff:
+        return "The local model returned the same code - nothing to change."
+    src = "\n".join(updated)
+    if real.endswith(".py"):
+        try:
+            compile(src, real, "exec")
+        except SyntaxError as ex:
+            return finish([f"Draft has a syntax error (line {ex.lineno}: {ex.msg}) - not applied. Diff:", "```diff", *diff, "```"])
+    if apply:
+        if open(real, "rb").read() != raw:
+            return "The file changed while drafting - run it again."
+        with open(real, "wb") as f:
+            f.write((src.replace("\n", "\r\n") if crlf else src).encode("utf-8"))
+        return finish([f"Applied to {real} (local-model draft - review and test):", "```diff", *diff, "```"])
+    return finish([f"Draft change for {real} lines {s}-{e} (local model - review; same call with apply=True writes it):",
+                   "```diff", *diff, "```"])
 
 
 @mcp.tool()
