@@ -203,8 +203,29 @@ STATUS_RX = re.compile(
 BENIGN_RX = re.compile(
     r"[\"']?(?:errors?|error_?count|failures?|failed(?:_?count)?|exceptions?)[\"']?\s*[:=]\s*"
     r"(?:0|null|none|false|\[\]|\{\}|\"\"|'')(?![\w.])"
-    r"|\b(?:no|0|zero|without|none)\s+(?:errors?|failures?|exceptions?)\b",
+    r"|\b(?:no|0|zero|without|none)\s+(?:errors?|failures?|failed|exceptions?|missing|skipped)\b",
     re.I)
+
+
+# Progress / summary counters ("records=200, missing=49, failed=0") are bookkeeping, not errors.
+COUNTER_PAIR_RX = re.compile(r"[\"']?\b([A-Za-z_][\w-]{0,40})[\"']?\s*[:=]\s*(\d+)\b")
+REAL_FAIL_KEY = re.compile(r"fail|error|exception|timeout|crash|reject", re.I)
+
+
+def strip_counters(text):
+    """Blank out counter pairs that only look like problems: any zero count, and on lines that list
+    several counters (progress/summary lines), non-failure counts like missing=49 / skipped=3."""
+    pairs = COUNTER_PAIR_RX.findall(text)
+    if not pairs:
+        return text
+    multi = len(pairs) >= 2
+
+    def repl(m):
+        key, val = m.group(1), int(m.group(2))
+        if val == 0 or (multi and not REAL_FAIL_KEY.search(key)):
+            return " "
+        return m.group(0)
+    return COUNTER_PAIR_RX.sub(repl, text)
 
 
 # Step Functions log lines (Express workflows, or Standard with logging on) are JSON with "type"
@@ -259,7 +280,7 @@ def classify_level(msg):
         return "error", ""
     if WARN_LEVEL_RX.search(msg):
         return "warning", ""
-    clean = BENIGN_RX.sub(" ", msg)
+    clean = strip_counters(BENIGN_RX.sub(" ", msg))
     hits = []
     for m in EXC_ANYWHERE.finditer(clean):
         hits.append(m.group(1).split(".")[-1])
@@ -773,7 +794,35 @@ class Store:
                 m = next((v for k, v in mutes.items() if k[0] == g["etype"] and k[1] == g["sig"]), None)
             g["mute"] = m["status"] if m else None
             g["regression"] = bool(m and m["status"] == "fixed" and g["last_seen"] > m["at"])
+        self.mark_log_formats(rows)
         return aws_local.attach_triage(self, aws_ops.attach_notes(self, rows, profile), profile)
+
+    _runs_cache = {"at": 0, "data": {}}
+
+    def runs_per_group(self):
+        """Lambda runs (REPORT lines) per log group in the last 24h, cached for a minute."""
+        c = Store._runs_cache
+        if time.time() - c["at"] > 60:
+            since = int(time.time() * 1000) - DAY_MS
+            with self.lock:
+                c["data"] = {r[0]: r[1] for r in self.db.execute(
+                    "SELECT grp, COUNT(*) FROM events WHERE level = 'platform' AND message LIKE 'REPORT %' "
+                    "AND ts >= ? GROUP BY grp", (since,))}
+            c["at"] = time.time()
+        return c["data"]
+
+    def mark_log_formats(self, rows):
+        """A hidden-error pattern that shows up in nearly every run of a function is almost always the
+        function's normal output (a progress line), not a problem: flag it so it can be muted."""
+        runs = self.runs_per_group()
+        for g in rows:
+            g["likely_format"] = None
+            if g.get("level") != "suspect" or g.get("count", 0) < 30:
+                continue
+            grp, n = max((g.get("log_groups") or {"": 0}).items(), key=lambda kv: kv[1])
+            total = runs.get(grp, 0)
+            if total >= 30 and min(n, total) / total >= 0.8:
+                g["likely_format"] = round(100 * min(n, total) / total)
 
     def pattern_totals(self, profile, since_ms, until_ms):
         """Error / hidden-error counts per pattern from the hourly baseline (kept 30 days)."""
@@ -2477,7 +2526,7 @@ function renderSummary(){
   const col={error:'--err',suspect:'--sus',warning:'--warn',info:'--info',platform:'--plat'};
   $('sumBody').innerHTML=rows.map(g=>`<tr class="click" data-i="${sumRows.indexOf(g)}">
     <td class="num"><span class="bar" style="width:${Math.max(3,60*g.count/max)}px;background:var(${col[g.level]||'--err'})"></span>${g.count}</td>
-    <td>${g.regression?'<span class="badge b-reg">REGRESSION</span>':''}${g.is_new?'<span class="badge b-new">NEW</span>':''}${g.is_spike?`<span class="badge b-spike">SPIKE ×${g.spike_ratio}</span>`:''}${g.mute&&!g.regression?`<span class="badge b-${g.mute}">${g.mute.toUpperCase()}</span>`:''}<br>
+    <td>${g.regression?'<span class="badge b-reg">REGRESSION</span>':''}${g.is_new?'<span class="badge b-new">NEW</span>':''}${g.is_spike?`<span class="badge b-spike">SPIKE ×${g.spike_ratio}</span>`:''}${g.mute&&!g.regression?`<span class="badge b-${g.mute}">${g.mute.toUpperCase()}</span>`:''}${g.likely_format?`<span class="badge" style="background:var(--line)" title="Appears in ${g.likely_format}% of this function's runs - probably its normal output, not an error. Mute it or add a note.">LOG FORMAT?</span>`:''}<br>
       <b>${esc(g.etype)}</b><br><span class="small" style="color:var(--mute)">${esc(g.level)}${g.hint?` · ${esc(g.hint)}`:''}</span>
       ${g.note?`<div class="note">📝 ${esc(g.note)}${g.ignore_below?` (ignore under ${g.ignore_below}/day)`:''}</div>`:''}${aiLine(g.ai)}
       <div>${g.mute?`<button class="act" data-a="unmute">unmute</button>`:'<button class="act" data-a="muted">mute</button><button class="act" data-a="fixed">mark fixed</button>'}<button class="act" data-a="note">note</button></div></td>

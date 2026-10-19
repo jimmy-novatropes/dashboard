@@ -38,8 +38,12 @@ sample log lines and what the function logged just before. Reply with ONLY a JSO
  "summary": "<= 2 short sentences: what is happening",
  "likely_cause": "<= 1 sentence",
  "next_step": "<= 1 sentence, concrete",
+ "evidence": "the exact text (copied from the lines) that supports the verdict",
  "confidence": number 0..1}
-Rules: "actionable" = needs a code/config fix by the developer. "noise" = harmless / already handled
+Rules: only claim a cause that is visible in the lines and quote it in "evidence"; if nothing in the
+lines shows the cause, use "unclear". A line that only counts things (records=, missing=, skipped=)
+is usually normal progress output, not an error -> "noise".
+"actionable" = needs a code/config fix by the developer. "noise" = harmless / already handled
 (e.g. retried successfully, informational). "external" = caused by a partner service or their data
 (outage, rate limit, expired token on their side). Base everything only on the lines given; if unsure
 say "unclear" with low confidence. No markdown, no extra text."""
@@ -180,6 +184,30 @@ def get_triage(store, profile=None):
     return out
 
 
+# Claims a verdict must be able to point at in the lines; otherwise it's downgraded to "unclear".
+_CLAIM_RX = {
+    "partner API rate limit": re.compile(r"\b429\b|rate.?limit|too many requests|throttl", re.I),
+    "partner API auth": re.compile(r"\b40[13]\b|unauthori[sz]ed|forbidden|expired|invalid.?(token|key|grant)|auth", re.I),
+    "partner API outage": re.compile(r"\b5\d\d\b|unavailable|timed? ?out|timeout|connection|refused|bad gateway", re.I),
+    "timeout / performance": re.compile(r"timed? ?out|timeout|duration|slow|memory", re.I),
+    "config / permissions": re.compile(r"denied|permission|not authorized|accessdenied|config|missing (env|key|setting)", re.I),
+}
+
+
+def check_evidence(res, text):
+    """Downgrade a verdict whose category isn't supported by anything in the lines, and drop a quoted
+    'evidence' that doesn't actually appear there."""
+    ev = (res.get("evidence") or "").strip()
+    if ev and ev[:60].lower() not in text.lower():
+        res["evidence"] = ""
+        res["note"] = "quoted evidence not found in the lines"
+    rx = _CLAIM_RX.get(res.get("category"))
+    if rx and not rx.search(text):
+        res.update(verdict="unclear", confidence=min(res.get("confidence") or 0, 0.3),
+                   note=f"downgraded: nothing in the lines shows {res['category']}")
+    return res
+
+
 def attach_triage(store, rows, profile=None):
     tr = get_triage(store)
     for g in rows:
@@ -247,7 +275,9 @@ class Triage(threading.Thread):
                "category": res.get("category") if res.get("category") in CATEGORIES else "unknown",
                "summary": str(res.get("summary", ""))[:400], "likely_cause": str(res.get("likely_cause", ""))[:300],
                "next_step": str(res.get("next_step", ""))[:300],
-               "confidence": max(0.0, min(1.0, float(res.get("confidence") or 0)))}
+               "confidence": max(0.0, min(1.0, float(res.get("confidence") or 0))),
+               "evidence": str(res.get("evidence", ""))[:300]}
+        res = check_evidence(res, samples + "\n" + ctx_txt)
         with self.store.lock:
             self.store.db.execute("INSERT OR REPLACE INTO ai_triage VALUES (?,?,?,?,?,?,?)",
                                   (g["etype"], g["sig"], prof, int(time.time() * 1000), self.llm.model, g["count"],
@@ -320,8 +350,10 @@ visible). Plain text, no markdown headers, nothing invented.""", 400),
     "fix": ("""You get an error brief from an AWS Lambda / Step Functions integration: the error, what the
 function logged just before it, the code around the failing line, recent runs and team notes.
 Reply with: 1) Likely root cause (1-2 sentences). 2) Where: file:line(s) to change. 3) Suggested
-fix (a few lines of code if obvious). 4) How to verify. Base everything on the brief; if the
-evidence doesn't support a conclusion, say "uncertain" and what to check next. Max 12 lines.""", 700),
+fix (a few lines of code if obvious). 4) How to verify. Base everything on the brief and quote the
+line that shows the cause; never assume rate limits, auth or outages unless a line shows them (429,
+401/403, 5xx, timeout). A line that only counts things (records=, missing=) is normal progress output.
+If the evidence doesn't support a conclusion, say "uncertain" and what to check next. Max 12 lines.""", 700),
     "narrative": ("""Write a short, client-friendly executive summary (3-5 sentences) of this integration health
 report: overall status, what went wrong (if anything) and what was done or is planned. Plain
 language, no jargon, nothing that isn't in the report.""", 400),

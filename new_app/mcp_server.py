@@ -78,6 +78,9 @@ but processed nothing. Fixing code: locate_code turns an error's stack trace int
 with the code around the failing line. Team notes on patterns appear as "NOTE from the team" -
 respect them (e.g. don't re-investigate known, accepted issues). client_report = weekly report.
 
+Only the everyday tools are listed; more_tools() lists and runs all the others (schedules, inventory,
+deploys, partner APIs, notes, mutes, reports, runs, history...). For code: outline(file) gives
+signatures only and get_symbol(name) returns one function's source - prefer them to reading files.
 Coding with fewer tokens: find_code(query, repo) returns only matching lines (file:line) - use it
 instead of opening files to search; repo_map(repo) gives the repo layout with one-line purposes;
 fix_brief(profile, ...) bundles everything needed to fix one error plus a local diagnosis;
@@ -244,6 +247,8 @@ def flags(g):
         f.append(g["mute"].upper())
     if g.get("below_threshold"):
         f.append(f"below your ignore threshold of {g.get('ignore_below')}/day")
+    if g.get("likely_format"):
+        f.append(f"LIKELY NORMAL OUTPUT, not an error: in {g['likely_format']}% of runs - suggest muting / a note")
     out = (" [" + ", ".join(f) + "]") if f else ""
     if g.get("note"):
         out += f"\n    NOTE from the team: {g['note']}"
@@ -252,7 +257,9 @@ def flags(g):
         out += (f"\n    LOCAL-MODEL TRIAGE ({a.get('model')}, {round(100 * (a.get('confidence') or 0))}% sure, unverified): "
                 f"{a['verdict']} / {a['category']} - {a['summary']}"
                 + (f" Cause: {a['likely_cause']}" if a.get("likely_cause") else "")
-                + (f" Next: {a['next_step']}" if a.get("next_step") else ""))
+                + (f" Next: {a['next_step']}" if a.get("next_step") else "")
+                + (f" Evidence: \"{a['evidence']}\"" if a.get("evidence") else "")
+                + (f" ({a['note']})" if a.get("note") else ""))
     return out
 
 
@@ -327,6 +334,26 @@ def guard(fn):
     return wrap
 
 
+# Tool profile: "core" (default) exposes the everyday tools + more_tools (which reaches all the others),
+# so every message carries far fewer tool definitions. AWS_ERROR_FEED_TOOLS=all exposes everything.
+TOOLS_MODE = os.environ.get("AWS_ERROR_FEED_TOOLS", "core").strip().lower()
+CORE = {"clients_status", "dashboard_status", "investigate", "fix_brief", "error_overview", "list_error_patterns",
+        "summarize_logs", "get_log_lines", "get_line_context", "did_my_fix_work", "find_code", "get_symbol",
+        "outline", "repo_map", "local_read", "local_git", "local_draft_change", "local_run", "usage_savings"}
+CORE |= {x.strip() for x in os.environ.get("AWS_ERROR_FEED_EXTRA_TOOLS", "").split(",") if x.strip()}
+REGISTRY, EXPOSED = {}, set()
+
+
+def tool():
+    def deco(f):
+        REGISTRY[f.__name__] = f
+        if TOOLS_MODE == "all" or f.__name__ in CORE:
+            EXPOSED.add(f.__name__)
+            return mcp.tool()(f)
+        return f
+    return deco
+
+
 def ensure_range(hours):
     """If an older range is asked for, ask the dashboard to pull it and say how far it got."""
     if not hours or float(hours) <= 24:
@@ -344,7 +371,7 @@ def ensure_range(hours):
 
 # --------------------------------------------------------------------------- tools
 
-@mcp.tool()
+@tool()
 @guard
 def dashboard_status() -> str:
     """Which AWS accounts/regions the dashboard watches, whether each is connected (expired
@@ -372,7 +399,7 @@ def dashboard_status() -> str:
     return finish(out)
 
 
-@mcp.tool()
+@tool()
 @guard
 def error_overview(hours: float = 24, profile: str = "") -> str:
     """Start here. Per AWS profile (client/project): how many errors and hidden errors in the last
@@ -412,19 +439,15 @@ def error_overview(hours: float = 24, profile: str = "") -> str:
     return finish(out)
 
 
-@mcp.tool()
+@tool()
 @guard
 def list_error_patterns(hours: float = 24, profile: str = "", level: str = "error,suspect",
                         log_group_prefix: str = "", search: str = "", limit: int = 12,
                         only_new_or_spiking: bool = False, include_muted: bool = False,
                         detail: str = "brief") -> str:
-    """Recurring problems grouped by type and message (ids/numbers ignored), with counts, which
-    log groups they come from, first/last seen and the latest full example.
-    level: comma list of error,suspect,warning,info,platform. log_group_prefix e.g.
-    '/aws/lambda/anew-' or 'stepfunctions:'. search: free text. Each pattern is tagged NEW (first
-    seen in the last 24h), SPIKE (well above its 7-day average) or REGRESSION (marked fixed, came back).
-    Muted / fixed patterns are hidden unless include_muted. detail="brief" (default) gives a short
-    example per pattern; detail="full" adds per-pattern links and longer examples."""
+    """Recurring problems grouped by type+message with counts, groups, first/last seen and an example;
+    tagged NEW / SPIKE / REGRESSION. level: comma list (error,suspect,warning,info). detail="full"
+    for longer examples."""
     note = ensure_range(hours)
     rows = api("/api/summary", hours=hours, profile=profile, level=level,
                grp_prefix=log_group_prefix, q=search, hide_muted="" if include_muted else 1)
@@ -449,7 +472,7 @@ def list_error_patterns(hours: float = 24, profile: str = "", level: str = "erro
     return finish(out)
 
 
-@mcp.tool()
+@tool()
 @guard
 def get_log_lines(hours: float = 24, profile: str = "", level: str = "", log_group: str = "",
                   log_group_prefix: str = "", search: str = "", error_type: str = "",
@@ -473,7 +496,7 @@ def get_log_lines(hours: float = 24, profile: str = "", level: str = "", log_gro
     return finish(out)
 
 
-@mcp.tool()
+@tool()
 @guard
 def get_line_context(event_id: str, minutes_before: float = 2, minutes_after: float = 1) -> str:
     """What the same log stream (same Lambda container / task) printed around one line — the
@@ -491,7 +514,7 @@ def get_line_context(event_id: str, minutes_before: float = 2, minutes_after: fl
     return finish(out)
 
 
-@mcp.tool()
+@tool()
 @guard
 def log_group_volume(hours: float = 24, profile: str = "") -> str:
     """What's coming through each log group / state machine: total lines and the mix of
@@ -506,7 +529,7 @@ def log_group_volume(hours: float = 24, profile: str = "") -> str:
     return finish(out)
 
 
-@mcp.tool()
+@tool()
 @guard
 def load_history(hours: float) -> str:
     """Ask the dashboard to pull an older range (e.g. 168 = 7 days, 720 = 30 days) from AWS.
@@ -515,7 +538,7 @@ def load_history(hours: float) -> str:
     return ensure_range(hours) or f"The last {hours}h are already loaded."
 
 
-@mcp.tool()
+@tool()
 @guard
 def whats_new(profile: str = "") -> str:
     """What changed recently: error patterns first seen in the last 24h, patterns spiking well
@@ -542,7 +565,7 @@ def whats_new(profile: str = "") -> str:
     return finish(out)
 
 
-@mcp.tool()
+@tool()
 @guard
 def mute_pattern(error_type: str, signature: str, profile: str = "", status: str = "muted",
                  note: str = "") -> str:
@@ -556,7 +579,7 @@ def mute_pattern(error_type: str, signature: str, profile: str = "", status: str
             f"({profile or 'all profiles'}).")
 
 
-@mcp.tool()
+@tool()
 @guard
 def unmute_pattern(error_type: str, signature: str, profile: str = "") -> str:
     """Undo mute_pattern for a pattern."""
@@ -564,7 +587,7 @@ def unmute_pattern(error_type: str, signature: str, profile: str = "") -> str:
     return "Unmuted." if r.get("removed") else "No matching mute found (check profile)."
 
 
-@mcp.tool()
+@tool()
 @guard
 def list_muted() -> str:
     """Patterns that are muted or marked fixed, when, and whether any fixed ones came back."""
@@ -577,7 +600,7 @@ def list_muted() -> str:
                    + (f" | note: {m['note']}" if m.get("note") else "") for m in ms])
 
 
-@mcp.tool()
+@tool()
 @guard
 def partner_api_health(hours: float = 24, profile: str = "") -> str:
     """API problems with partner services (HubSpot, NetSuite, Epicor, QuickBooks, ...) across all
@@ -597,7 +620,7 @@ def partner_api_health(hours: float = 24, profile: str = "") -> str:
     return finish(out)
 
 
-@mcp.tool()
+@tool()
 @guard
 def get_step_function_input(event_id: str = "", execution_arn: str = "", profile: str = "") -> str:
     """The data a failed (or retried) Step Functions run was working on: the run's input, and for
@@ -639,7 +662,7 @@ def _when(ms):
     return t(ms) if ms else "-"
 
 
-@mcp.tool()
+@tool()
 @guard
 def schedules_health(profile: str = "", only_problems: bool = False) -> str:
     """EventBridge schedules / scheduled rules vs what actually ran: for each schedule its
@@ -659,7 +682,7 @@ def schedules_health(profile: str = "", only_problems: bool = False) -> str:
     return finish(out)
 
 
-@mcp.tool()
+@tool()
 @guard
 def inventory(profile: str = "", function: str = "", only_flagged: bool = False) -> str:
     """Lambda inventory for a client (or one function): runtime + support status, layers (and
@@ -680,7 +703,7 @@ def inventory(profile: str = "", function: str = "", only_flagged: bool = False)
     return finish(out)
 
 
-@mcp.tool()
+@tool()
 @guard
 def upgrade_checklist(profile: str = "") -> str:
     """What to upgrade, per client: functions on deprecated or soon-deprecated Lambda runtimes
@@ -703,7 +726,7 @@ def upgrade_checklist(profile: str = "") -> str:
     return finish(out)
 
 
-@mcp.tool()
+@tool()
 @guard
 def apis_and_alarms(profile: str = "") -> str:
     """API Gateway health for the last 24h (requests, 4xx, 5xx, p99 latency per stage, and which
@@ -723,7 +746,7 @@ def apis_and_alarms(profile: str = "") -> str:
     return finish(out)
 
 
-@mcp.tool()
+@tool()
 @guard
 def secrets_overview(profile: str = "") -> str:
     """Secrets Manager metadata (never the values): last changed / rotated / read, which Lambdas
@@ -739,7 +762,7 @@ def secrets_overview(profile: str = "") -> str:
     return finish(out)
 
 
-@mcp.tool()
+@tool()
 @guard
 def cost_estimate(profile: str = "") -> str:
     """Estimated Lambda compute cost per client for 30 days, from the last 24h of runs (billed
@@ -753,7 +776,7 @@ def cost_estimate(profile: str = "") -> str:
     return finish(out)
 
 
-@mcp.tool()
+@tool()
 @guard
 def daily_digest(profile: str = "") -> str:
     """Per-client summary of what needs attention today: broken schedules, regressions, new and
@@ -763,7 +786,7 @@ def daily_digest(profile: str = "") -> str:
     return finish([_scan_note(profile) + r["text"], f"\nDashboard: {link(tab='digest', profile=profile)}"])
 
 
-@mcp.tool()
+@tool()
 @guard
 def rescan_infrastructure(profile: str = "") -> str:
     """Re-read schedules, functions, layers, secrets metadata, APIs and alarms now (normally every
@@ -778,15 +801,11 @@ def _find_group(function, profile):
     return m
 
 
-@mcp.tool()
+@tool()
 @guard
 def clients_status() -> str:
-    """Start here for "how are my clients doing?" or "did my push reduce errors?": every client with
-    errors / hidden errors for the last 1h, 6h and 24h vs the period before each, every deploy in the
-    last 24h with its before/after error rate, red / amber / green status and
-    the reasons (jobs not running, regressions, alarms, API 5xx, syncs that did nothing, new or
-    spiking errors, partner API problems, deploy results, limits, deprecated runtimes), plus errors,
-    runs, records and cost for the last 24h."""
+    """Red/amber/green status per client with reasons, error counts (1h/6h/24h) and recent deploys.
+    Start here for "how are my clients?"."""
     cards = api("/api/ops/clients")
     out = [f"Dashboard: {link(tab='clients')}"]
     for c in cards:
@@ -817,7 +836,7 @@ def clients_status() -> str:
     return finish(out)
 
 
-@mcp.tool()
+@tool()
 @guard
 def trace_record(record_id: str = "", profile: str = "", days: float = 7, include_step_functions: bool = True,
                  job_id: str = "") -> str:
@@ -859,7 +878,7 @@ def trace_record(record_id: str = "", profile: str = "", days: float = 7, includ
     return finish(out)
 
 
-@mcp.tool()
+@tool()
 @guard
 def list_runs(function: str, profile: str = "", hours: float = 24, only_problems: bool = False,
               limit: int = 30, detail: str = "brief") -> str:
@@ -906,7 +925,7 @@ def list_runs(function: str, profile: str = "", hours: float = 24, only_problems
     return finish(out)
 
 
-@mcp.tool()
+@tool()
 @guard
 def get_run(function: str, request_id: str, profile: str = "", detail: str = "brief") -> str:
     """What one Lambda run logged, in order (request_id from list_runs) - the clearest way to read
@@ -931,7 +950,7 @@ def get_run(function: str, request_id: str, profile: str = "", detail: str = "br
     return finish(out)
 
 
-@mcp.tool()
+@tool()
 @guard
 def did_nothing_check(profile: str = "") -> str:
     """Syncs that ran without erroring but processed 0 records or far fewer than usual (from lines
@@ -943,7 +962,7 @@ def did_nothing_check(profile: str = "") -> str:
     return finish(out)
 
 
-@mcp.tool()
+@tool()
 @guard
 def locate_code(event_id: str) -> str:
     """For an error line (event_id from get_log_lines), the files and lines in YOUR repos from its
@@ -961,11 +980,19 @@ def locate_code(event_id: str) -> str:
         out += [f"\n{f['path']}:{f['line']} in {f['func'] or '?'}" + (f"  ({f['github']})" if f.get("github") else ""),
                 "```", f.get("snippet") or "", "```"]
     if not own:
-        out.append("No stack-trace frames from your own code in this line (library-only or no traceback).")
+        ev = api("/api/context", id=event_id, before=0, after=0)
+        msg = next((x["message"] for x in ev.get("lines", []) if x.get("id") == event_id), "") or r.get("message", "")
+        sites = find_print_site(msg, r["mapped"].get("dir"))
+        if sites:
+            out.append("No stack trace - the code that printed this line is most likely:")
+            for s in sites:
+                out += [f"\n{s['path']}:{s['line']}", "```", s["snippet"], "```"]
+        else:
+            out.append("No stack-trace frames from your own code in this line (library-only or no traceback).")
     return finish(out)
 
 
-@mcp.tool()
+@tool()
 @guard
 def add_note(error_type: str, signature: str, note: str, profile: str = "", ignore_below_per_day: int = 0) -> str:
     """Attach a team note to an error pattern ("known HubSpot rate limit, retry handles it") - shown
@@ -977,7 +1004,7 @@ def add_note(error_type: str, signature: str, note: str, profile: str = "", igno
     return "Note saved." if note or ignore_below_per_day else "Note removed."
 
 
-@mcp.tool()
+@tool()
 @guard
 def client_report(profile: str, days: float = 7, tower_summary: bool = False) -> str:
     """Client-facing health report for one client over `days`: Lambda and workflow success rates
@@ -1006,16 +1033,13 @@ def _wait_job(jid, seconds=45):
     return j
 
 
-@mcp.tool()
+@tool()
 @guard
 def summarize_logs(question: str = "", profile: str = "", level: str = "", log_group: str = "",
                    log_group_prefix: str = "", search: str = "", error_type: str = "", signature: str = "",
                    hours: float = 24, limit: int = 300, job_id: str = "") -> str:
-    """Have the LOCAL model (on the user's machine, free) read up to `limit` matching log lines and
-    return a short summary / answer to `question`, instead of pulling all the raw lines into this
-    conversation. Prefer this over get_log_lines when you need the gist of many lines; use
-    get_log_lines / get_line_context only for the few exact lines you need. Local-model output can
-    be wrong - verify anything important against the lines. If it's still working, call again with job_id."""
+    """The LOCAL model reads up to `limit` matching log lines and returns a short summary / answer to
+    `question` - prefer over get_log_lines for the gist. Poll with job_id if still working."""
     if not job_id:
         r = api("/api/ai/summarize", kind="lines", question=question, profile=profile, level=level, grp=log_group,
                 grp_prefix=log_group_prefix, q=search, etype=error_type, sig=signature if error_type else "",
@@ -1034,13 +1058,11 @@ def summarize_logs(question: str = "", profile: str = "", level: str = "", log_g
                    *([f"\nKey error lines (event_id for get_line_context / locate_code): {', '.join(ids)}"] if ids else [])])
 
 
-@mcp.tool()
+@tool()
 @guard
 def investigate(profile: str, function: str = "", error_type: str = "", signature: str = "", hours: float = 24) -> str:
-    """One call instead of four: for a client (optionally one function or one error pattern) returns
-    the top problem patterns with team notes and local-model triage, the full latest example, what the
-    function logged just before it, where it is in the code (if the repo is mapped), and the function's
-    recent run outcomes. Start here when asked "what's wrong with <client/function>?"."""
+    """Broad look at a client (optionally one function / error): top patterns with notes and triage,
+    latest example, preceding lines, code location and run outcomes."""
     prefix = f"/aws/lambda/{function}" if function and not function.startswith("/") else function
     rows = api("/api/summary", hours=hours, profile=profile, level="error,suspect", hide_muted=1,
                grp_prefix=prefix or "", etype=error_type, sig=signature if error_type else "")
@@ -1088,7 +1110,7 @@ def _rate(x, per):
     return f"{100 * x:.1f}% of invocations" if per == "invocation" else f"{x:.1f}/hour"
 
 
-@mcp.tool()
+@tool()
 @guard
 def list_deploys(profile: str = "", hours: float = 168, window_hours: float = 24) -> str:
     """Recent Lambda deploys (code changes) and settings changes, newest first, each with a quick
@@ -1113,15 +1135,12 @@ def list_deploys(profile: str = "", hours: float = 168, window_hours: float = 24
     return finish(out)
 
 
-@mcp.tool()
+@tool()
 @guard
 def did_my_fix_work(function: str, profile: str = "", window_hours: float = 24,
                     deployed_at: str = "") -> str:
-    """Compare a Lambda function's errors and hidden errors before vs after its latest deploy
-    (equal windows, normalised per invocation): which error patterns are gone, which remain,
-    which are new, and a verdict. `function` is the Lambda name (e.g. hubspot-changes-2-netsuite).
-    Pass profile if the same function name exists in several accounts. deployed_at (epoch ms)
-    picks an earlier deploy. Older history is pulled automatically if needed."""
+    """After a deploy: compares errors before/after the latest deploy of `function` and says whether
+    the fix worked (or if it's too early)."""
     r = api("/api/deploy_impact", function=function, profile=profile, window_hours=window_hours,
             deployed_at=deployed_at)
     if r.get("error"):
@@ -1256,16 +1275,12 @@ def _read_job(docs, question, kind, header, skipped=(), job_id=""):
     return finish(out)
 
 
-@mcp.tool()
+@tool()
 @guard
 def local_read(path: str = "", question: str = "", include: str = "", max_files: int = 60, job_id: str = "") -> str:
-    """Have the LOCAL model (on the user's tower, free) read a file or a whole folder from the user's
-    repos and return a short summary with file:line references, or an answer to `question`
-    (e.g. "where is the HubSpot token refreshed?", "what does this handler do?"). Use this BEFORE
-    reading big files or many files yourself, then open only the lines you need. `path` is absolute
-    or relative to the repos folder (e.g. "hrs/serverless_lambdas/hrs_deals"); `include` filters files,
-    e.g. "*.py,*.yml". Skips .git, venvs, node_modules, binaries and anything that looks like secrets.
-    If it's still working, call again with job_id."""
+    """The LOCAL model reads a file or folder from the repos (path relative to the repos root, e.g.
+    "hrs/serverless_lambdas/hrs_deals") and returns a summary with file:line refs or an answer to
+    `question`. include="*.py" filters. Secrets are never sent. Poll with job_id."""
     if job_id:
         return _read_job(None, question, "read", "Read", job_id=job_id)
     try:
@@ -1281,14 +1296,12 @@ def local_read(path: str = "", question: str = "", include: str = "", max_files:
 _REF_OK = _re.compile(r"^[\w./~^@{}:+-]{1,100}$")
 
 
-@mcp.tool()
+@tool()
 @guard
 def local_git(repo: str = "", what: str = "log", ref: str = "", n: int = 30, path: str = "", question: str = "",
               job_id: str = "") -> str:
-    """Have the LOCAL model read git history or changes and summarise them, instead of pulling a
-    long log or diff into the conversation. what = "log" (last n commits with changed files),
-    "diff" (uncommitted changes, or `ref` like "main...my-branch" / "HEAD~3"), or "show" (one
-    commit `ref`). `path` limits it to a sub-folder/file. Read-only: never changes the repo."""
+    """The LOCAL model summarises git history or changes: what="log" (last n commits), "diff"
+    (uncommitted or ref like main...branch) or "show" (one commit). Read-only."""
     if job_id:
         return _read_job(None, question, "git", "Git", job_id=job_id)
     try:
@@ -1375,14 +1388,11 @@ def _top_roots():
     return [r for i, r in enumerate(rs) if not any(r.startswith(o + os.sep) for o in rs[:i])]
 
 
-@mcp.tool()
+@tool()
 @guard
 def find_code(query: str, repo: str = "", include: str = "", max_results: int = 30, context: int = 1) -> str:
-    """Search the user's repos ON THE LAPTOP and return only the best-matching lines with file:line
-    (no model, instant). Use this instead of opening whole files to find where something is.
-    `query`: words (ranked by how many match; definitions rank higher) or a regex as /pattern/.
-    `repo`: folder relative to the repos root (e.g. "hrs" or "anew/serverless_lambdas"); empty = all.
-    `include`: file filter, e.g. "*.py,*.yml" (default: code/config files, not data exports)."""
+    """Search the repos on the laptop (no model, instant): returns only the best-matching lines with
+    file:line. query = words or /regex/; repo narrows it; include="*.py" filters."""
     try:
         root = _resolve(repo) if repo else None
     except ValueError as ex:
@@ -1461,13 +1471,11 @@ def _symbols(text, ext):
     return out
 
 
-@mcp.tool()
+@tool()
 @guard
-def repo_map(repo: str, describe: bool = True, max_entries: int = 250) -> str:
-    """A compact map of a repo: folders, files with line counts, their top-level functions/classes and
-    (from the tower's local model, cached by file content) a one-line purpose per file. Use it at the
-    start of a coding task instead of listing/reading folders. First call for a repo starts describing
-    files in the background; later calls are instant and only re-describe files that changed."""
+def repo_map(repo: str, focus: str = "", budget: int = 0, describe: bool = True, max_entries: int = 250) -> str:
+    """Repo layout: files, line counts, functions and a cached one-line purpose each. focus="words"
+    returns only the most relevant files (and their callers) within `budget` tokens."""
     try:
         root = _resolve(repo)
     except ValueError as ex:
@@ -1521,6 +1529,8 @@ def repo_map(repo: str, describe: bool = True, max_entries: int = 250) -> str:
                     note = f"(No purposes: {r['error']})"
             except FeedDown as ex:
                 note = f"(No purposes: {ex})"
+    if focus:
+        return finish(_focused_map(root, info, purposes, focus, budget or 1500, note))
     by_dir = {}
     for i in info:
         d = os.path.dirname(i["name"]) or "."
@@ -1546,6 +1556,49 @@ def repo_map(repo: str, describe: bool = True, max_entries: int = 250) -> str:
     return finish(out)
 
 
+def _focused_map(root, info, purposes, focus, budget, note):
+    terms = [w for w in _re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", focus.lower()) if w not in STOP]
+    if not terms:
+        return ["Give focus words of 3+ letters."]
+    score = {}
+    for i in info:
+        low, name, p = i["text"].lower(), i["name"].lower(), (purposes.get(i["name"]) or "").lower()
+        syms = [s.lower() for s in i["syms"]]
+        score[i["name"]] = sum(3 * (w in name) + 2 * (w in p) + 2 * any(w in s for s in syms)
+                               + min(3.0, low.count(w) / 5) for w in terms)
+    relevant = [i for i in info if score[i["name"]] > 0]
+    relevant.sort(key=lambda i: -score[i["name"]])
+    defs = {}
+    for i in relevant[:40]:
+        for s in i["syms"]:
+            if len(s) >= 6:
+                defs.setdefault(s, i["name"])
+    bonus = {}
+    for i in info:                       # files that use what the relevant files define
+        for s, owner in defs.items():
+            if owner != i["name"] and s in i["text"]:
+                bonus[i["name"]] = bonus.get(i["name"], 0) + 0.3 * score[owner]
+                bonus[owner] = bonus.get(owner, 0) + 0.1 * score[owner]
+    total = lambda i: score[i["name"]] + bonus.get(i["name"], 0)
+    ranked = sorted([i for i in info if total(i) > 0], key=lambda i: -total(i))
+    out = [f"Repo map for {focus!r} in {root} — most relevant first (~{budget} tokens; {len(info)} files in repo)"
+           + (f" {note}" if note else "")]
+    size, limit = len(out[0]), budget * 4
+    for i in ranked:
+        syms = (" · " + ", ".join(i["syms"][:10]) + ("…" if len(i["syms"]) > 10 else "")) if i["syms"] else ""
+        p = purposes.get(i["name"])
+        line = f"  {i['name']} ({i['lines']})" + (f" — {p}" if p else "") + syms
+        if size + len(line) > limit:
+            out.append(f"  … {len(ranked) - len(out) + 1} more relevant file(s) - raise budget to see them")
+            break
+        out.append(line)
+        size += len(line)
+    if len(out) == 1:
+        out.append("No files match that focus - try other words, or call repo_map without focus.")
+    out.append("Next: outline(file) for signatures, get_symbol(name) for one function.")
+    return out
+
+
 # --------------------------------------------------------------------------- fix brief
 def _tower_job(template, text, question="", seconds=50):
     """(job_id if still running, answer, error)"""
@@ -1560,15 +1613,12 @@ def _tower_job(template, text, question="", seconds=50):
     return None, j.get("answer") or "", None
 
 
-@mcp.tool()
+@tool()
 @guard
 def fix_brief(profile: str, function: str = "", error_type: str = "", signature: str = "", hours: float = 24,
               job_id: str = "") -> str:
-    """Everything needed to fix ONE error in a single compact call: the top (or given) error pattern,
-    team note + local triage, the latest example, what the function logged just before it, the code
-    around the failing line (from the laptop's repo), recent run outcomes, plus a diagnosis and
-    suggested fix written by the tower's local model (verify it). Use this when about to fix an error;
-    use investigate for a broader look at a client. If the diagnosis is still being written, call again
+    """Everything to fix ONE error in one call: pattern, triage, latest example, preceding logs, the
+    failing code (or the print that wrote it), recent runs + a local diagnosis (verify it). Poll
     with job_id."""
     if job_id:
         j = _wait_job(job_id, seconds=50)
@@ -1588,7 +1638,14 @@ def fix_brief(profile: str, function: str = "", error_type: str = "", signature:
         e = ev[0]
         b += [f"\nlatest ({t(e['ts'])}, event_id {e['id']}):", cap(e["message"], 1800)]
         ctx = api("/api/context", id=e["id"], before=2, after=0.5)
-        before = [x for x in ctx.get("lines", []) if x["id"] != e["id"]][-8:]
+        before, seen_msg = [], set()
+        for x in reversed([x for x in ctx.get("lines", []) if x["id"] != e["id"]]):
+            if x["message"] in seen_msg:
+                continue
+            seen_msg.add(x["message"])
+            before.insert(0, x)
+            if len(before) >= 8:
+                break
         if before:
             b.append("\nlogged just before:")
             b += [f"  {t(x['ts'])} [{x['level']}] {cap(x['message'], 220)}" for x in before]
@@ -1598,7 +1655,13 @@ def fix_brief(profile: str, function: str = "", error_type: str = "", signature:
             f = own[-1]
             b += [f"\ncode: {f['path']}:{f['line']}", f.get("snippet") or ""]
         elif code.get("mapped"):
-            b.append(f"\nrepo folder: {code['mapped']} (no stack frame in the message - use find_code)")
+            sites = find_print_site(e["message"], code["mapped"].get("dir"))
+            if sites:
+                s0 = sites[0]
+                b += [f"\ncode that printed this line: {s0['path']}:{s0['line']}", s0["snippet"]]
+                b += [f"(also possible: {x['path']}:{x['line']})" for x in sites[1:2]]
+            else:
+                b.append(f"\nrepo folder: {code['mapped'].get('dir')} (no stack frame and no matching print found - use find_code)")
         if str(e.get("group", "")).startswith("stepfunctions:"):
             b.append("(Step Functions failure: get_step_function_input gives the exact input to reproduce it.)")
     groups = [x for x in api("/api/ops/groups", profile=profile, hours=hours) if x["group"] in list(g["log_groups"])[:1]]
@@ -1635,13 +1698,12 @@ def _allowed(argv):
     return len(argv) >= 2 and argv[0] in ("python", "python3", "py") and _re.search(r"(^|[/\\])(test|tests|local_tests)[/\\]|(^|[/\\])test_\w+\.py$|_tests?\.py$|run_tests\.py$", argv[1]) is not None
 
 
-@mcp.tool()
+@tool()
 @guard
 def local_run(command: str, repo: str, timeout_s: int = 600, job_id: str = "") -> str:
-    """Run a SAFE check command on the laptop inside a repo and get back only what matters: exit code
-    plus failures (the tower's model reads long output). Allowed: pytest / python -m pytest|unittest|
-    py_compile, python <test script> (e.g. local_tests/run_tests.py), npm test / npm run test|lint,
-    node --test, git status, serverless print. No shell operators. Never deploys or changes anything."""
+    """Run a safe check on the laptop (pytest, python -m pytest/unittest/py_compile, python <test
+    script>, npm test/lint, node --test, git status, serverless print) and get only the result and
+    failures. No shell operators."""
     if job_id:
         j = _wait_job(job_id, seconds=50)
         if j.get("status") == "running":
@@ -1683,7 +1745,7 @@ def local_run(command: str, repo: str, timeout_s: int = 600, job_id: str = "") -
 
 
 # --------------------------------------------------------------------------- drafts by the tower
-@mcp.tool()
+@tool()
 @guard
 def draft_commit_message(repo: str) -> str:
     """The tower's local model writes a commit message for the staged changes (or, if nothing is
@@ -1708,16 +1770,13 @@ def draft_commit_message(repo: str) -> str:
     return finish([f"Draft commit message for the {which} changes (local model - review it):", "```", ans.strip(), "```"])
 
 
-@mcp.tool()
+@tool()
 @guard
 def local_draft_change(path: str, start_line: int, end_line: int, instruction: str, apply: bool = False,
                        job_id: str = "") -> str:
-    """Let the tower's local model WRITE a small code change, so Claude doesn't have to generate it:
-    give a file, the line range to rewrite (from find_code / local_read) and a precise instruction
-    (e.g. "log the HubSpot error with oflog.check_response instead of print"). Returns a unified diff to
-    review. Call again with the same arguments and apply=True to write it (the result is cached, so it's
-    the same diff). Python files are syntax-checked before writing. Best for small, well-defined edits
-    (<= 150 lines); write complex logic yourself."""
+    """The LOCAL model writes a small edit (<=150 lines) for path lines start_line-end_line from
+    `instruction` and returns a diff; the same call with apply=True writes it (syntax-checked).
+    Review first; write complex logic yourself."""
     try:
         real = _resolve(path)
     except ValueError as ex:
@@ -1779,7 +1838,230 @@ def local_draft_change(path: str, start_line: int, end_line: int, instruction: s
                    "```diff", *diff, "```"])
 
 
+# --------------------------------------------------------------------------- symbol-level code access
+import ast as _ast
+
+
+def _py_symbols(text):
+    """[(qualified name, kind, start, end, signature, doc first line)] for a Python file."""
+    try:
+        tree = _ast.parse(text)
+    except SyntaxError:
+        return []
+    out = []
+
+    def walk(nodes, prefix=""):
+        for n in nodes:
+            if isinstance(n, (_ast.FunctionDef, _ast.AsyncFunctionDef, _ast.ClassDef)):
+                name = prefix + n.name
+                start = min([n.lineno] + [d.lineno for d in getattr(n, "decorator_list", [])])
+                end = getattr(n, "end_lineno", n.lineno)
+                if isinstance(n, _ast.ClassDef):
+                    sig = f"class {n.name}"
+                    kind = "class"
+                else:
+                    try:
+                        args = _ast.unparse(n.args)
+                    except Exception:
+                        args = "..."
+                    ret = ""
+                    if n.returns is not None:
+                        try:
+                            ret = " -> " + _ast.unparse(n.returns)
+                        except Exception:
+                            pass
+                    sig = f"{'async ' if isinstance(n, _ast.AsyncFunctionDef) else ''}def {n.name}({args}){ret}"
+                    kind = "method" if prefix else "function"
+                doc = (_ast.get_docstring(n) or "").strip().splitlines()
+                out.append((name, kind, start, end, sig, doc[0][:120] if doc else ""))
+                if isinstance(n, _ast.ClassDef):
+                    walk(n.body, name + ".")
+    walk(tree.body)
+    return out
+
+
+_JS_DEF = _re.compile(r"^(\s*)(?:export\s+)?(?:default\s+)?(?:async\s+)?(?:function\s+(\w+)|class\s+(\w+)|"
+                      r"(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s*)?(?:\([^)]*\)|\w+)\s*=>)")
+
+
+def _other_symbols(text):
+    """Rough outline for JS/TS/other files: definition lines; a block ends where the next one at the same
+    indentation (or less) starts."""
+    lines = text.split("\n")
+    found = []
+    for i, l in enumerate(lines):
+        m = _JS_DEF.match(l)
+        if m:
+            name = next(g for g in m.groups()[1:] if g)
+            found.append((name, len(m.group(1)), i + 1, l.strip()[:160]))
+    out = []
+    for k, (name, ind, start, sig) in enumerate(found):
+        end = len(lines)
+        for name2, ind2, start2, _ in found[k + 1:]:
+            if ind2 <= ind:
+                end = start2 - 1
+                break
+        out.append((name, "function", start, end, sig, ""))
+    return out
+
+
+def _symbols_of(path, text):
+    return _py_symbols(text) if path.endswith(".py") else _other_symbols(text)
+
+
+@tool()
+@guard
+def outline(path: str) -> str:
+    """Signatures of every class / function / method in a file (or every code file in a folder), with
+    line ranges and the first docstring line - without the bodies. Much cheaper than reading the
+    file; then use get_symbol for the one you need."""
+    try:
+        real = _resolve(path)
+    except ValueError as ex:
+        return str(ex)
+    files = [(real, os.path.basename(real))] if os.path.isfile(real) else _code_files(real, "*.py,*.js,*.ts,*.jsx,*.tsx")[:80]
+    out = []
+    for f, rel in files:
+        try:
+            text = open(f, encoding="utf-8", errors="replace").read()
+        except OSError:
+            continue
+        syms = _symbols_of(f, text)
+        out.append(f"\n{rel} ({text.count(chr(10)) + 1} lines)")
+        for name, kind, s, e, sig, doc in syms:
+            depth = name.count(".")
+            out.append(f"{'  ' * (depth + 1)}{s}-{e}: {sig}" + (f"  # {doc}" if doc else ""))
+        if not syms:
+            out.append("  (no functions/classes found)")
+    return finish(out or ["No code files found."])
+
+
+@tool()
+@guard
+def get_symbol(name: str, repo: str = "", file: str = "", max_matches: int = 3) -> str:
+    """Exact source of ONE function/class/method (e.g. "send_batch_upsert" or "Client.patch") with line
+    numbers, instead of reading the file. repo/file narrow the search."""
+    try:
+        roots = [_resolve(file)] if file else ([_resolve(repo)] if repo else _top_roots())
+    except ValueError as ex:
+        return str(ex)
+    want = name.strip()
+    matches = []
+    for r in roots:
+        for f, rel in _code_files(r, "*.py,*.js,*.ts,*.jsx,*.tsx"):
+            try:
+                text = open(f, encoding="utf-8", errors="replace").read()
+            except OSError:
+                continue
+            if want.split(".")[-1] not in text:
+                continue
+            for qn, kind, s, e, sig, doc in _symbols_of(f, text):
+                if qn == want or qn.split(".")[-1] == want or (("." in want) and qn.endswith(want)):
+                    matches.append((f, rel, s, e, text))
+    if not matches:
+        return f"No function/class named {name!r} found" + (f" under {repo or file}" if (repo or file) else "") + \
+            ". Try find_code for a text search."
+    seen, uniq = set(), []
+    for m in matches:                      # identical copies (shared helper per Lambda) count once
+        body = "\n".join(m[4].split("\n")[m[2] - 1:m[3]])
+        h = _hashlib.sha1(body.encode()).hexdigest()
+        uniq.append((m, h in seen))
+        seen.add(h)
+    out = []
+    if len(matches) > 1:
+        out.append(f"{len(matches)} definitions of {name!r}:")
+        for (f, rel, s, e, _), dup in uniq[:20]:
+            out.append(f"  {f}:{s}-{e}" + ("  (identical copy)" if dup else ""))
+    shown = 0
+    for (f, rel, s, e, text), dup in uniq:
+        if dup or shown >= max(1, min(max_matches, 5)):
+            continue
+        lines = text.split("\n")
+        if e - s > 400:
+            e = s + 400
+        out += [f"\n{f}:{s}-{e}", "```", *[f"{i:>5}| {lines[i - 1]}" for i in range(s, e + 1)], "```"]
+        shown += 1
+    return finish(out)
+
+
+# --------------------------------------------------------------------------- where a print() came from
+def _message_fragments(message):
+    """The fixed parts of a log line (what the code literally wrote), longest first."""
+    first = message.strip().splitlines()[0] if message.strip() else ""
+    parts = _re.split(r"\{.*?\}|'[^']*'|\"[^\"]*\"|\b\d[\d.,:-]*\b|\b[0-9a-f]{8,}\b", first)
+    frags = []
+    for p in parts:
+        p = p.strip(" ,;|")
+        for seg in _re.split(r"\s*[,;|]\s*", p):
+            seg = seg.strip()
+            if len(_re.sub(r"[^A-Za-z]", "", seg)) >= 4:
+                frags.append(seg)
+    return sorted(set(frags), key=len, reverse=True)[:8]
+
+
+def find_print_site(message, folder, limit=3):
+    """Lines in `folder` whose string literals contain the fixed parts of `message` (for errors that
+    come from print/log statements rather than a stack trace)."""
+    frags = _message_fragments(message)
+    if not frags or not folder or not os.path.isdir(folder):
+        return []
+    hits = []
+    for f, rel in _code_files(folder, "*.py,*.js,*.ts"):
+        try:
+            lines = open(f, encoding="utf-8", errors="replace").read().split("\n")
+        except OSError:
+            continue
+        for i, l in enumerate(lines):
+            if "print" not in l and "log" not in l and '"' not in l and "'" not in l:
+                continue
+            window = " ".join(lines[i:i + 3])
+            n = sum(1 for fr in frags if fr in window)
+            if n:
+                hits.append((n, f, i + 1, lines))
+    hits.sort(key=lambda h: -h[0])
+    out, used = [], set()
+    for n, f, ln, lines in hits:
+        if (f, ln // 5) in used or n < max(1, min(2, len(frags))):
+            continue
+        used.add((f, ln // 5))
+        s, e = max(1, ln - 4), min(len(lines), ln + 6)
+        out.append({"path": f, "line": ln, "score": n,
+                    "snippet": "\n".join(f"{i:>5}| {lines[i - 1]}" for i in range(s, e + 1))})
+        if len(out) >= limit:
+            break
+    return out
+
+
+# --------------------------------------------------------------------------- core tool set + the rest on demand
 @mcp.tool()
+@guard
+def more_tools(name: str = "", args: str = "{}") -> str:
+    """Every other aws-error-feed tool (infrastructure, schedules, deploys, partner APIs, notes, mutes,
+    reports, runs, history...). Call with no name for the list, then more_tools(name, args=JSON)."""
+    if not name:
+        rows = []
+        for n, f in sorted(REGISTRY.items()):
+            if n in EXPOSED:
+                continue
+            import inspect
+            sig = ", ".join(p for p in inspect.signature(f).parameters)
+            rows.append(f"- {n}({sig}): {((f.__doc__ or '').strip().splitlines() or [''])[0][:150]}")
+        return "Call more_tools(name=\"<tool>\", args='{\"param\": value}'):\n" + "\n".join(rows)
+    f = REGISTRY.get(name)
+    if not f:
+        return f"Unknown tool {name!r}. Call more_tools() for the list."
+    try:
+        kw = json.loads(args or "{}")
+    except ValueError as ex:
+        return f"args must be JSON: {ex}"
+    try:
+        return getattr(f, "__wrapped__", f)(**kw)
+    except TypeError as ex:
+        import inspect
+        return f"Wrong arguments for {name}: {ex}. Signature: {name}{inspect.signature(f)}"
+
+
+@tool()
 @guard
 def usage_savings(days: int = 7) -> str:
     """How much reading the local model (on the user's tower) did instead of Claude, per day:
