@@ -2264,7 +2264,7 @@ tr.click:hover{background:var(--bg);cursor:pointer}
  .tabs button{flex:0 0 auto}
  #export,#pause,#notif,label[for],.row label{display:none}
  #q{width:100%;flex:1 1 100%}
- #status .chip{display:none}#status .chip.bad{display:inline-block}
+ #status .chip{display:none}#status .chip.bad,#status #stToggle{display:inline-block}
  main{padding:8px 10px}.help{display:none}
  .cards{grid-template-columns:1fr}
  table{display:block;overflow-x:auto}
@@ -2827,17 +2827,39 @@ async function aiSummarize(params,box){
   poll();
 }
 let aiTick=0;
+// Account chips: collapsed to one summary line by default (problems still always show)
+let ST_OPEN=false; try{ST_OPEN=localStorage.getItem('statusOpen')==='1'}catch(e){}
+let LAST_ST=null;
+function renderStatus(chips, vals){
+  LAST_ST=[chips,vals];
+  const bad=vals.filter(v=>!v.ok&&(v.error||'starting…')!=='starting…').length,
+        connecting=vals.filter(v=>!v.ok&&(v.error||'starting…')==='starting…').length,
+        ok=vals.filter(v=>v.ok).length, loading=vals.filter(v=>v.ok&&v.backfilling).length;
+  const sum=`<span class="chip filter" id="stToggle" title="${ST_OPEN?'Hide':'Show'} the account list">${ST_OPEN?'▾':'▸'} Accounts: <b style="color:var(--ok)">${ok} connected</b>`+
+    `${loading?` · ${loading} loading history`:''}${connecting?` · ${connecting} connecting`:''}`+
+    `${bad?` · <b style="color:var(--err)">${bad} problem${bad>1?'s':''}</b>`:''}</span>`;
+  // collapsed: only the accounts that need attention stay visible
+  const shown=ST_OPEN?chips:chips.filter(c=>c.includes('chip bad'));
+  $('status').innerHTML=sum+shown.join('');
+}
+document.addEventListener('click',e=>{
+  if(e.target.closest&&e.target.closest('#stToggle')){
+    ST_OPEN=!ST_OPEN; try{localStorage.setItem('statusOpen',ST_OPEN?'1':'0')}catch(_){}
+    if(LAST_ST)renderStatus(...LAST_ST);
+  }
+});
 async function status(){
   if(regTick++%3===0)loadRegress();
   if(aiTick++%6===0)aiStatus();
   try{
     const s=await getJ('/api/status'), now=Date.now(), vals=Object.values(s);
     vals.forEach(v=>v.profile&&knownProfiles.add(v.profile)); updateProfiles();
-    $('status').innerHTML=Object.entries(s).map(([k,v])=>{
+    const chips=Object.entries(s).map(([k,v])=>{
       if(!v.ok && (v.error||'starting…')==='starting…') return `<span class="chip" title="first pull in progress">◌ ${esc(k)} — connecting…</span>`;
       if(!v.ok) return `<span class="chip bad" title="${esc(v.error||'starting…')}">● ${esc(k)} — ${esc((v.error||'starting…').slice(0,90))}</span>`;
       const pct=v.backfilling?Math.round(100*(now-v.covered_from)/Math.max(1,now-v.target)):100;
-      return `<span class="chip good" title="${v.groups} log groups · history loaded back to ${day(v.covered_from)}${v.sampled?` · ${v.sampled} times a log group was too busy to pull every line (errors still pulled)`:''}"><b>●</b> ${esc(k)} (${esc(v.account||'?')}) · ${v.groups} groups${v.state_machines?` · ${v.state_machines} state machines`:''}${v.lambdas?` · ${v.lambdas} lambdas`:''}${v.lambda_error?` · <span style="color:var(--sus)" title="${esc(v.lambda_error)}">deploys: ${/AccessDenied/.test(v.lambda_error)?'no permission':'error'}</span>`:''}${v.sfn_error?` · <span style="color:var(--sus)" title="${esc(v.sfn_error)}">step functions: ${/AccessDenied/.test(v.sfn_error)?'no permission':'error'}</span>`:''}${v.backfilling?` · loading ${pct}%`:''}${v.sampled?' · sampled':''}</span>`}).join('');
+      return `<span class="chip good" title="${v.groups} log groups · history loaded back to ${day(v.covered_from)}${v.sampled?` · ${v.sampled} times a log group was too busy to pull every line (errors still pulled)`:''}"><b>●</b> ${esc(k)} (${esc(v.account||'?')}) · ${v.groups} groups${v.state_machines?` · ${v.state_machines} state machines`:''}${v.lambdas?` · ${v.lambdas} lambdas`:''}${v.lambda_error?` · <span style="color:var(--sus)" title="${esc(v.lambda_error)}">deploys: ${/AccessDenied/.test(v.lambda_error)?'no permission':'error'}</span>`:''}${v.sfn_error?` · <span style="color:var(--sus)" title="${esc(v.sfn_error)}">step functions: ${/AccessDenied/.test(v.sfn_error)?'no permission':'error'}</span>`:''}${v.backfilling?` · loading ${pct}%`:''}${v.sampled?' · sampled':''}</span>`});
+    renderStatus(chips, vals);
     const h=$('fHours').value, el=$('hist'), ok=vals.filter(v=>v.ok&&v.covered_from);
     if(h&&ok.length){
       const want=now-h*3600e3, oldest=Math.max(...ok.map(v=>v.covered_from));
