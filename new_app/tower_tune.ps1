@@ -23,7 +23,7 @@ $NumParallel     = "1"             # 12 GB card: one call at a time (the dashboa
 $MaxLoadedModels = "1"
 $ContextsToTry   = @(16384, 12288, 8192)   # biggest first; first one that fits 100% on the GPU wins
 $UndoNumCtx      = 8192
-$Drain3Mode      = "shadow"        # "shadow" = measure only, "off" = disable
+$Drain3Mode      = "on"            # "on" = Drain3 templates are the patterns, "shadow" = measure only, "off"
 $Python          = "C:\Users\jagom\AppData\Local\Programs\Python\Python311\python.exe"
 $AppDir          = $PSScriptRoot
 $ConfigFile      = Join-Path $AppDir "config.json"

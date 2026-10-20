@@ -89,6 +89,7 @@ DEFAULTS = {
     # errors.db is a short-lived cache: anything older than this is deleted, unless you pulled
     # an older range in the last keep_hours (then it's kept until keep_hours after that pull)
     "keep_hours": 24,
+    "info_keep_hours": 8,         # plain info lines are dropped sooner (errors / hidden errors / warnings / platform keep keep_hours)
     "poll_seconds": 30,
     "lookback_minutes": 60,      # how far back to look the very first time
     # Fast start: the first pull after starting only catches up this many hours, so the feed is
@@ -514,6 +515,7 @@ class Store:
         self.skip_platform = set(cfg["skip_platform_lines"])
         self.on_rows = None             # called with each batch of new rows (Drain3 shadow grouping)
         self.on_status = None           # called when an account connects / disconnects
+        self.regroup = None             # Drain3 "on": (profile, etype, sig, ts) -> (pattern, [(old, new)])
         reset_old_db(path)
         self.db = sqlite3.connect(path, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
@@ -553,7 +555,7 @@ class Store:
 
     # ---- writes
     def add_many(self, evs, live):
-        rows = []
+        rows, changes = [], []
         for e in evs:
             msg = e["message"]
             if "level" in e:                 # pre-classified (Step Functions findings)
@@ -564,6 +566,12 @@ class Store:
                     continue
                 etype, sig = signature(msg, level, hint)
                 kind = kind_of(msg, level)
+            if self.regroup and level in ("error", "suspect", "warning"):
+                try:
+                    sig, ch = self.regroup(e["profile"], etype, sig, e["ts"])
+                    changes += [(e["profile"], etype, o, n) for o, n in ch]
+                except Exception:
+                    pass
             rows.append((e["id"], e["ts"], e["profile"], e["account"], e["region"], e["group"],
                          e["stream"], kind, etype, sig,
                          msg[:20000] if level in ("error", "suspect") else msg[:4000],
@@ -576,12 +584,37 @@ class Store:
                 "message,live,level,hint) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
             self.db.commit()
             n = cur.rowcount
+        for prof, etype, old, new in changes:
+            self.remap_sig(prof, etype, old, new)
         if self.on_rows:
             try:
                 self.on_rows(rows)
             except Exception:
                 pass
         return n
+
+    def remap_sig(self, profile, etype, old, new):
+        """Rename a pattern (Drain3 made its template more general): lines, hourly baseline, mutes,
+        notes and triage follow it. Global (all-profile) mutes / notes are copied, not moved."""
+        with self.lock:
+            db = self.db
+            db.execute("UPDATE events SET sig = ? WHERE etype = ? AND sig = ? AND profile = ?", (new, etype, old, profile))
+            db.execute("INSERT INTO pattern_hours (profile, grp, etype, sig, level, hour, n) "
+                       "SELECT profile, grp, etype, ?, level, hour, n FROM pattern_hours "
+                       "WHERE profile = ? AND etype = ? AND sig = ? "
+                       "ON CONFLICT(profile, grp, etype, sig, hour) DO UPDATE SET n = n + excluded.n",
+                       (new, profile, etype, old))
+            db.execute("DELETE FROM pattern_hours WHERE profile = ? AND etype = ? AND sig = ?", (profile, etype, old))
+            for t in ("mutes", "notes", "ai_triage"):
+                try:
+                    cols = [r[1] for r in db.execute(f"PRAGMA table_info({t})")]
+                    sel = ", ".join("?" if c == "sig" else c for c in cols)
+                    db.execute(f"INSERT OR IGNORE INTO {t} ({', '.join(cols)}) SELECT {sel} FROM {t} "
+                               f"WHERE etype = ? AND sig = ? AND profile IN (?, '')", (new, etype, old, profile))
+                    db.execute(f"DELETE FROM {t} WHERE etype = ? AND sig = ? AND profile = ?", (etype, old, profile))
+                except sqlite3.Error:
+                    pass
+            db.commit()
 
     def _delete_batched(self, where, params, batch=5000):
         """Delete in small chunks, releasing the lock in between, so a big clean-up never
@@ -1663,6 +1696,7 @@ class Worker(threading.Thread):
         # Step Functions keeps execution history for 90 days; start with the same window as the logs
         self.sfn_covered_from = sc["covered_from"] if sc else now - cfg["lookback_minutes"] * 60_000
         self.keep_ms = int(cfg["keep_hours"] * 3_600_000)
+        self.info_keep_ms = int(float(cfg.get("info_keep_hours") or cfg["keep_hours"]) * 3_600_000)
         ex = store.get_coverage("exp|" + self.key)
         self.hist_expires = ex["covered_from"] if ex else 0   # when an older pulled range expires
         self.last_expire_check = 0
@@ -1710,6 +1744,9 @@ class Worker(threading.Thread):
         """Once a pulled range is more than keep_hours old, delete it and forget it was loaded,
         so picking that range again pulls it fresh from AWS."""
         now = int(time.time() * 1000)
+        if self.info_keep_ms < self.keep_ms:      # plain info lines in the live window go sooner
+            self.store._delete_batched("profile=? AND region=? AND level='info' AND ts BETWEEN ? AND ?",
+                                       (self.profile, self.region, now - self.keep_ms, now - self.info_keep_ms))
         if now < self.hist_expires:
             return 0
         cutoff = now - self.keep_ms
@@ -2501,7 +2538,7 @@ tr.click:hover{background:var(--bg);cursor:pointer}
   <table><thead><tr><th>Service</th><th>Problem</th><th class="num">Lines</th><th class="num">Last hour</th><th>Clients</th><th>Functions</th><th>Last seen</th><th>Example</th></tr></thead>
   <tbody id="partBody"></tbody></table></div>
  <div id="v-volume" class="view">
-  <p class="help">What's coming through each log group in the selected range. Click a row to see its logs.</p>
+  <p class="help">What's coming through each log group in the selected range. Click a row to see its logs. Plain info lines are kept for the last 8 hours (info_keep_hours); errors, hidden errors, warnings and platform lines for 24.</p>
   <div class="totals" id="vtotals"></div><table><thead><tr>
   <th>Profile</th><th>Log group</th><th class="num">Total</th><th>Mix</th><th class="num">Errors</th><th class="num">Hidden?</th>
   <th class="num">Warn</th><th class="num">Info</th><th class="num">Platform</th><th>Last line</th></tr></thead>
@@ -2770,10 +2807,12 @@ async function loadHealth(){
   h+=sec('Claude connector tools',tbl(['Tool','Window','#Calls','#Avg / p95 time','#Avg tokens to Claude','#Max','#Errors','Last error'],s.tools.sort((a,b)=>b.calls*b.avg_chars-a.calls*a.avg_chars).map(t=>`<tr><td>${esc(t.tool)}</td><td>${t.window}</td><td class="num">${t.calls}</td><td class="num">${(t.avg_ms/1000).toFixed(1)}s / ${(t.p95_ms/1000).toFixed(1)}s</td><td class="num">~${k(Math.round(t.avg_chars/4))}</td><td class="num">~${k(Math.round(t.max_chars/4))}</td><td class="num" style="${t.errors?'color:var(--err)':''}">${t.errors}</td><td class="small">${esc(t.last_error||'')}</td></tr>`))
     +`<p class="small">7 days: tower read ~${k(s.savings.local_read)} tokens · Claude received ~${k(s.savings.claude_received)} from ${s.savings.claude_calls} calls · ~${s.savings.saved_pct}% of the reading done on the tower. Time and errors are recorded once the connector is restarted with this version.</p>`);
   const d=s.drain||{};
-  h+=sec('Drain3 shadow grouping',!d.available?`<p class="small">${esc(d.error||'off')}</p>`:
-    `<p class="small">Last ${'24'}h: today's grouping has <b>${d.patterns}</b> patterns (errors, hidden errors, warnings); Drain3 would make <b>${d.drain_clusters}</b> (−${d.reduction_pct}%). ${d.avg_us!=null?`Cost ~${d.avg_us} µs per new pattern.`:''} ${d.seeded?'':'(still loading the last 24h…)'} Nothing in the feed changes — this only measures.</p>`
+  const on=d.mode==='on';
+  h+=sec(on?'Drain3 grouping (on)':'Drain3 shadow grouping',!d.available?`<p class="small">${esc(d.error||'off')}</p>`:
+    (on?`<p class="small">Patterns are Drain3 templates. Last 24h: <b>${d.patterns}</b> raw patterns shown as <b>${d.drain_clusters}</b> (−${d.reduction_pct}%) · ${d.renamed} renamed at start. ${d.avg_us!=null?`Cost ~${d.avg_us} µs per new pattern.`:''} Different error types and HTTP codes (429 vs 500) are never merged. Undo: set grouping.drain3 to "shadow" (new lines group the old way).</p>`
+    :`<p class="small">Last 24h: today's grouping has <b>${d.patterns}</b> patterns (errors, hidden errors, warnings); Drain3 would make <b>${d.drain_clusters}</b> (−${d.reduction_pct}%). ${d.avg_us!=null?`Cost ~${d.avg_us} µs per new pattern.`:''} ${d.seeded?'':'(still loading the last 24h…)'} Nothing in the feed changes — this only measures.</p>`)
     +tbl(['Profile','#Patterns','#Drain3 clusters','#Fewer'],(d.per_profile||[]).slice(0,20).map(x=>`<tr><td>${esc(x.profile)}</td><td class="num">${x.patterns}</td><td class="num">${x.clusters}</td><td class="num">${x.reduction_pct}%</td></tr>`))
-    +`<p class="small" style="margin-top:8px"><b>Merge candidates</b> — patterns Drain3 sees as one. If these really are the same problem, switching grouping is worth it; if they're different problems, it isn't.</p>`
+    +`<p class="small" style="margin-top:8px"><b>${on?'Merged patterns':'Merge candidates'}</b> — ${on?'raw patterns now shown as one.':'patterns Drain3 sees as one. If these really are the same problem, switching grouping is worth it; if they\'re different problems, it isn\'t.'}</p>`
     +tbl(['Profile','#Patterns','#Lines','Drain3 template','Today\'s patterns'],(d.merge_candidates||[]).map(x=>`<tr><td>${esc(x.profile)}</td><td class="num">${x.patterns}</td><td class="num">${x.lines}</td><td class="sig">${esc(x.template)}</td><td class="small">${x.examples.map(esc).join('<br>')}</td></tr>`)));
   const LV={error:'--err',warning:'--sus',info:'--mute'};
   h+=sec(`System log <span class="small" style="font-weight:400">(24h: ${s.events_24h.error||0} errors, ${s.events_24h.warning||0} warnings${s.db_mb!=null?` · errors.db ${s.db_mb} MB`:''}) <button class="act" id="hlRefresh">refresh now</button></span>`,
@@ -3085,9 +3124,13 @@ def main():
     threading.excepthook = HEALTH.thread_hook
     store.on_status = HEALTH.status_change
     DRAIN = aws_health.DrainShadow(cfg)
-    store.on_rows = DRAIN.feed_rows
-    threading.Thread(target=DRAIN.seed, args=(store, int(time.time() * 1000) - cfg["keep_hours"] * 3_600_000),
-                     daemon=True, name="drain3-seed").start()
+    if DRAIN.active:            # Drain3 templates are the patterns: rename what's stored, then group live
+        DRAIN.migrate(store, store.remap_sig, int(time.time() * 1000) - cfg["keep_hours"] * 3_600_000)
+        store.regroup = DRAIN.resolve
+    else:                       # shadow: only measure
+        store.on_rows = DRAIN.feed_rows
+        threading.Thread(target=DRAIN.seed, args=(store, int(time.time() * 1000) - cfg["keep_hours"] * 3_600_000),
+                         daemon=True, name="drain3-seed").start()
     lc = cfg.get("local_llm") or {}
     HEALTH.event("info", "settings", "start",
                  f"model={LLM.model} num_ctx={LLM.num_ctx} parallel={LLM.gate.slots} "

@@ -19,6 +19,7 @@ Also:
 """
 import json
 import os
+import re
 import threading
 import time
 import traceback
@@ -73,21 +74,33 @@ def _day(ms):
     return time.strftime("%Y-%m-%d", time.localtime(ms / 1000))
 
 
-# ================================================================== Drain3 shadow grouping
+# ================================================================== Drain3 grouping
+HTTP_CODE_RX = re.compile(r"\b[45]\d\d\b")
+
+
 class DrainShadow:
-    """Feeds every distinct (profile, type, normalized message) pattern to Drain3 once and remembers
-    which Drain3 cluster it landed in. Several of today's patterns in one cluster = patterns Drain3
-    would merge. Doesn't change anything in the feed."""
+    """Drain3 log-template mining over the normalized messages.
+
+    mode "shadow": only measures - every distinct (profile, type, message) pattern is fed once and the
+    Health tab shows how many patterns Drain3 would merge.
+    mode "on": the same, and the Drain3 template becomes the stored pattern (Store calls resolve()).
+    When a template gets more general, remap(old, new) moves events, baseline, mutes, notes and triage.
+
+    Never merged: different error types, different HTTP status codes (429 vs 500), run_summary
+    patterns (one per function) and very short messages."""
 
     def __init__(self, cfg):
         g = cfg.get("grouping") or {}
         self.mode = str(g.get("drain3", "shadow")).lower()
         self.sim = float(g.get("drain3_similarity", 0.4))
+        self.min_tokens = int(g.get("drain3_min_tokens", 3))
         self.max_keys = int(g.get("drain3_max_patterns", 200000))
         self.available, self.error = False, None
-        self.lock = threading.Lock()
-        self.miners, self.keys = {}, {}          # keys: (profile, etype, sig) -> [cluster_id, last_ts, lines]
-        self.cost_s, self.fed, self.seeded = 0.0, 0, False
+        self.lock = threading.RLock()
+        self.miners = {}         # miner key (profile, etype, http codes) -> TemplateMiner
+        self.keys = {}           # (profile, etype, raw sig) -> [miner key, cluster id, last_ts, lines]
+        self.tpl = {}            # (miner key, cluster id) -> template currently stored as the pattern
+        self.cost_s, self.fed, self.seeded, self.remapped = 0.0, 0, False, 0
         if self.mode == "off":
             self.error = "off in config (grouping.drain3)"
             return
@@ -98,46 +111,65 @@ class DrainShadow:
             self.available = True
         except ImportError:
             self.error = "drain3 isn't installed - on the tower run: pip install drain3 (tower_tune.ps1 does it)"
+            self.mode = "shadow"
 
-    def _miner(self, prof):
-        m = self.miners.get(prof)
+    @property
+    def active(self):
+        return self.available and self.mode == "on"
+
+    def _miner(self, mkey):
+        m = self.miners.get(mkey)
         if m is None:
             c = self._Cfg()
             c.drain_sim_th, c.drain_depth, c.profiling_enabled = self.sim, 4, False
             c.parametrize_numeric_tokens = True
-            m = self.miners[prof] = self._TM(config=c)
+            m = self.miners[mkey] = self._TM(config=c)
         return m
 
-    def feed(self, prof, etype, sig, ts, lines=1):
-        if not self.available:
-            return
+    def eligible(self, etype, sig):
+        return bool(sig) and not str(etype).startswith("run_summary") and len(sig.split()) >= self.min_tokens
+
+    def resolve(self, prof, etype, sig, ts, lines=1):
+        """-> (pattern to store, [(old, new) template changes to apply])."""
+        if not self.available or not self.eligible(etype, sig):
+            return sig, []
         k = (prof, etype, sig)
         with self.lock:
             e = self.keys.get(k)
             if e:
-                e[1], e[2] = max(e[1], ts), e[2] + lines
-                return
+                e[2], e[3] = max(e[2], ts), e[3] + lines
+                return self.tpl.get((e[0], e[1]), sig), []
             if len(self.keys) >= self.max_keys:      # safety valve: start over
-                self.keys.clear()
-                self.miners.clear()
+                self.keys.clear(), self.miners.clear(), self.tpl.clear()
+            mkey = (prof, etype, ",".join(sorted(set(HTTP_CODE_RX.findall(sig)))))
             t0 = time.perf_counter()
             try:
-                r = self._miner(prof).add_log_message(f"{etype} {sig}")
+                r = self._miner(mkey).add_log_message(sig)
             except Exception as ex:
                 self.error = f"drain3 failed: {ex}"[:200]
-                return
+                return sig, []
             self.cost_s += time.perf_counter() - t0
             self.fed += 1
-            self.keys[k] = [r["cluster_id"], ts, lines]
+            cid = r["cluster_id"]
+            self.keys[k] = [mkey, cid, ts, lines]
+            new = (r.get("template_mined") or sig)[:200]
+            old = self.tpl.get((mkey, cid))
+            self.tpl[(mkey, cid)] = new
+            changes = [(old, new)] if old and old != new else []
+            return new, changes
+
+    def feed(self, prof, etype, sig, ts, lines=1):
+        self.resolve(prof, etype, sig, ts, lines)
 
     def feed_rows(self, rows):
-        """rows as built in Store.add_many: (id, ts, profile, account, region, group, stream, kind,
-        etype, sig, message, live, level, hint)."""
+        """Shadow mode: rows as built in Store.add_many (id, ts, profile, account, region, group, stream,
+        kind, etype, sig, message, live, level, hint)."""
         for r in rows:
             if r[12] in DRAIN_LEVELS:
                 self.feed(r[2], r[8], r[9], r[1])
 
     def seed(self, store, since_ms):
+        """Shadow mode: learn the patterns already in the cache."""
         if not self.available:
             return
         with store.lock:
@@ -148,38 +180,59 @@ class DrainShadow:
             self.feed(p, et, sg, ts, n)
         self.seeded = True
 
+    def migrate(self, store, remap, since_ms):
+        """Mode "on", at start (before the workers run): learn every stored pattern (24h cache + hourly
+        baseline), then rename each to its Drain3 template. Re-running it is cheap: templates map to
+        themselves."""
+        if not self.active:
+            return 0
+        t0 = time.time()
+        with store.lock:
+            rows = store.db.execute(
+                "SELECT profile, etype, sig, MAX(ts), COUNT(*) FROM events WHERE ts >= ? AND level IN "
+                "('error','suspect','warning') GROUP BY profile, etype, sig", (since_ms,)).fetchall()
+            rows += store.db.execute(
+                "SELECT profile, etype, sig, MAX(hour) * 3600000, SUM(n) FROM pattern_hours "
+                "GROUP BY profile, etype, sig").fetchall()
+        for p, et, sg, ts, n in rows:
+            self.resolve(p, et, sg, ts or 0, n or 0)
+        n = 0
+        with self.lock:
+            final = [(k, self.tpl.get((v[0], v[1]))) for k, v in self.keys.items()]
+        for (p, et, sg), t in final:
+            if t and t != sg:
+                remap(p, et, sg, t)
+                n += 1
+        self.seeded, self.remapped = True, self.remapped + n
+        print(f"Drain3 grouping: {len(final)} patterns -> {len(set(self.tpl.values()))} templates, "
+              f"{n} renamed in {time.time() - t0:.0f}s", flush=True)
+        return n
+
     def prune(self, cutoff_ms):
         with self.lock:
-            for k in [k for k, v in self.keys.items() if v[1] < cutoff_ms]:
+            for k in [k for k, v in self.keys.items() if v[2] < cutoff_ms]:
                 del self.keys[k]
-
-    def template(self, prof, cid):
-        try:
-            c = self.miners[prof].drain.id_to_cluster.get(cid)
-            return c.get_template() if c else ""
-        except Exception:
-            return ""
 
     def stats(self, since_ms, top=15):
         st = {"mode": self.mode, "available": self.available, "error": self.error, "seeded": self.seeded,
-              "similarity": self.sim}
+              "similarity": self.sim, "renamed": self.remapped}
         if not self.available:
             return st
         with self.lock:
-            items = [(k, list(v)) for k, v in self.keys.items() if v[1] >= since_ms]
+            items = [(k, list(v)) for k, v in self.keys.items() if v[2] >= since_ms]
             clusters = {}
             for k, v in items:
-                clusters.setdefault((k[0], v[0]), []).append((k, v[2]))
+                clusters.setdefault((v[0], v[1]), []).append((k, v[3]))
             merges = sorted((c for c in clusters.items() if len(c[1]) > 1), key=lambda c: -len(c[1]))[:top]
-            merge_rows = [{"profile": p, "template": self.template(p, cid)[:240],
+            merge_rows = [{"profile": mk[0], "template": (self.tpl.get((mk, cid)) or "")[:240],
                            "patterns": len(ks), "lines": sum(n for _, n in ks),
                            "examples": [f"{k[1]}: {k[2]}"[:160] for k, _ in sorted(ks, key=lambda x: -x[1])[:4]]}
-                          for (p, cid), ks in merges]
+                          for (mk, cid), ks in merges]
         per = {}
         for k, v in items:
             d = per.setdefault(k[0], {"patterns": 0, "clusters": set()})
             d["patterns"] += 1
-            d["clusters"].add(v[0])
+            d["clusters"].add((v[0], v[1]))
         n_sig, n_cl = len(items), len(clusters)
         st.update(patterns=n_sig, drain_clusters=n_cl,
                   reduction_pct=round(100 * (1 - n_cl / n_sig)) if n_sig else 0,
@@ -515,11 +568,14 @@ def recommendations(s):
     d = s.get("drain") or {}
     if d and not d.get("available"):
         add("info", "Grouping", f"Drain3 shadow grouping is off: {d.get('error')}", "")
+    elif d.get("mode") == "on":
+        add("ok", "Grouping", f"Drain3 grouping is on: {d.get('patterns', 0)} raw patterns shown as "
+            f"{d.get('drain_clusters', 0)} (-{d.get('reduction_pct', 0)}%).", "")
     elif d.get("patterns", 0) >= DRAIN_MIN_PATTERNS:
         if d["reduction_pct"] >= DRAIN_GAIN_PCT:
             add("info", "Grouping", f"Drain3 would merge {d['patterns']} patterns into {d['drain_clusters']} "
                 f"(-{d['reduction_pct']}%), i.e. fewer patterns to triage and read.",
-                "Check the merge candidates below; if they look right, switching grouping is the next step.")
+                "Check the merge candidates below; if they look right, set grouping.drain3 to \"on\" in config.json.")
         else:
             add("ok", "Grouping", f"Drain3 finds only -{d['reduction_pct']}% - the current grouping is already tight.", "")
     e = s["events_24h"].get("error", 0)
@@ -564,7 +620,7 @@ def text_report(s):
                          f"{d['saved_pct']}, {d['settings'][:80]}")
     dr = s.get("drain") or {}
     if dr.get("available"):
-        lines.append(f"DRAIN3 shadow: {dr.get('patterns')} patterns -> {dr.get('drain_clusters')} clusters "
+        lines.append(f"DRAIN3 ({dr.get('mode')}): {dr.get('patterns')} patterns -> {dr.get('drain_clusters')} clusters "
                      f"(-{dr.get('reduction_pct')}%)")
         for mc in (dr.get("merge_candidates") or [])[:5]:
             lines.append(f"  {mc['profile']}: {mc['patterns']} patterns -> '{mc['template'][:100]}'")
