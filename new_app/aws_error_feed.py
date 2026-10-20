@@ -89,7 +89,9 @@ DEFAULTS = {
     # errors.db is a short-lived cache: anything older than this is deleted, unless you pulled
     # an older range in the last keep_hours (then it's kept until keep_hours after that pull)
     "keep_hours": 24,
-    "info_keep_hours": 8,         # plain info lines are dropped sooner (errors / hidden errors / warnings / platform keep keep_hours)
+    "info_keep_hours": 8,
+    "full_lines_per_pattern_hour": 200,   # after this many lines of one pattern in an hour, store the rest short
+    "repeat_line_chars": 1000,            # ...to this many characters: start + end kept (JSON lines always whole)         # plain info lines are dropped sooner (errors / hidden errors / warnings / platform keep keep_hours)
     "poll_seconds": 30,
     "lookback_minutes": 60,      # how far back to look the very first time
     # Fast start: the first pull after starting only catches up this many hours, so the feed is
@@ -516,6 +518,9 @@ class Store:
         self.on_rows = None             # called with each batch of new rows (Drain3 shadow grouping)
         self.on_status = None           # called when an account connects / disconnects
         self.regroup = None             # Drain3 "on": (profile, etype, sig, ts) -> (pattern, [(old, new)])
+        self.full_per_hour = int(cfg.get("full_lines_per_pattern_hour") or 0)   # 0 = keep every line in full
+        self.short_chars = int(cfg.get("repeat_line_chars") or 500)
+        self._seen_hour = {}            # (profile, etype, sig, hour) -> lines stored this hour
         reset_old_db(path)
         self.db = sqlite3.connect(path, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
@@ -572,9 +577,18 @@ class Store:
                     changes += [(e["profile"], etype, o, n) for o, n in ch]
                 except Exception:
                     pass
+            width = 20000 if level in ("error", "suspect") else 4000
+            if self.full_per_hour and level in ("error", "suspect", "warning"):
+                hk = (e["profile"], etype, sig, e["ts"] // 3_600_000)
+                c = self._seen_hour[hk] = self._seen_hour.get(hk, 0) + 1
+                if c > self.full_per_hour and not msg.lstrip().startswith("{"):   # JSON (oflog) lines stay whole
+                    width = self.short_chars    # the pattern already has plenty of full samples this hour
+                if len(self._seen_hour) > 200_000:
+                    self._seen_hour.clear()
             rows.append((e["id"], e["ts"], e["profile"], e["account"], e["region"], e["group"],
                          e["stream"], kind, etype, sig,
-                         msg[:20000] if level in ("error", "suspect") else msg[:4000],
+                         msg[:width] if len(msg) <= width or width >= 4000 else
+                         msg[:300] + " … " + msg[-(width - 303):],     # keep the start and the end (the exception)
                          1 if live else 0, level, hint))
         if not rows:
             return 0
@@ -2639,7 +2653,7 @@ function renderSummary(){
   const col={error:'--err',suspect:'--sus',warning:'--warn',info:'--info',platform:'--plat'};
   $('sumBody').innerHTML=rows.map(g=>`<tr class="click" data-i="${sumRows.indexOf(g)}">
     <td class="num"><span class="bar" style="width:${Math.max(3,60*g.count/max)}px;background:var(${col[g.level]||'--err'})"></span>${g.count}</td>
-    <td>${g.regression?'<span class="badge b-reg">REGRESSION</span>':''}${g.is_new?'<span class="badge b-new">NEW</span>':''}${g.is_spike?`<span class="badge b-spike">SPIKE ×${g.spike_ratio}</span>`:''}${g.mute&&!g.regression?`<span class="badge b-${g.mute}">${g.mute.toUpperCase()}</span>`:''}${g.likely_format?`<span class="badge" style="background:var(--line)" title="Appears in ${g.likely_format}% of this function's runs - probably its normal output, not an error. Mute it or add a note.">LOG FORMAT?</span>`:''}<br>
+    <td>${g.regression?'<span class="badge b-reg">REGRESSION</span>':''}${g.is_new?'<span class="badge b-new">NEW</span>':''}${g.is_spike?`<span class="badge b-spike">SPIKE ×${g.spike_ratio}</span>`:''}${g.mute&&!g.regression?`<span class="badge b-${g.mute}">${g.mute.toUpperCase()}</span>`:''}${g.likely_format?`<span class="badge" style="background:var(--line)" title="Appears in ${g.likely_format}% of this function's runs: either its normal output, or a chronic issue that happens every run (still worth fixing). Add a note saying which; mute it only if it's normal output.">EVERY RUN</span>`:''}<br>
       <b>${esc(g.etype)}</b><br><span class="small" style="color:var(--mute)">${esc(g.level)}${g.hint?` · ${esc(g.hint)}`:''}</span>
       ${g.note?`<div class="note">📝 ${esc(g.note)}${g.ignore_below?` (ignore under ${g.ignore_below}/day)`:''}</div>`:''}${aiLine(g.ai)}
       <div>${g.mute?`<button class="act" data-a="unmute">unmute</button>`:'<button class="act" data-a="muted">mute</button><button class="act" data-a="fixed">mark fixed</button>'}<button class="act" data-a="note">note</button></div></td>

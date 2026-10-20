@@ -321,7 +321,9 @@ class Triage(threading.Thread):
                     continue
                 prio = (0 if g.get("regression") else 1 if g.get("is_new") else 2 if g.get("is_spike") else 3 + i)
                 t = tr.get((g["etype"], g["sig"], prof))
-                stale = (not t or time.time() * 1000 - t["at"] > DAY_MS or
+                every_run = g.get("likely_format") and not (g.get("is_spike") or g.get("is_new") or g.get("regression"))
+                max_age = 7 * DAY_MS if every_run else DAY_MS     # chronic, unchanged: re-read weekly, not daily
+                stale = (not t or time.time() * 1000 - t["at"] > max_age or
                          (g["count"] > 3 * max(t["count_at_triage"] or 1, 1) and g["count"] - (t["count_at_triage"] or 0) > 20))
                 if stale and (prio < 3 or i < self.cfg.get("local_llm", {}).get("triage_top_n", 8)):
                     out.append((prio, prof, g))

@@ -235,7 +235,13 @@ def cap(text, n):
     return text if len(text) <= n else text[:n] + f"\n… [{len(text) - n} more chars]"
 
 
-def flags(g):
+def chronic(g):
+    """In (nearly) every run of its function and not new / spiking / regressed: normal output or a
+    known, ongoing issue - listed compactly so it doesn't crowd out real changes."""
+    return bool(g.get("likely_format")) and not (g.get("is_new") or g.get("is_spike") or g.get("regression"))
+
+
+def flags(g, brief=False):
     f = []
     if g.get("regression"):
         f.append("REGRESSION (was marked fixed)")
@@ -248,12 +254,15 @@ def flags(g):
     if g.get("below_threshold"):
         f.append(f"below your ignore threshold of {g.get('ignore_below')}/day")
     if g.get("likely_format"):
-        f.append(f"LIKELY NORMAL OUTPUT, not an error: in {g['likely_format']}% of runs - suggest muting / a note")
+        f.append(f"IN {g['likely_format']}% OF RUNS: normal output or a chronic issue")
     out = (" [" + ", ".join(f) + "]") if f else ""
     if g.get("note"):
         out += f"\n    NOTE from the team: {g['note']}"
     a = g.get("ai")
-    if a:
+    if a and brief:
+        out += (f"\n    tower triage ({round(100 * (a.get('confidence') or 0))}%, unverified): {a['verdict']} / "
+                f"{a['category']} - {cap(a.get('summary') or '', 180)}")
+    elif a:
         out += (f"\n    LOCAL-MODEL TRIAGE ({a.get('model')}, {round(100 * (a.get('confidence') or 0))}% sure, unverified): "
                 f"{a['verdict']} / {a['category']} - {a['summary']}"
                 + (f" Cause: {a['likely_cause']}" if a.get("likely_cause") else "")
@@ -266,20 +275,40 @@ def flags(g):
 _NUM = __import__("re").compile(r"\d+")
 
 
-def _brief_lines(lines, max_lines=120):
-    """Collapse repeated lines (same text apart from numbers) and keep problem lines with context."""
-    rows, last_key = [], None
+def _problem_text(msg, width=1200):
+    """A problem line for Claude: whole if short; a long traceback keeps its start and its end
+    (where the exception is)."""
+    if len(msg) <= width:
+        return msg
+    head = min(300, width // 3)
+    return msg[:head] + f"\n   … [{len(msg) - width} chars] …\n" + msg[-(width - head):]
+
+
+def _brief_lines(lines, max_lines=80):
+    """Collapse repeated lines (same text apart from numbers); a problem line that already appeared
+    earlier in the run is counted on its first occurrence instead of repeated; keep problem lines
+    with the lines just before them."""
+    rows, last_key, seen = [], None, {}
     for l in lines:
         key = (l["level"], _NUM.sub("#", l["message"][:200]))
         if key == last_key:
             rows[-1]["n"] += 1
             continue
+        if l["level"] in ("error", "suspect") and key in seen:
+            seen[key]["n"] += 1
+            seen[key]["last"] = l["ts"]
+            continue                      # (last_key unchanged: lines around it still fold together)
         last_key = key
         rows.append({"l": l, "n": 1})
+        if l["level"] in ("error", "suspect"):
+            seen[key] = rows[-1]
     def fmt(r):
         l = r["l"]
-        width = 2500 if l["level"] in ("error", "suspect") else 300
-        return f"{t(l['ts'])} [{l['level']}] {cap(l['message'], width)}" + (f"  (×{r['n']} similar)" if r["n"] > 1 else "")
+        msg = _problem_text(l["message"]) if l["level"] in ("error", "suspect") else cap(l["message"], 300)
+        more = ""
+        if r["n"] > 1:
+            more = f"  (×{r['n']} similar" + (f", last at {t(r['last'])[11:]}" if r.get("last") else "") + ")"
+        return f"{t(l['ts'])[11:]} [{l['level']}] {msg}{more}"
     if len(rows) <= max_lines:
         return [fmt(r) for r in rows]
     keep = set(range(10)) | set(range(len(rows) - 10, len(rows)))
@@ -432,7 +461,7 @@ def error_overview(hours: float = 24, profile: str = "") -> str:
     if hot:
         out.append("\n## Needs attention first (regressions / new / spiking)")
         for g in hot[:10]:
-            out.append(f"- {g['etype']}: {g['sig'][:120]}{flags(g)} — {g['count']}× in {top(g['profiles'], 3)}")
+            out.append(f"- {g['etype']}: {g['sig'][:120]}{flags(g, brief=True)} — {g['count']}× in {top(g['profiles'], 3)}")
     if pats and pats[0].get("baseline_hours", 999) < 48:
         out.append(f"(Baseline for NEW/SPIKE is still building: {pats[0]['baseline_hours']}h of history.)")
     if not by:
@@ -440,9 +469,18 @@ def error_overview(hours: float = 24, profile: str = "") -> str:
     for prof, b in sorted(by.items(), key=lambda x: -(x[1]["error"] * 3 + x[1]["suspect"])):
         out.append(f"\n## {prof}: {b['error']} errors, {b['suspect']} hidden errors "
                    f"({lines_per.get(prof, 0)} log lines total)")
-        for n, g in sorted(b["pats"], key=lambda x: -x[0])[:3]:
+        pats_sorted = sorted(b["pats"], key=lambda x: -x[0])
+        live = [x for x in pats_sorted if not chronic(x[1])]
+        chron = [x for x in pats_sorted if chronic(x[1])]
+        for n, g in live[:3]:
             out.append(f"- [{g['level']}] {g['etype']}: {g['sig'][:110]} — {n}× in "
-                       f"{top(g['log_groups'], 2)}; last {t(g['last_seen'])}{flags(g)}")
+                       f"{top(g['log_groups'], 2)}; last {t(g['last_seen'])}{flags(g, brief=True)}")
+        if len(live) > 3:
+            out.append(f"- +{len(live) - 3} more pattern(s) ({sum(n for n, _ in live[3:])} lines)")
+        if chron:
+            out.append(f"- chronic (in nearly every run, unchanged): " + "; ".join(
+                f"{g['etype']}: {g['sig'][:70]} ({n}×)" for n, g in chron[:3])
+                + (f"; +{len(chron) - 3} more" if len(chron) > 3 else ""))
     quiet = sorted(set(lines_per) - set(by))
     if quiet:
         out.append(f"\nNo errors: {', '.join(quiet)}")
@@ -467,6 +505,28 @@ def list_error_patterns(hours: float = 24, profile: str = "", level: str = "erro
     rows = rows[: max(1, min(limit, 100))]
     out = [note + f"{len(rows)} patterns, last {hours}h — dashboard: "
            f"{link(tab='patterns', hours=int(hours), profile=profile, level=level, q=search)}"]
+    if detail != "full":
+        out.append("Lines for a pattern: get_log_lines(error_type=<type>, signature=<message>); "
+                   "deeper: investigate / fix_brief.")
+        chron = [g for g in rows if chronic(g)]
+        for i, g in enumerate([g for g in rows if not chronic(g)], 1):
+            same_sample = g["sample"].strip()[:300] == g["sig"].strip()[:300]
+            grp = top(g["log_groups"], 2)
+            out += [f"\n### {i}. [{g['level']}] {g['etype']} — {g['count']}×{flags(g, brief=True)}",
+                    f"message: {g['sig']}",
+                    *([f"flagged because: {g['hint']}"] if g.get("hint") else []),
+                    f"where: {top(g['profiles'], 3)} | {grp} | {t(g['first_seen'])[5:16]} → {t(g['last_seen'])[5:16]}"
+                    + (f" | {g['last24']}/24h vs {g['prev7_daily_avg']}/day before" if g.get("last24") is not None else ""),
+                    *([] if same_sample else ["example:", "```", _problem_text(g["sample"], 500), "```"])]
+        if chron:
+            out.append(f"\n### Chronic — in nearly every run of their function, not new or spiking "
+                       f"(normal output or a known, ongoing issue; investigate / fix_brief for detail):")
+            for g in chron:
+                a = g.get("ai") or {}
+                out.append(f"- [{g['level']}] {g['etype']}: {g['sig'][:160]} — {g['count']}× in {top(g['log_groups'], 1)}"
+                           + (f" | tower: {a.get('verdict')}/{a.get('category')}" if a else "")
+                           + (f" | note: {g['note'][:80]}" if g.get("note") else ""))
+        return finish(out)
     for i, g in enumerate(rows, 1):
         out += [f"\n### {i}. [{g['level']}] {g['etype']} — {g['count']}×{flags(g)}",
                 f"message: {g['sig']}",
@@ -527,16 +587,25 @@ def get_line_context(event_id: str, minutes_before: float = 2, minutes_after: fl
 
 @tool()
 @guard
-def log_group_volume(hours: float = 24, profile: str = "") -> str:
+def log_group_volume(hours: float = 24, profile: str = "", limit: int = 25) -> str:
     """What's coming through each log group / state machine: total lines and the mix of
     errors, hidden errors, warnings, info and Lambda platform lines, plus when it last logged."""
     note = ensure_range(hours)
     rows = api("/api/volume", hours=hours, profile=profile)
     out = [note + f"{len(rows)} log groups, last {hours}h — dashboard: {link(tab='volume', hours=int(hours), profile=profile)}"]
-    for v in rows[:150]:
+    show = rows if limit <= 0 else rows[:limit]
+    for v in show:
         out.append(f"- {v['profile']} | {v['group']}: {v['total']} lines (errors {v['error']}, hidden "
                    f"{v['suspect']}, warn {v['warning']}, info {v['info']}, platform {v['platform']}); "
-                   f"last {t(v['last'])}")
+                   f"last {t(v['last'])[5:16]}")
+    rest = rows[len(show):]
+    if rest:
+        problem = [v for v in rest if v["error"] or v["suspect"]]
+        out.append(f"+{len(rest)} quieter groups ({sum(v['total'] for v in rest)} lines; "
+                   f"{sum(v['error'] for v in rest)} errors, {sum(v['suspect'] for v in rest)} hidden)"
+                   + (": with problems - " + ", ".join(f"{v['profile']}|{v['group'].split('/')[-1]} "
+                                                       f"(e{v['error']}/h{v['suspect']})" for v in problem[:15])
+                      if problem else "") + ". limit=0 lists all.")
     return finish(out)
 
 
@@ -921,16 +990,46 @@ def list_runs(function: str, profile: str = "", hours: float = 24, only_problems
                        f"avg {sum(x['duration_ms'] for x in ok_run) / len(ok_run) / 1000:.1f}s"
                        + (f", records {min(recs)}–{max(recs)}" if recs else "") + " (no problems)")
         ok_run.clear()
+    same = []
+
+    def pkey(r):
+        fp = (r.get("first_problem") or {}).get("line") or ""
+        return (r["outcome"], _NUM.sub("#", fp[:160]))
+
+    def flush_same():
+        if not same:
+            return
+        if len(same) > 2:
+            x = same[0]
+            errs = sum(y["errors"] for y in same)
+            hid = sum(y["hidden"] for y in same)
+            out.append(f"- {len(same)} more {x['outcome'].upper()} runs {t(same[-1]['end'])[5:16]} → {t(same[0]['end'])[5:16]} "
+                       f"with the same first problem (errors {errs}, hidden {hid} in total; "
+                       f"request_ids {same[-1]['request_id']} … {same[0]['request_id']})")
+        else:
+            for x in same:
+                out.append(f"- {t(x['end'])} | {x['duration_ms'] / 1000:.1f}s | records {x['records'] if x['records'] is not None else '-'} | "
+                           f"errors {x['errors']} hidden {x['hidden']} | {x['outcome'].upper()} | request_id {x['request_id']} (same problem as above)")
+        same.clear()
+    last_key = None
     for r in runs[: max(1, min(limit, 300))]:
         if detail != "full" and r["outcome"] == "ok" and not r.get("first_problem") and not r["errors"] and not r["hidden"]:
+            flush_same()
+            last_key = None
             ok_run.append(r)
             continue
         flush_ok()
+        if detail != "full" and last_key is not None and pkey(r) == last_key:
+            same.append(r)
+            continue
+        flush_same()
+        last_key = pkey(r)
         out.append(f"- {t(r['end'])} | {r['duration_ms'] / 1000:.1f}s | records {r['records'] if r['records'] is not None else '-'} | "
                    f"errors {r['errors']} hidden {r['hidden']} | {r['mem_used']}/{r['memory']} MB | {r['outcome'].upper()}"
                    f"{' (cold start)' if r['cold_start'] else ''} | request_id {r['request_id']}"
                    + (f"\n    first problem: {r['first_problem']['line'][:250]}" if r.get("first_problem") else ""))
     flush_ok()
+    flush_same()
     if len(runs) > limit:
         out.append(f"(+{len(runs) - limit} older runs; raise limit to see them)")
     return finish(out)
