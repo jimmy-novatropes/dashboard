@@ -219,6 +219,8 @@ def attach_triage(store, rows, profile=None):
                 if et == g["etype"] and sg == g["sig"] and (pf in g.get("profiles", {}) or not g.get("profiles")):
                     t = v
                     break
+        if t and "evidence" not in t:          # triaged before evidence checks existed: check it now
+            t = check_evidence(dict(t), (g.get("sample") or "") + "\n" + str(g.get("sig") or ""))
         g["ai"] = t
     return rows
 

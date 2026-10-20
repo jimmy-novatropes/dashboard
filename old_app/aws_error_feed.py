@@ -817,8 +817,8 @@ class Store:
         runs = self.runs_per_group()
         for g in rows:
             g["likely_format"] = None
-            if g.get("level") != "suspect" or g.get("count", 0) < 30:
-                continue
+            if g.get("level") != "suspect" or g.get("count", 0) < 30 or str(g.get("etype", "")).startswith("run_summary"):
+                continue          # a run that keeps failing records every time is a real problem, not a format
             grp, n = max((g.get("log_groups") or {"": 0}).items(), key=lambda kv: kv[1])
             total = runs.get(grp, 0)
             if total >= 30 and min(n, total) / total >= 0.8:
