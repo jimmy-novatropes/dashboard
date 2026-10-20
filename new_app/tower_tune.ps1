@@ -88,8 +88,8 @@ function Fits($ctx) {
     catch { Write-Warning "  load with num_ctx=$ctx failed: $_"; return $null }
     $m = (Invoke-RestMethod "$OllamaUrl/api/ps").models | Where-Object { $_.name -like "$($model.Split(':')[0])*" } | Select-Object -First 1
     if (-not $m) { return $null }
-    $pct = [math]::Round(100 * $m.size_vram / [math]::Max(1, $m.size))
-    Write-Host ("  num_ctx {0}: {1}% on GPU ({2:N1} of {3:N1} GB)" -f $ctx, $pct, ($m.size_vram / 1e9), ($m.size / 1e9))
+    $pct = [math]::Round(100.0 * [double]$m.size_vram / [math]::Max(1.0, [double]$m.size))
+    Write-Host ("  num_ctx {0}: {1}% on GPU ({2:N1} of {3:N1} GB)" -f $ctx, $pct, ([double]$m.size_vram / 1e9), ([double]$m.size / 1e9))
     return $pct
 }
 
