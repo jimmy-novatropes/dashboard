@@ -74,6 +74,48 @@ at most 15 bullets with the key points, keeping the file:line references. Remove
 anything that isn't in the notes."""
 
 
+# Health hooks (set by aws_error_feed to aws_health.Health methods); all optional.
+HOOKS = {"event": None, "count": None, "llm_call": None}
+BACKGROUND_KINDS = ("triage",)      # everything else is someone (Claude / the page) waiting for an answer
+
+
+def _hook(name, *a):
+    f = HOOKS.get(name)
+    if f:
+        try:
+            f(*a)
+        except Exception:
+            pass
+
+
+class Gate:
+    """Lets `slots` model calls run at once (it's one GPU). A call someone is waiting for always goes
+    before background triage."""
+
+    def __init__(self, slots=1):
+        self.slots = max(1, int(slots or 1))
+        self.busy, self.waiting = 0, [0, 0]
+        self.cv = threading.Condition()
+
+    def acquire(self, prio):
+        with self.cv:
+            self.waiting[prio] += 1
+            try:
+                while self.busy >= self.slots or (prio == 1 and self.waiting[0] > 0):
+                    self.cv.wait()
+                self.busy += 1
+            finally:
+                self.waiting[prio] -= 1
+
+    def release(self):
+        with self.cv:
+            self.busy -= 1
+            self.cv.notify_all()
+
+    def state(self):
+        return {"running": self.busy, "waiting_claude": self.waiting[0], "waiting_triage": self.waiting[1]}
+
+
 class LocalLLM:
     def __init__(self, cfg):
         c = cfg.get("local_llm") or {}
@@ -83,7 +125,8 @@ class LocalLLM:
         self.num_ctx = int(c.get("num_ctx") or 16384)
         self.max_input_chars = int(c.get("max_input_chars") or 40000)
         self.state = {"ok": False, "detail": "not checked yet", "checked": 0}
-        self.lock = threading.Lock()          # one generation at a time (it's one GPU)
+        self.gate = Gate(c.get("parallel") or 1)   # model calls at once (match OLLAMA_NUM_PARALLEL)
+        self.last_call = {}                   # timings of the latest call (for the status line)
         self.meter = None                     # meter(kind, chars_read, chars_written) - savings counter
 
     # ------------------------------------------------------------ health
@@ -118,6 +161,7 @@ class LocalLLM:
 
     # ------------------------------------------------------------ generation
     def chat(self, system, user, as_json=False, timeout=300, max_tokens=700, kind="other"):
+        cut = len(user) > self.max_input_chars
         user = user[: self.max_input_chars]
         body = {"model": self.model, "stream": False,
                 "messages": [{"role": "system", "content": system},
@@ -129,14 +173,21 @@ class LocalLLM:
             body["think"] = "low"                 # gpt-oss: keep its reasoning short
         elif re.match(r"(qwen3|deepseek-r1)", self.model):
             body["think"] = False
-        with self.lock:
+        prio = 1 if kind in BACKGROUND_KINDS else 0
+        rec = {"kind": kind, "model": self.model, "prio": prio, "num_ctx": self.num_ctx,
+               "in_chars": len(system) + len(user), "truncated": cut}
+        t_wait = time.time()
+        self.gate.acquire(prio)
+        rec["wait_ms"] = int(1000 * (time.time() - t_wait))
+        t0, resp, text = time.time(), {}, ""
+        try:
             for attempt in range(2):
                 req = urllib.request.Request(self.url + "/api/chat", data=json.dumps(body).encode(),
                                              headers={"Content-Type": "application/json"})
                 try:
                     with urllib.request.urlopen(req, timeout=timeout) as r:
-                        msg = json.loads(r.read()).get("message", {})
-                    text = (msg.get("content") or "").strip()
+                        resp = json.loads(r.read())
+                    text = (resp.get("message", {}).get("content") or "").strip()
                     break
                 except urllib.error.HTTPError as ex:
                     detail = ex.read().decode(errors="ignore")
@@ -144,18 +195,38 @@ class LocalLLM:
                         body.pop("think")          # model doesn't support the think option
                         continue
                     raise RuntimeError(f"Ollama error {ex.code}: {detail[:200]}")
+        except Exception as ex:
+            self.gate.release()
+            rec.update(err=f"{type(ex).__name__}: {ex}"[:300], total_ms=int(1000 * (time.time() - t0)))
+            _hook("llm_call", rec)
+            raise
+        self.gate.release()
+        ns = lambda k: int((resp.get(k) or 0) / 1e6)
+        rec.update(out_chars=len(text), prompt_tok=resp.get("prompt_eval_count"), gen_tok=resp.get("eval_count"),
+                   load_ms=ns("load_duration"), prompt_ms=ns("prompt_eval_duration"), gen_ms=ns("eval_duration"),
+                   total_ms=int(1000 * (time.time() - t0)), cut_off=resp.get("done_reason") == "length")
+        if (resp.get("prompt_eval_count") or 0) >= self.num_ctx - max_tokens - 64:
+            rec["truncated"] = True           # Ollama silently drops what doesn't fit num_ctx
+        self.last_call = {"at": time.time(), "kind": kind,
+                          "gen_tps": round(rec["gen_tok"] / (rec["gen_ms"] / 1000), 1) if rec.get("gen_ms") else None,
+                          "secs": round(rec["total_ms"] / 1000, 1)}
         if self.meter:
             try:
                 self.meter(kind, len(user), len(text))
             except Exception:
                 pass
         if not as_json:
+            _hook("llm_call", rec)
             return text
         m = re.search(r"\{.*\}", text, re.S)
         try:
-            return json.loads(m.group(0) if m else text)
+            out = json.loads(m.group(0) if m else text)
+            rec["json_ok"] = 1
         except ValueError:
-            return {"verdict": "unclear", "category": "unknown", "summary": text[:300], "confidence": 0.1}
+            out = {"verdict": "unclear", "category": "unknown", "summary": text[:300], "confidence": 0.1}
+            rec["json_ok"] = 0
+        _hook("llm_call", rec)
+        return out
 
 
 # ============================================================================ storage
@@ -236,6 +307,7 @@ class Triage(threading.Thread):
         self.done = 0
         self.last_error = None
         self.running_now = None
+        self.backlog = None                     # patterns waiting for triage (last cycle)
 
     def candidates(self):
         """(profile, pattern) pairs: regressions, new, spiking, then the busiest - untriaged first."""
@@ -280,6 +352,12 @@ class Triage(threading.Thread):
                "confidence": max(0.0, min(1.0, float(res.get("confidence") or 0))),
                "evidence": str(res.get("evidence", ""))[:300]}
         res = check_evidence(res, samples + "\n" + ctx_txt)
+        _hook("count", "triage:verdict:" + res["verdict"])
+        note = res.get("note") or ""
+        if note.startswith("downgraded"):
+            _hook("count", "triage:downgraded")
+        elif note.startswith("quoted evidence"):
+            _hook("count", "triage:evidence_dropped")
         with self.store.lock:
             self.store.db.execute("INSERT OR REPLACE INTO ai_triage VALUES (?,?,?,?,?,?,?)",
                                   (g["etype"], g["sig"], prof, int(time.time() * 1000), self.llm.model, g["count"],
@@ -292,13 +370,16 @@ class Triage(threading.Thread):
         while True:
             try:
                 if self.llm.ready:
-                    for _, prof, g in self.candidates()[: self.cfg.get("local_llm", {}).get("triage_per_cycle", 6)]:
+                    cands = self.candidates()
+                    self.backlog = len(cands)
+                    for _, prof, g in cands[: self.cfg.get("local_llm", {}).get("triage_per_cycle", 6)]:
                         self.running_now = f"{prof}: {g['etype']}"
                         self.triage_one(prof, g)
                         self.done += 1
                     self.last_error = None
             except Exception as ex:
                 self.last_error = str(ex)[:300]
+                _hook("event", "error", "triage", self.running_now or "cycle", f"{type(ex).__name__}: {ex}")
             self.running_now = None
             time.sleep(self.cfg.get("local_llm", {}).get("triage_every_minutes", 5) * 60)
 
@@ -381,8 +462,10 @@ class Jobs:
         key = hashlib.sha1((self.llm.model + "tpl:" + template + question + text).encode()).hexdigest()
         jid = uuid.uuid4().hex[:10]
         if key in self.cache:
+            _hook("count", "cache:hit:" + kind)
             self.jobs[jid] = {"id": jid, "status": "done", "answer": self.cache[key], "cached": True}
             return jid
+        _hook("count", "cache:miss:" + kind)
         job = {"id": jid, "status": "running", "answer": None, "started": time.time()}
         with self.lock:
             self.jobs[jid] = job
@@ -395,6 +478,7 @@ class Jobs:
                 self.cache[key] = ans
             except Exception as ex:
                 job["status"], job["error"] = "error", str(ex)[:300]
+                _hook("event", "error", "job", job.get("kind") or "job", f"{type(ex).__name__}: {ex}")
         threading.Thread(target=work, daemon=True).start()
         return jid
 
@@ -421,6 +505,7 @@ class Jobs:
                 for f in files:
                     k = "fm:" + self.llm.model + ":" + str(f.get("sha"))
                     v = self.cache.get(k)
+                    _hook("count", ("cache:hit:" if v else "cache:miss:") + "repo_map")
                     if not v:
                         txt = _numbered((f.get("text") or "")[: self.llm.chunk_chars - 600])
                         v = self.llm.chat(system, f"File: {f.get('name')}\n\n{txt}", timeout=600,
@@ -432,15 +517,18 @@ class Jobs:
                 job["status"] = "done"
             except Exception as ex:
                 job["status"], job["error"] = "error", str(ex)[:300]
+                _hook("event", "error", "job", job.get("kind") or "job", f"{type(ex).__name__}: {ex}")
         threading.Thread(target=work, daemon=True).start()
         return jid
 
     def start(self, question, text, kind="summary"):
         key = hashlib.sha1((self.llm.model + kind + question + text).encode()).hexdigest()
         if key in self.cache:
+            _hook("count", "cache:hit:" + kind)
             jid = uuid.uuid4().hex[:10]
             self.jobs[jid] = {"id": jid, "status": "done", "answer": self.cache[key], "cached": True}
             return jid
+        _hook("count", "cache:miss:" + kind)
         jid = uuid.uuid4().hex[:10]
         job = {"id": jid, "status": "running", "answer": None, "started": time.time()}
         with self.lock:
@@ -458,6 +546,7 @@ class Jobs:
                 self.cache[key] = ans
             except Exception as ex:
                 job["status"], job["error"] = "error", str(ex)[:300]
+                _hook("event", "error", "job", job.get("kind") or "job", f"{type(ex).__name__}: {ex}")
         threading.Thread(target=work, daemon=True).start()
         return jid
 
@@ -471,8 +560,10 @@ class Jobs:
         key = hashlib.sha1((self.llm.model + kind + question + json.dumps(docs, sort_keys=True)).encode()).hexdigest()
         jid = uuid.uuid4().hex[:10]
         if key in self.cache:
+            _hook("count", "cache:hit:" + kind)
             self.jobs[jid] = {"id": jid, "status": "done", "answer": self.cache[key], "cached": True}
             return jid
+        _hook("count", "cache:miss:" + kind)
         budget = self.llm.chunk_chars - 600
         parts = _pack_docs(docs, budget)
         job = {"id": jid, "status": "running", "answer": None, "started": time.time(),
@@ -506,6 +597,7 @@ class Jobs:
                 self.cache[key] = ans
             except Exception as ex:
                 job["status"], job["error"] = "error", str(ex)[:300]
+                _hook("event", "error", "job", job.get("kind") or "job", f"{type(ex).__name__}: {ex}")
         threading.Thread(target=work, daemon=True).start()
         return jid
 

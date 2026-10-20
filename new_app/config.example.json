@@ -15,5 +15,7 @@
   "infra_refresh_minutes": 15,
   "infra_scan_layer_packages": true,
   "poll_seconds": 30,
-  "lookback_minutes": 60
+  "lookback_minutes": 60,
+  "local_llm": {"model": "qwen3:14b", "num_ctx": 16384, "parallel": 1},
+  "grouping": {"drain3": "shadow", "drain3_similarity": 0.4}
 }

@@ -62,6 +62,7 @@ sys.path.insert(0, HERE)
 import aws_infra  # noqa: E402  (infrastructure scan: schedules, layers, secrets, APIs, alarms)
 import aws_ops  # noqa: E402    (runs, did-nothing, trace, code links, notes, reports, clients)
 import aws_local  # noqa: E402  (optional local model via Ollama: triage + summaries)
+import aws_health  # noqa: E402 (health / efficiency stats, system log, Drain3 shadow grouping)
 DAY_MS = 86_400_000
 LEVELS = ("error", "suspect", "warning", "info", "platform")
 
@@ -119,7 +120,10 @@ DEFAULTS = {
     # Optional local model (Ollama) that triages errors and summarises logs on your machine,
     # so Claude gets short answers instead of raw lines. Ignored if Ollama isn't running.
     "local_llm": {"enabled": True, "url": "http://localhost:11434", "model": "gpt-oss:20b",
-                  "num_ctx": 16384, "triage_every_minutes": 5, "triage_per_cycle": 6, "triage_top_n": 8},
+                  "num_ctx": 16384, "triage_every_minutes": 5, "triage_per_cycle": 6, "triage_top_n": 8,
+                  "parallel": 1},          # model calls at once; match OLLAMA_NUM_PARALLEL on the tower
+    # Drain3 log-template mining next to the normal grouping: "shadow" = measure only (Health tab), "off"
+    "grouping": {"drain3": "shadow", "drain3_similarity": 0.4},
     # Infrastructure scan (schedules, Lambda config + layers, secrets metadata, API Gateway, alarms)
     "infra_scan": True,
     "infra_refresh_minutes": 15,
@@ -508,6 +512,8 @@ class Store:
         self.slock = threading.Lock()   # status has its own lock so it answers even mid-query
         self.status = {}
         self.skip_platform = set(cfg["skip_platform_lines"])
+        self.on_rows = None             # called with each batch of new rows (Drain3 shadow grouping)
+        self.on_status = None           # called when an account connects / disconnects
         reset_old_db(path)
         self.db = sqlite3.connect(path, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
@@ -569,7 +575,13 @@ class Store:
                 "INSERT OR IGNORE INTO events(id,ts,profile,account,region,grp,stream,kind,etype,sig,"
                 "message,live,level,hint) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
             self.db.commit()
-            return cur.rowcount
+            n = cur.rowcount
+        if self.on_rows:
+            try:
+                self.on_rows(rows)
+            except Exception:
+                pass
+        return n
 
     def _delete_batched(self, where, params, batch=5000):
         """Delete in small chunks, releasing the lock in between, so a big clean-up never
@@ -946,7 +958,16 @@ class Store:
 
     def set_status(self, key, **kw):
         with self.slock:
-            self.status.setdefault(key, {}).update(kw, updated=time.time())
+            st = self.status.setdefault(key, {})
+            was_ok, was_err = st.get("ok"), st.get("error")
+            st.update(kw, updated=time.time())
+            now_ok, now_err = st.get("ok"), st.get("error")
+        if self.on_status and "ok" in kw and was_ok is not None and bool(was_ok) != bool(now_ok) \
+                and was_err != "starting…" and now_err != "starting…":
+            try:
+                self.on_status(key, was_ok, now_ok, now_err)
+            except Exception:
+                pass
 
     def get_status(self):
         with self.slock:
@@ -1944,6 +1965,8 @@ TRACES = aws_ops.TraceJobs()
 LLM = None
 AIJOBS = None
 TRIAGE = None
+HEALTH = None
+DRAIN = None
 CODE = None
 
 
@@ -1969,7 +1992,11 @@ def make_handler(store, workers, cfg):
         def ai(self, path, q):
             if path == "/api/ai/status":
                 st = LLM.check(force=bool(q.get("force")))
+                rt = HEALTH.runtime(LLM) if HEALTH else {}
+                gpu = next((x for x in rt.get("loaded") or [] if x.get("name", "").startswith(LLM.model.split(":")[0])), None)
                 return self.json({**{k: v for k, v in st.items() if k != "models"}, "model": LLM.model,
+                                  "queue": LLM.gate.state(), "last_call": LLM.last_call, "gpu": gpu,
+                                  "backlog": getattr(TRIAGE, "backlog", None),
                                   "triaged": TRIAGE.done if TRIAGE else 0,
                                   "working_on": TRIAGE.running_now if TRIAGE else None,
                                   "last_error": TRIAGE.last_error if TRIAGE else None})
@@ -1977,6 +2004,9 @@ def make_handler(store, workers, cfg):
                 return self.json(aws_local.savings(store, int(q.get("days") or 7)))
             if path == "/api/ai/claude_usage":          # the connector reports what it returned to Claude
                 aws_local.record_usage(store, "claude", q.get("tool") or "?", 0, int(q.get("chars") or 0))
+                if HEALTH:
+                    HEALTH.tool_call(q.get("tool") or "?", int(float(q.get("ms") or 0)), int(q.get("chars") or 0),
+                                     q.get("err") or None)
                 return self.json({"ok": True})
             if path == "/api/ai/triage_map":
                 return self.json({f"{k[0]}|{k[1]}|{k[2]}": v for k, v in aws_local.get_triage(store).items()})
@@ -2179,6 +2209,11 @@ def make_handler(store, workers, cfg):
                                                  [l for l in q.get("notify", "error").split(",") if l]))
             if u.path == "/api/status":
                 return self.json(store.get_status())
+            if u.path in ("/api/health", "/api/health/text"):
+                snap = HEALTH.snapshot(LLM, TRIAGE, DRAIN, cfg["keep_hours"], force=bool(q.get("force")))
+                if u.path.endswith("/text"):
+                    return self.send(200, aws_health.text_report(snap), "text/plain; charset=utf-8")
+                return self.json(snap)
             if u.path == "/api/summary":
                 return self.json(store.annotate(store.summary(q), q.get("profile")))
             if u.path.startswith("/api/infra/") or u.path.startswith("/api/digest"):
@@ -2381,6 +2416,7 @@ tr.click:hover{background:var(--bg);cursor:pointer}
    <button data-v="inventory">Inventory</button>
    <button data-v="apis">APIs &amp; alarms</button>
    <button data-v="digest">Digest</button>
+   <button data-v="health">Health<span class="n" id="n-health"></span></button>
   </div>
  </div>
  <div class="row">
@@ -2457,6 +2493,9 @@ tr.click:hover{background:var(--bg);cursor:pointer}
  <div id="v-digest" class="view">
   <p class="help">What needs attention today, per client: broken schedules, regressions, new / spiking errors, deploy results, partner API problems, alarms, API 5xx, functions near limits and the upgrade backlog. Ask Claude for the same with "give me today's digest".</p>
   <div id="digBody"></div></div>
+ <div id="v-health" class="view">
+  <p class="help">Is the tower setup working? Local-model speed, queue, GPU fit, triage quality, cache, token savings, connector tools, Drain3 shadow grouping and the dashboard's own error log, with a "what to improve next" list built from them. The daily table shows which settings were active each day, so you can compare before / after a change. Ask Claude with more_tools("system_health").</p>
+  <div id="hlBody"></div></div>
  <div id="v-partners" class="view">
   <p class="help">API problems with partner services across all clients, from error and hidden-error lines: <b>auth</b> (401, expired token), <b>permission</b> (403, missing scopes), <b>rate limit</b> (429), <b>server error</b> (5xx) and <b>timeout</b>. A red flag means the same problem hit several clients in the last hour — usually the partner's side or a shared credential, not your code. Click a row for the lines.</p>
   <table><thead><tr><th>Service</th><th>Problem</th><th class="num">Lines</th><th class="num">Last hour</th><th>Clients</th><th>Functions</th><th>Last seen</th><th>Example</th></tr></thead>
@@ -2600,7 +2639,7 @@ async function counts(){
 async function refresh(newIds,force){
   if(busy)return; busy=true;
   try{
-    const HEAVY={clients:loadClients,runs:loadRuns,trace:pollTrace,volume:loadVolume,deploys:loadDeploys,partners:loadPartners,schedules:loadSchedules,inventory:loadInventory,apis:loadApis,digest:loadDigest};
+    const HEAVY={clients:loadClients,runs:loadRuns,trace:pollTrace,volume:loadVolume,deploys:loadDeploys,partners:loadPartners,schedules:loadSchedules,inventory:loadInventory,apis:loadApis,digest:loadDigest,health:loadHealth};
     if(tab==='patterns'||HEAVY[tab]){
       if(force||Date.now()-lastHeavy>30000){ lastHeavy=Date.now();
         tab==='patterns'?(sumRows=await getJ('/api/summary?'+params(false)),renderSummary()):await HEAVY[tab](); }
@@ -2707,6 +2746,40 @@ async function loadDigest(){
     d.sections.map(s=>`<div style="margin-top:6px"><b class="small" style="color:var(--fg)">${esc(s.title)}</b><ul style="margin:2px 0 0 18px;padding:0;font-size:13px">${s.items.map(i=>`<li>${esc(i)}</li>`).join('')}</ul></div>`).join('')+'</div>').join('')
     +`<p class="small"><button class="act" id="copyDig">copy as text</button></p>`;
   $('copyDig').onclick=()=>navigator.clipboard.writeText(r.text);
+}
+async function loadHealth(){
+  const s=await getJ('/api/health'+(window._hlForce?'?force=1':'')); window._hlForce=false;
+  const f=(v,suf='')=>v==null||v===''?'—':v+suf, k=n=>n>=1000?(n/1000).toFixed(n>=10000?0:1)+'k':String(n||0);
+  const SEV={bad:'--err',warn:'--sus',info:'--acc',ok:'--ok'};
+  const todo=s.recommendations.filter(r=>r.sev==='bad'||r.sev==='warn').length;
+  $('count').textContent=todo?`${todo} thing(s) to improve`:'all within targets'; $('n-health').textContent=todo||'';
+  const m=s.model, rt=m.runtime||{}, q=m.queue||{};
+  const sec=(t,body)=>`<h3 style="font-size:14px;margin:18px 0 6px">${t}</h3>`+body;
+  const tbl=(head,rows)=>`<div style="overflow-x:auto"><table><thead><tr>${head.map(h=>`<th${h.startsWith('#')?' class="num"':''}>${esc(h.replace(/^#/,''))}</th>`).join('')}</tr></thead><tbody>${rows.join('')||`<tr><td colspan="${head.length}" class="empty" style="padding:12px">nothing yet</td></tr>`}</tbody></table></div>`;
+  const bar=(p,c)=>p==null?'—':`<span style="display:inline-block;width:60px;height:6px;background:var(--line);border-radius:3px;vertical-align:middle;margin-right:6px"><span style="display:block;height:100%;width:${Math.max(0,Math.min(100,p))}%;background:var(${c||'--acc'});border-radius:3px"></span></span>${p}%`;
+  let h=sec('What to improve next',s.recommendations.map(r=>`<div class="ev" style="border-left-color:var(${SEV[r.sev]});padding:7px 12px"><div class="meta"><b style="color:var(${SEV[r.sev]})">${esc(r.sev.toUpperCase())}</b><span>${esc(r.area)}</span></div><div>${esc(r.title)}</div>${r.fix?`<div class="small" style="color:var(--mute)">→ ${esc(r.fix)}</div>`:''}</div>`).join(''));
+  const lo=(rt.loaded||[]).map(x=>`${esc(x.name)}: <b style="color:var(${x.gpu_pct>=98?'--ok':'--err'})">${f(x.gpu_pct,'%')} on GPU</b> (${x.vram_gb}/${x.size_gb} GB), context ${f(x.context)}`).join('<br>')||'nothing loaded right now';
+  h+=sec('Tower / local model',`<div class="ev info" style="padding:8px 12px"><div><b>${esc(m.name)}</b> — ${m.ready?'<span style="color:var(--ok)">ready</span>':esc(m.detail)} · Ollama ${esc(rt.version||'?')} · num_ctx ${m.num_ctx} · parallel ${m.parallel} · queue: ${q.running||0} running, ${q.waiting_claude||0} waiting (Claude), ${q.waiting_triage||0} waiting (triage)</div><div class="small">${lo}</div></div>`);
+  h+=tbl(['Window','#Calls','#Failed','#Avg / p95','#Tok/s out','#Tok/s in','#Wait p95 Claude / triage','#Input cut','#Answer cut','#Bad JSON','#Reloads'],['1h','24h','7d'].map(w=>{const a=s.llm[w]||{};return a.calls?`<tr><td>${w}</td><td class="num">${a.calls}</td><td class="num">${a.error_pct}%</td><td class="num">${a.avg_s}s / ${a.p95_s}s</td><td class="num">${f(a.gen_tps)}</td><td class="num">${f(a.prompt_tps)}</td><td class="num">${a.wait_p95_s}s / ${a.wait_bg_p95_s}s</td><td class="num">${a.truncated_pct}%</td><td class="num">${a.cut_off_pct}%</td><td class="num">${a.json_fail_pct}%</td><td class="num">${a.reloads}</td></tr>`:`<tr><td>${w}</td><td colspan="10" class="small">no calls</td></tr>`}));
+  h+=sec('By kind (24h)',tbl(['Kind','#Calls','#Failed','#Avg / p95','#Tok/s out','#Tokens in / out','#Input cut','#Answer cut'],s.by_kind.map(a=>`<tr><td>${esc(a.kind)}</td><td class="num">${a.calls}</td><td class="num">${a.error_pct}%</td><td class="num">${a.avg_s}s / ${a.p95_s}s</td><td class="num">${f(a.gen_tps)}</td><td class="num">${k(a.tokens_in)} / ${k(a.tokens_out)}</td><td class="num">${a.truncated_pct}%</td><td class="num">${a.cut_off_pct}%</td></tr>`)));
+  const t24=s.triage['24h'], t7=s.triage['7d'];
+  const vs=t=>Object.entries(t.verdicts).map(([v,n])=>`${esc(v)} ${n}`).join(' · ')||'—';
+  h+=sec('Triage quality',tbl(['Window','#Triaged','Verdicts','#Unclear','#Claims not backed by lines','#Quote not found'],[['today',t24],['7d',t7]].map(([w,t])=>`<tr><td>${w}</td><td class="num">${t.triaged}</td><td class="small">${vs(t)}</td><td class="num">${bar(t.unclear_pct,t.unclear_pct>40?'--sus':'--ok')}</td><td class="num">${t.downgraded_pct}%</td><td class="num">${t.evidence_dropped_pct}%</td></tr>`))
+    +`<p class="small">Backlog: <b>${f(s.triage.backlog)}</b> patterns waiting · ${s.triage.done_session} triaged since start${s.triage.last_error?` · <span style="color:var(--sus)">${esc(s.triage.last_error)}</span>`:''} · Cache: today ${s.cache['24h'].hit_pct}% hits (${s.cache['24h'].hits}/${s.cache['24h'].hits+s.cache['24h'].misses}), 7d ${s.cache['7d'].hit_pct}%</p>`);
+  h+=sec('Day by day (compare before / after a settings change)',tbl(['Day','#Model calls','#Failed','#Tok/s','#p95','#Claude wait p95','#Input cut','#Triaged','#Unclear','#Cache hits','#Tower read','#Claude got','#Saved','Settings that day'],s.daily.slice().reverse().filter(d=>d.calls||d.claude_received||d.triaged||d.tower_read).map(d=>`<tr><td style="white-space:nowrap">${d.day}</td><td class="num">${d.calls}</td><td class="num">${f(d.error_pct,'%')}</td><td class="num">${f(d.gen_tps)}</td><td class="num">${f(d.p95_s,'s')}</td><td class="num">${f(d.wait_p95_s,'s')}</td><td class="num">${f(d.truncated_pct,'%')}</td><td class="num">${d.triaged}</td><td class="num">${d.triaged?d.unclear_pct+'%':'—'}</td><td class="num">${d.cache_hit_pct}%</td><td class="num">${k(d.tower_read)}</td><td class="num">${k(d.claude_received)}</td><td class="num">${d.saved_pct==null?'—':bar(d.saved_pct,'--ok')}</td><td class="small">${esc(d.settings)}</td></tr>`)));
+  h+=sec('Claude connector tools',tbl(['Tool','Window','#Calls','#Avg / p95 time','#Avg tokens to Claude','#Max','#Errors','Last error'],s.tools.sort((a,b)=>b.calls*b.avg_chars-a.calls*a.avg_chars).map(t=>`<tr><td>${esc(t.tool)}</td><td>${t.window}</td><td class="num">${t.calls}</td><td class="num">${(t.avg_ms/1000).toFixed(1)}s / ${(t.p95_ms/1000).toFixed(1)}s</td><td class="num">~${k(Math.round(t.avg_chars/4))}</td><td class="num">~${k(Math.round(t.max_chars/4))}</td><td class="num" style="${t.errors?'color:var(--err)':''}">${t.errors}</td><td class="small">${esc(t.last_error||'')}</td></tr>`))
+    +`<p class="small">7 days: tower read ~${k(s.savings.local_read)} tokens · Claude received ~${k(s.savings.claude_received)} from ${s.savings.claude_calls} calls · ~${s.savings.saved_pct}% of the reading done on the tower. Time and errors are recorded once the connector is restarted with this version.</p>`);
+  const d=s.drain||{};
+  h+=sec('Drain3 shadow grouping',!d.available?`<p class="small">${esc(d.error||'off')}</p>`:
+    `<p class="small">Last ${'24'}h: today's grouping has <b>${d.patterns}</b> patterns (errors, hidden errors, warnings); Drain3 would make <b>${d.drain_clusters}</b> (−${d.reduction_pct}%). ${d.avg_us!=null?`Cost ~${d.avg_us} µs per new pattern.`:''} ${d.seeded?'':'(still loading the last 24h…)'} Nothing in the feed changes — this only measures.</p>`
+    +tbl(['Profile','#Patterns','#Drain3 clusters','#Fewer'],(d.per_profile||[]).slice(0,20).map(x=>`<tr><td>${esc(x.profile)}</td><td class="num">${x.patterns}</td><td class="num">${x.clusters}</td><td class="num">${x.reduction_pct}%</td></tr>`))
+    +`<p class="small" style="margin-top:8px"><b>Merge candidates</b> — patterns Drain3 sees as one. If these really are the same problem, switching grouping is worth it; if they're different problems, it isn't.</p>`
+    +tbl(['Profile','#Patterns','#Lines','Drain3 template','Today\'s patterns'],(d.merge_candidates||[]).map(x=>`<tr><td>${esc(x.profile)}</td><td class="num">${x.patterns}</td><td class="num">${x.lines}</td><td class="sig">${esc(x.template)}</td><td class="small">${x.examples.map(esc).join('<br>')}</td></tr>`)));
+  const LV={error:'--err',warning:'--sus',info:'--mute'};
+  h+=sec(`System log <span class="small" style="font-weight:400">(24h: ${s.events_24h.error||0} errors, ${s.events_24h.warning||0} warnings${s.db_mb!=null?` · errors.db ${s.db_mb} MB`:''}) <button class="act" id="hlRefresh">refresh now</button></span>`,
+    tbl(['Last seen','Level','Source','What','#Times','Message'],s.events.map(e=>`<tr><td class="small">${when(e.last_at)}</td><td><span class="chip" style="border-color:var(${LV[e.level]||'--mute'});color:var(${LV[e.level]||'--mute'})">${esc(e.level)}</span></td><td>${esc(e.source)}</td><td class="small">${esc(e.kind)}</td><td class="num">${e.n}</td><td class="small" style="white-space:pre-wrap;word-break:break-word">${esc(e.message.slice(0,600))}</td></tr>`)));
+  $('hlBody').innerHTML=h;
+  $('hlRefresh').onclick=()=>{window._hlForce=true;refresh(null,true)};
 }
 function chg(cur,prev){
   if(prev==null)return '<span class="chg">—</span>';
@@ -2834,7 +2907,7 @@ function show(v){
   tab=v; document.querySelectorAll('.tabs button').forEach(b=>b.classList.toggle('on',b.dataset.v===v));
   const feed=['errors','suspect','all'].includes(v);
   $('v-feed').classList.toggle('on',feed); $('v-patterns').classList.toggle('on',v==='patterns'); $('v-volume').classList.toggle('on',v==='volume'); $('v-deploys').classList.toggle('on',v==='deploys'); $('v-partners').classList.toggle('on',v==='partners');
-  ['schedules','inventory','apis','digest','clients','runs','trace'].forEach(x=>$('v-'+x).classList.toggle('on',v===x));
+  ['schedules','inventory','apis','digest','health','clients','runs','trace'].forEach(x=>$('v-'+x).classList.toggle('on',v===x));
   $('fLevel').style.display=(v==='all'||v==='patterns')?'':'none';
   if(v==='patterns'&&!$('fLevel').dataset.touched)$('fLevel').value='error,suspect';
   if(v==='all'&&!$('fLevel').dataset.touched)$('fLevel').value='error,suspect,warning,info';
@@ -2864,7 +2937,7 @@ function updateProfiles(){
 }
 async function aiStatus(){
   try{ const a=await getJ('/api/ai/status');
-    $('aiStatus').innerHTML=a.ok?`🤖 Local model <b>${esc(a.model)}</b> ready · ${a.triaged} patterns triaged this session${a.working_on?` · now: ${esc(a.working_on)}`:''}${a.last_error?` · <span style="color:var(--sus)">${esc(a.last_error)}</span>`:''}`
+    $('aiStatus').innerHTML=a.ok?`🤖 Local model <b>${esc(a.model)}</b> ready · ${a.triaged} patterns triaged this session${a.working_on?` · now: ${esc(a.working_on)}`:''}${a.queue&&(a.queue.waiting_claude+a.queue.waiting_triage)?` · queue ${a.queue.waiting_claude+a.queue.waiting_triage}`:''}${a.backlog?` · backlog ${a.backlog}`:''}${a.last_call&&a.last_call.gen_tps?` · ${a.last_call.gen_tps} tok/s`:''}${a.gpu&&a.gpu.gpu_pct!=null?` · <span style="color:var(${a.gpu.gpu_pct>=98?'--ok':'--err'})">GPU ${a.gpu.gpu_pct}%</span>`:''}${a.last_error?` · <span style="color:var(--sus)">${esc(a.last_error)}</span>`:''}`
       :`<span style="color:var(--mute)">🤖 Local model off — ${esc(a.detail)}</span>`;
     AI_OK=a.ok; }catch(e){}
   try{ const s=(await getJ('/api/ai/savings?days=1')).total, k=n=>n>=1000?(n/1000).toFixed(n>=10000?0:1)+'k':String(n);
@@ -2933,7 +3006,7 @@ async function status(){
   }catch(e){}
 }
 function onRange(){ const h=$('fHours').value;
-  if(h&&!['deploys','schedules','inventory','apis','digest','clients','trace'].includes(tab)) fetch('/api/backfill?hours='+h);   // these views don't need old logs
+  if(h&&!['deploys','schedules','inventory','apis','digest','health','clients','trace'].includes(tab)) fetch('/api/backfill?hours='+h);   // these views don't need old logs
   refresh(null,true); status(); }
 let qt; $('q').oninput=()=>{clearTimeout(qt);qt=setTimeout(()=>refresh(null,true),300)};
 $('fHours').onchange=onRange; $('runGroup').onchange=()=>refresh(null,true); $('runProblems').onchange=()=>refresh(null,true);
@@ -2958,7 +3031,7 @@ $('notifySus').checked=store.get('notifySus')==='1'; $('notifySus').onchange=e=>
   if(u.get('level')){const sel=$('fLevel'); if(![...sel.options].some(o=>o.value===u.get('level'))){const o=document.createElement('option');o.value=u.get('level');o.textContent=u.get('level');sel.appendChild(o)} sel.value=u.get('level'); sel.dataset.touched=1}
   if(u.get('grp'))grpFilter=u.get('grp');
   if(u.get('etype'))sigFilter={etype:u.get('etype'),sig:u.get('sig')||''};
-  renderChips(); show(['errors','suspect','all','patterns','volume','deploys','partners','schedules','inventory','apis','digest','clients','runs','trace'].includes(u.get('tab'))?u.get('tab'):'clients');
+  renderChips(); show(['errors','suspect','all','patterns','volume','deploys','partners','schedules','inventory','apis','digest','health','clients','runs','trace'].includes(u.get('tab'))?u.get('tab'):'clients');
   if(u.get('trace')){$('trTerm').value=u.get('trace'); show('trace'); startTrace()}})();
 onRange(); tick(); setInterval(tick,5000); setInterval(status,5000);
 </script></body></html>"""
@@ -3006,6 +3079,22 @@ def main():
     LLM = aws_local.LocalLLM(cfg)
     LLM.meter = lambda kind, i, o: aws_local.record_usage(store, "local", kind, i, o)
     AIJOBS = aws_local.Jobs(LLM, store)
+    global HEALTH, DRAIN
+    HEALTH = aws_health.Health(store, cfg, db)
+    aws_local.HOOKS.update(event=HEALTH.event, count=HEALTH.count, llm_call=HEALTH.llm_call)
+    threading.excepthook = HEALTH.thread_hook
+    store.on_status = HEALTH.status_change
+    DRAIN = aws_health.DrainShadow(cfg)
+    store.on_rows = DRAIN.feed_rows
+    threading.Thread(target=DRAIN.seed, args=(store, int(time.time() * 1000) - cfg["keep_hours"] * 3_600_000),
+                     daemon=True, name="drain3-seed").start()
+    lc = cfg.get("local_llm") or {}
+    HEALTH.event("info", "settings", "start",
+                 f"model={LLM.model} num_ctx={LLM.num_ctx} parallel={LLM.gate.slots} "
+                 f"max_input_chars={LLM.max_input_chars} triage_per_cycle={lc.get('triage_per_cycle', 6)} "
+                 f"triage_every_minutes={lc.get('triage_every_minutes', 5)} drain3={DRAIN.mode}"
+                 f"{'' if DRAIN.available else ' (not installed)'}"
+                 + (f" ollama[{cfg['tuning_note']}]" if cfg.get("tuning_note") else ""))
     global CODE, EXTRA_RX
     EXTRA_RX[:] = [re.compile(x, re.I) for x in cfg["record_count_patterns"]]
     root = cfg["repos_root"] or os.path.dirname(HERE)
@@ -3037,7 +3126,11 @@ def main():
                 aws_ops.rollup_runs(store, workers, now - 3 * 3_600_000, now, EXTRA_RX)
             except Exception as ex:
                 print("run rollup failed:", ex)
+                HEALTH.event("error", "rollup", "runs", f"{type(ex).__name__}: {ex}")
             n += 1
+            DRAIN.prune(now - cfg["keep_hours"] * 3_600_000)
+            if n % 288 == 0:
+                HEALTH.prune()
             if n % 3 == 0:
                 store.delete_orphans(now - cfg["keep_hours"] * 3_600_000, keys)
                 store.prune_baseline(cfg["baseline_days"])

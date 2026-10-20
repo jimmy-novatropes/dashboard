@@ -61,7 +61,9 @@ default URL and `install_autostart.ps1` (new_app only).
 | `aws_error_feed.py` (~3.1k lines) | Main app: Store (SQLite), Worker per profile/region, StepFunctionsScanner, classification, HTTP API + the whole HTML/JS page, `main()` |
 | `aws_infra.py` | Infra scanner: schedules / missed runs, Lambda inventory + runtimes + layers, secrets metadata, API Gateway, alarms, cost |
 | `aws_ops.py` | Runs (REPORT-based), did-nothing, trace a record, code index (function → repo folder), notes, client reports, client cards, structured-line parsing (`structured()`, `structured_count()`) |
-| `aws_local.py` | Local model: LocalLLM (Ollama), background Triage (+ evidence check), Jobs (summaries, map-reduce reads, templates, file map), PCache (answers cached 30 days in `ai_cache`), savings counter (`ai_usage`) |
+| `aws_local.py` | Local model: LocalLLM (Ollama), background Triage (+ evidence check), Jobs (summaries, map-reduce reads, templates, file map), PCache (answers cached 30 days in `ai_cache`), savings counter (`ai_usage`), Gate (Claude requests before triage) |
+| `aws_health.py` | Health tab: model-call telemetry (`llm_calls`), connector tool calls (`tool_calls`), daily `counters`, own error log (`sys_events`), Drain3 shadow grouping, "what to improve next" rules (thresholds at the top) |
+| `tower_tune.ps1` | Tower: Ollama env (flash attention, q8_0 KV, keep_alive 24h), biggest num_ctx that fits the GPU, drain3 install, `tuning_note`, restarts Ollama + dashboard; `-Undo` |
 | `mcp_server.py` | Claude connector (runs on whichever machine Claude is on; talks HTTP to the dashboard; reads local repos itself) |
 | `install_autostart.ps1` | Registers the scheduled task + `tailscale serve --bg 8766`; `-Remove` undoes it |
 
@@ -99,6 +101,13 @@ old long-range pulls not resumed after restart.
 - 🤖 line: model status, triaged count, **💰 savings** (tower tokens read vs Claude tokens received, % saved).
 - Endpoints: `GET /api/ai/status|savings|job|triage_map|summarize|claude_usage`, `POST /api/ai/read` (map-reduce reading),
   `POST /api/ai/prompt` (templates: edit, commit, fix, narrative, run, filemap), `POST /api/ai/filemap[_known]`.
+
+**Health tab** (`/api/health`, `/api/health/text`, connector `more_tools("system_health")`): what to improve next,
+model speed / queue / GPU fit / inputs cut / answers cut / bad JSON / reloads, per-kind stats, triage quality (unclear,
+claims not backed by lines), cache hit rate, day-by-day table with the settings active each day (before/after compare),
+connector tool time/size/errors, Drain3 shadow merge candidates, system log (model errors, triage/job failures,
+crashed threads, AWS accounts disconnecting). 🤖 line also shows queue, backlog, tok/s and GPU %.
+Config: `local_llm.parallel` (1), `grouping.drain3` ("shadow" | "off"), `grouping.drain3_similarity` (0.4).
 
 ## 6. Claude connector tools
 

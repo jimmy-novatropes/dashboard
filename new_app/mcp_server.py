@@ -305,11 +305,15 @@ def finish(lines):
     return cap("\n".join(lines), MAX_OUT)
 
 
-def _report_usage(tool, chars):
-    """Tell the dashboard how much this tool sent to Claude (for the savings counter). Never blocks."""
+def _report_usage(tool, chars, ms=0, err=None):
+    """Tell the dashboard how much this tool sent to Claude, how long it took and whether it failed
+    (savings counter + Health tab). Never blocks."""
     def go():
         try:
-            u = f"{base()}/api/ai/claude_usage?" + urllib.parse.urlencode({"tool": tool, "chars": chars})
+            q = {"tool": tool, "chars": chars, "ms": int(ms)}
+            if err:
+                q["err"] = str(err)[:300]
+            u = f"{base()}/api/ai/claude_usage?" + urllib.parse.urlencode(q)
             urllib.request.urlopen(u, timeout=5).read()
         except Exception:
             pass
@@ -324,12 +328,19 @@ def guard(fn):
 
     @functools.wraps(fn)
     def wrap(*a, **kw):
+        name = fn.__name__
+        if name == "more_tools":
+            name = f"more_tools:{kw.get('name') or (a[0] if a else '') or 'list'}"
+        t0 = time.time()
         try:
             out = fn(*a, **kw)
         except FeedDown as ex:
             return str(ex)
+        except Exception as ex:
+            _report_usage(name, 0, 1000 * (time.time() - t0), f"{type(ex).__name__}: {ex}")
+            raise
         if isinstance(out, str):
-            _report_usage(fn.__name__, len(out))
+            _report_usage(name, len(out), 1000 * (time.time() - t0))
         return out
     return wrap
 
@@ -2037,7 +2048,7 @@ def find_print_site(message, folder, limit=3):
 @guard
 def more_tools(name: str = "", args: str = "{}") -> str:
     """Every other aws-error-feed tool (infrastructure, schedules, deploys, partner APIs, notes, mutes,
-    reports, runs, history...). Call with no name for the list, then more_tools(name, args=JSON)."""
+    reports, runs, history, system_health...). Call with no name for the list, then more_tools(name, args=JSON)."""
     if not name:
         rows = []
         for n, f in sorted(REGISTRY.items()):
@@ -2082,6 +2093,20 @@ def usage_savings(days: int = 7) -> str:
     out.append("Background triage counts as avoided only if Claude would otherwise have read those lines; "
                "summaries are a direct saving. Claude's own reasoning and code work aren't included.")
     return finish(out)
+
+
+@tool()
+@guard
+def system_health() -> str:
+    """Is the tower / local-model setup working? What to improve next, model speed (tokens/s, p95),
+    queue waits, GPU fit, inputs cut by the context, triage quality (unclear / unbacked claims),
+    cache hits, token savings per day with the settings active that day, Drain3 shadow grouping
+    and the dashboard's own recent errors. Use when the user asks whether the setup/optimisations work."""
+    try:
+        with urllib.request.urlopen(f"{base()}/api/health/text", timeout=40) as r:
+            return finish([r.read().decode("utf-8")])
+    except urllib.error.HTTPError as ex:
+        return f"The dashboard doesn't have the Health page yet (HTTP {ex.code}) - pull and restart it on the tower."
 
 
 if __name__ == "__main__":
