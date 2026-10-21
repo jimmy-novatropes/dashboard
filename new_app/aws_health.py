@@ -464,6 +464,27 @@ class Health:
                                   "errors": len(errs), "last_error": errs[-1]["err"] if errs else None})
                 break                                   # 24h if used today, else 7d
 
+        # per-model comparison (7 days): speed from llm_calls, answer quality from the triage table
+        tq_by_model = {}
+        try:
+            for r in self._rows("SELECT model, data FROM ai_triage WHERE at >= ?", (now - 7 * DAY_MS,)):
+                d = json.loads(r["data"] or "{}")
+                t = tq_by_model.setdefault(r["model"], {"triaged": 0, "unclear": 0, "downgraded": 0})
+                t["triaged"] += 1
+                t["unclear"] += d.get("verdict") == "unclear"
+                t["downgraded"] += str(d.get("note") or "").startswith("downgraded")
+        except Exception:
+            pass
+        loaded = {x["name"]: x for x in (self.runtime(llm).get("loaded") or [])}
+        by_model = []
+        for name in sorted({r["model"] for r in calls if r["model"]} | set(tq_by_model)):
+            a = self.agg([r for r in calls if r["model"] == name])
+            t = tq_by_model.get(name, {"triaged": 0, "unclear": 0, "downgraded": 0})
+            lo = loaded.get(name) or {}
+            by_model.append({"model": name, **a, "triaged": t["triaged"],
+                             "unclear_pct": _pct(t["unclear"], t["triaged"]),
+                             "downgraded_pct": _pct(t["downgraded"], t["triaged"]),
+                             "in_use": name == llm.model, "gpu_pct": lo.get("gpu_pct"), "size_gb": lo.get("size_gb")})
         ev = self._rows("SELECT * FROM sys_events ORDER BY last_at DESC LIMIT 80")
         ev24 = self._rows("SELECT level, SUM(n) AS n FROM sys_events WHERE last_at >= ? GROUP BY level",
                           (now - DAY_MS,))
@@ -480,6 +501,7 @@ class Health:
             "llm": {"1h": self.agg([r for r in calls if r["at"] >= now - 3_600_000]), "24h": self.agg(last24),
                     "7d": self.agg(calls)},
             "by_kind": sorted(({"kind": k, **self.agg(v)} for k, v in by_kind.items()), key=lambda x: -x["calls"]),
+            "by_model": by_model, "gpu_vram_gb": float(self.cfg.get("gpu_vram_gb") or 12),
             "triage": {"24h": self.triage_quality(cnt.get(days[-1], {})), "7d": self.triage_quality(merged(days)),
                        "backlog": getattr(triage, "backlog", None), "done_session": getattr(triage, "done", 0),
                        "last_error": getattr(triage, "last_error", None)},
@@ -506,11 +528,20 @@ def recommendations(s):
     a = s["llm"]["24h"]
     if not m["ready"]:
         add("bad", "Local model", f"Local model is off: {m['detail']}", "Start Ollama on the tower / pull the model.")
+    vram = s.get("gpu_vram_gb") or 12
     for x in rt.get("loaded") or []:
         if x.get("gpu_pct") is not None and x["gpu_pct"] < GPU_FIT_PCT:
-            add("bad", "GPU", f"{x['name']} is only {x['gpu_pct']}% on the GPU ({x['vram_gb']} of {x['size_gb']} GB) "
-                "- the rest runs on the CPU, which is much slower.",
-                "Run tower_tune.ps1 (KV cache q8_0 + flash attention) or lower local_llm.num_ctx in config.json.")
+            if (x.get("size_gb") or 0) > vram * 0.95:
+                add("info", "GPU", f"{x['name']} needs {x['size_gb']} GB, more than the {vram:g} GB GPU, so "
+                    f"{x['gpu_pct']}% on the GPU is close to the most it can get: Ollama keeps the parts every word "
+                    f"uses on the GPU and puts the rest of the model in RAM. Judge it by speed and answer quality in "
+                    f"'Model comparison', not by this percentage.",
+                    (f"For a few % more on the GPU, use context 8k (now {x.get('context')}). " if (x.get("context") or 0) > 8192 else "")
+                    + "If it's not clearer than the smaller model, switch back with the picker.")
+            else:
+                add("bad", "GPU", f"{x['name']} is only {x['gpu_pct']}% on the GPU ({x['vram_gb']} of {x['size_gb']} GB) "
+                    "- the rest runs on the CPU, which is much slower.",
+                    "Lower the context with the model picker, or close other programs using the GPU.")
         if x.get("name") and not x["name"].startswith(m["name"].split(":")[0]):
             add("warn", "GPU", f"Ollama also has {x['name']} loaded - it competes for the 12 GB.",
                 "Set OLLAMA_MAX_LOADED_MODELS=1 (tower_tune.ps1) or stop the other model.")
@@ -536,6 +567,12 @@ def recommendations(s):
         if a["reloads"] > MAX_RELOADS_PER_DAY:
             add("warn", "Speed", f"The model was loaded from disk {a['reloads']} times in 24h.",
                 "Set OLLAMA_KEEP_ALIVE=24h (tower_tune.ps1).")
+    bm = [m for m in s.get("by_model") or [] if m.get("calls", 0) >= 20]
+    if len(bm) >= 2:
+        add("info", "Models", "Model comparison (7d): " + " | ".join(
+            f"{m['model']}: {m.get('gen_tps')} tok/s, p95 {m.get('p95_s')}s, unclear {m['unclear_pct']}%"
+            + (f" of {m['triaged']}" if m["triaged"] else "") for m in bm),
+            "Keep the one with fewer 'unclear' answers if its p95 time is acceptable.")
     for k in s["by_kind"]:
         if k["calls"] >= 5 and k.get("cut_off_pct", 0) > CUTOFF_PCT:
             add("warn", "Answers", f"{k['cut_off_pct']}% of '{k['kind']}' answers hit the max length and were cut off.",
@@ -605,6 +642,11 @@ def text_report(s):
         lines.append(f"24h: {a['calls']} calls, {a['error_pct']}% failed, avg {a['avg_s']}s (p95 {a['p95_s']}s), "
                      f"{a['gen_tps']} tok/s out, {a['prompt_tps']} tok/s in, Claude-request wait p95 {a['wait_p95_s']}s, "
                      f"{a['truncated_pct']}% inputs cut, {a['reloads']} reloads")
+    for m in s.get("by_model") or []:
+        lines.append(f"MODEL {m['model']}{' (in use)' if m['in_use'] else ''}: {m.get('calls', 0)} calls 7d, "
+                     f"{m.get('gen_tps')} tok/s out, {m.get('prompt_tps')} tok/s in, avg {m.get('avg_s')}s p95 {m.get('p95_s')}s, "
+                     f"triaged {m['triaged']} (unclear {m['unclear_pct']}%, unbacked {m['downgraded_pct']}%)"
+                     + (f", {m['gpu_pct']}% on GPU" if m.get("gpu_pct") is not None else ""))
     t = s["triage"]["7d"]
     lines.append(f"TRIAGE 7d: {t['triaged']} verdicts {t['verdicts']}, unclear {t['unclear_pct']}%, "
                  f"downgraded {t['downgraded_pct']}%, backlog {s['triage']['backlog']}")

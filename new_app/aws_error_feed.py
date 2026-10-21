@@ -91,7 +91,8 @@ DEFAULTS = {
     # an older range in the last keep_hours (then it's kept until keep_hours after that pull)
     "keep_hours": 24,
     "info_keep_hours": 8,
-    "on_demand_wake_hours": 2,    # an on-demand project stays loaded this long after you open it
+    "on_demand_wake_hours": 2,
+    "gpu_vram_gb": 12,            # tower GPU memory (RTX A2000 12 GB) - for the Health tab's GPU advice    # an on-demand project stays loaded this long after you open it
     "profile_priority": {},       # optional defaults, e.g. {"hrs": "high", "puretech": "on_demand"} (dashboard wins)
     "full_lines_per_pattern_hour": 200,   # after this many lines of one pattern in an hour, store the rest short
     "repeat_line_chars": 1000,            # ...to this many characters: start + end kept (JSON lines always whole)         # plain info lines are dropped sooner (errors / hidden errors / warnings / platform keep keep_hours)
@@ -2577,6 +2578,7 @@ tr.click:hover{background:var(--bg);cursor:pointer}
  <div id="hist"></div>
  <div id="status"></div>
  <div id="aiStatus" class="small" style="margin-top:6px"></div>
+ <div id="aiPick" class="small row" style="margin-top:4px;gap:6px"></div>
 </header>
 <main>
  <div id="v-clients" class="view on">
@@ -2910,6 +2912,7 @@ async function loadHealth(){
   const lo=(rt.loaded||[]).map(x=>`${esc(x.name)}: <b style="color:var(${x.gpu_pct>=98?'--ok':'--err'})">${f(x.gpu_pct,'%')} on GPU</b> (${x.vram_gb}/${x.size_gb} GB), context ${f(x.context)}`).join('<br>')||'nothing loaded right now';
   h+=sec('Tower / local model',`<div class="ev info" style="padding:8px 12px"><div><b>${esc(m.name)}</b> — ${m.ready?'<span style="color:var(--ok)">ready</span>':esc(m.detail)} · Ollama ${esc(rt.version||'?')} · num_ctx ${m.num_ctx} · parallel ${m.parallel} · queue: ${q.running||0} running, ${q.waiting_claude||0} waiting (Claude), ${q.waiting_triage||0} waiting (triage)</div><div class="small">${lo}</div></div>`);
   h+=tbl(['Window','#Calls','#Failed','#Avg / p95','#Tok/s out','#Tok/s in','#Wait p95 Claude / triage','#Input cut','#Answer cut','#Bad JSON','#Reloads'],['1h','24h','7d'].map(w=>{const a=s.llm[w]||{};return a.calls?`<tr><td>${w}</td><td class="num">${a.calls}</td><td class="num">${a.error_pct}%</td><td class="num">${a.avg_s}s / ${a.p95_s}s</td><td class="num">${f(a.gen_tps)}</td><td class="num">${f(a.prompt_tps)}</td><td class="num">${a.wait_p95_s}s / ${a.wait_bg_p95_s}s</td><td class="num">${a.truncated_pct}%</td><td class="num">${a.cut_off_pct}%</td><td class="num">${a.json_fail_pct}%</td><td class="num">${a.reloads}</td></tr>`:`<tr><td>${w}</td><td colspan="10" class="small">no calls</td></tr>`}));
+  h+=sec('Model comparison (7 days) — keep the one with fewer "unclear" answers if its speed is acceptable',tbl(['Model','#Calls','#Tok/s out','#Tok/s in','#Avg / p95','#Claude wait p95','#Triaged','#Unclear','#Claims not backed','#On GPU'],(s.by_model||[]).map(m=>`<tr><td>${esc(m.model)}${m.in_use?' <span class="chip" style="color:var(--ok);border-color:var(--ok)">in use</span>':''}</td><td class="num">${m.calls||0}</td><td class="num">${f(m.gen_tps)}</td><td class="num">${f(m.prompt_tps)}</td><td class="num">${m.calls?m.avg_s+'s / '+m.p95_s+'s':'—'}</td><td class="num">${m.calls?m.wait_p95_s+'s':'—'}</td><td class="num">${m.triaged}</td><td class="num">${m.triaged?m.unclear_pct+'%':'—'}</td><td class="num">${m.triaged?m.downgraded_pct+'%':'—'}</td><td class="num">${f(m.gpu_pct,'%')}</td></tr>`)));
   h+=sec('By kind (24h)',tbl(['Kind','#Calls','#Failed','#Avg / p95','#Tok/s out','#Tokens in / out','#Input cut','#Answer cut'],s.by_kind.map(a=>`<tr><td>${esc(a.kind)}</td><td class="num">${a.calls}</td><td class="num">${a.error_pct}%</td><td class="num">${a.avg_s}s / ${a.p95_s}s</td><td class="num">${f(a.gen_tps)}</td><td class="num">${k(a.tokens_in)} / ${k(a.tokens_out)}</td><td class="num">${a.truncated_pct}%</td><td class="num">${a.cut_off_pct}%</td></tr>`)));
   const t24=s.triage['24h'], t7=s.triage['7d'];
   const vs=t=>Object.entries(t.verdicts).map(([v,n])=>`${esc(v)} ${n}`).join(' · ')||'—';
@@ -3099,7 +3102,20 @@ function updateProfiles(force){
   const lab=p=>{const x=PRIO[p]||{};return (x.priority==='high'?'★ ':'')+p+(x.priority==='on_demand'?(x.asleep?' (on demand, not loaded)':' (on demand)'):'')};
   sel.innerHTML='<option value="">All profiles</option>'+profs.map(p=>`<option value="${esc(p)}">${esc(lab(p))}</option>`).join(''); sel.value=cur;
 }
+async function headerPicker(){
+  let m; try{m=await getJ('/api/ai/models')}catch(e){return}
+  const box=$('aiPick'); if(!box||!m.installed.length)return;
+  const sig=m.installed.map(x=>x.name).join(',')+'|'+m.current+'|'+m.num_ctx;
+  if(box.dataset.sig===sig||box.contains(document.activeElement))return;
+  box.dataset.sig=sig;
+  box.innerHTML=`<span style="color:var(--mute)">🔁 Model:</span>
+    <select id="hpModel" style="font-size:12px;padding:2px 6px">${m.installed.map(x=>`<option value="${esc(x.name)}"${x.name===m.current?' selected':''}>${esc(x.name)} · ${x.size_gb} GB</option>`).join('')}</select>
+    <select id="hpCtx" style="font-size:12px;padding:2px 6px" title="Context: how much text the model reads at once. Smaller leaves more of the GPU for the model itself.">${m.contexts.map(c=>`<option value="${c}"${c===m.num_ctx?' selected':''}>${c/1024}k ctx</option>`).join('')}</select>
+    <button id="hpGo" style="font-size:12px;padding:2px 8px">Switch</button><span id="hpMsg" style="color:var(--mute)"></span>`;
+  $('hpGo').onclick=async()=>{$('hpMsg').textContent='switching…';const r=await getJ('/api/ai/model?'+new URLSearchParams({name:$('hpModel').value,num_ctx:$('hpCtx').value}));$('hpMsg').textContent=r.error||r.message;box.dataset.sig='';setTimeout(()=>{aiStatus();$('hpMsg').textContent=''},15000)};
+}
 async function aiStatus(){
+  headerPicker();
   try{ const a=await getJ('/api/ai/status');
     $('aiStatus').innerHTML=a.ok?`🤖 Local model <b>${esc(a.model)}</b> ready · ${a.triaged} patterns triaged this session${a.working_on?` · now: ${esc(a.working_on)}`:''}${a.queue&&(a.queue.waiting_claude+a.queue.waiting_triage)?` · queue ${a.queue.waiting_claude+a.queue.waiting_triage}`:''}${a.backlog?` · backlog ${a.backlog}`:''}${a.last_call&&a.last_call.gen_tps?` · ${a.last_call.gen_tps} tok/s`:''}${a.gpu&&a.gpu.gpu_pct!=null?` · <span style="color:var(${a.gpu.gpu_pct>=98?'--ok':'--err'})">GPU ${a.gpu.gpu_pct}%</span>`:''}${a.last_error?` · <span style="color:var(--sus)">${esc(a.last_error)}</span>`:''}`
       :`<span style="color:var(--mute)">🤖 Local model off — ${esc(a.detail)}</span>`;
