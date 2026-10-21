@@ -1,6 +1,6 @@
 """
 Tower deploy helper for the AWS Error Feed:
-  1. pushes the tower's commits to GitHub (so the laptop can pull them)
+  1. (off by default) pushes the tower's commits to GitHub
   2. downloads an extra Ollama model (skipped if it's already installed)
   3. stops the running dashboard and starts it again (scheduled task "AWS Error Feed")
   4. waits until it answers and prints a short status
@@ -18,7 +18,7 @@ import urllib.parse
 import urllib.request
 
 # ------------------------------------------------------------------ settings
-PUSH_TO_GITHUB = True
+PUSH_TO_GITHUB = False                  # already pushed; set True to push from here
 MODEL_TO_INSTALL = "qwen3:30b-a3b"      # "" = don't download anything
 SWITCH_TO_NEW_MODEL = False             # True = make it the active model after the restart
 NEW_MODEL_CONTEXT = 8192                # context used if SWITCH_TO_NEW_MODEL is True
