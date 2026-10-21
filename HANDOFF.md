@@ -63,6 +63,7 @@ default URL and `install_autostart.ps1` (new_app only).
 | `aws_ops.py` | Runs (REPORT-based), did-nothing, trace a record, code index (function → repo folder), notes, client reports, client cards, structured-line parsing (`structured()`, `structured_count()`) |
 | `aws_local.py` | Local model: LocalLLM (Ollama), background Triage (+ evidence check), Jobs (summaries, map-reduce reads, templates, file map), PCache (answers cached 30 days in `ai_cache`), savings counter (`ai_usage`), Gate (Claude requests before triage) |
 | `aws_health.py` | Health tab: model-call telemetry (`llm_calls`), connector tool calls (`tool_calls`), daily `counters`, own error log (`sys_events`), Drain3 shadow grouping, "what to improve next" rules (thresholds at the top) |
+| `aws_prefs.py` | Project priority (high ★ / normal / on_demand = not polled until opened, then awake `on_demand_wake_hours`), dashboard-picked settings (meta table), ModelPicker (list / switch / download Ollama models without restart) |
 | `tower_tune.ps1` | Tower: Ollama env (flash attention, q8_0 KV, keep_alive 24h), biggest num_ctx that fits the GPU, drain3 install, `tuning_note`, restarts Ollama + dashboard; `-Undo` |
 | `mcp_server.py` | Claude connector (runs on whichever machine Claude is on; talks HTTP to the dashboard; reads local repos itself) |
 | `install_autostart.ps1` | Registers the scheduled task + `tailscale serve --bg 8766`; `-Remove` undoes it |
@@ -101,6 +102,9 @@ old long-range pulls not resumed after restart.
 - 🤖 line: model status, triaged count, **💰 savings** (tower tokens read vs Claude tokens received, % saved).
 - Endpoints: `GET /api/ai/status|savings|job|triage_map|summarize|claude_usage`, `POST /api/ai/read` (map-reduce reading),
   `POST /api/ai/prompt` (templates: edit, commit, fix, narrative, run, filemap), `POST /api/ai/filemap[_known]`.
+
+**Model picker** (Health tab, connector `more_tools("switch_model")`): switch installed Ollama models + context live, download new ones; choice persists over config.json.
+**Project priority** (Clients tab select, connector `more_tools("project_priority")`): ★ first everywhere + triaged first; on-demand projects asleep (no polling/scan/triage, hidden from all-client views) until opened.
 
 **Health tab** (`/api/health`, `/api/health/text`, connector `more_tools("system_health")`): what to improve next,
 model speed / queue / GPU fit / inputs cut / answers cut / bad JSON / reloads, per-kind stats, triage quality (unclear,

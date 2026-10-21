@@ -308,12 +308,16 @@ class Triage(threading.Thread):
         self.last_error = None
         self.running_now = None
         self.backlog = None                     # patterns waiting for triage (last cycle)
+        self.prefs = None                       # project priority: starred first, asleep skipped
 
     def candidates(self):
         """(profile, pattern) pairs: regressions, new, spiking, then the busiest - untriaged first."""
         tr = get_triage(self.store)
         out = []
         for prof in sorted({w.profile for w in self.workers}):
+            if self.prefs and self.prefs.asleep(prof):
+                continue
+            rank = self.prefs.rank(prof) if self.prefs else 1
             rows = self.store.annotate(self.store.summary({"hours": 24, "profile": prof, "level": "error,suspect",
                                                            "hide_muted": "1"}), prof)
             for i, g in enumerate(rows[:40]):
@@ -326,7 +330,7 @@ class Triage(threading.Thread):
                 stale = (not t or time.time() * 1000 - t["at"] > max_age or
                          (g["count"] > 3 * max(t["count_at_triage"] or 1, 1) and g["count"] - (t["count_at_triage"] or 0) > 20))
                 if stale and (prio < 3 or i < self.cfg.get("local_llm", {}).get("triage_top_n", 8)):
-                    out.append((prio, prof, g))
+                    out.append(((rank, prio), prof, g))
         out.sort(key=lambda x: x[0])
         return out
 

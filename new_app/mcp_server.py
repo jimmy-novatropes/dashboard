@@ -164,7 +164,29 @@ def base():
                    f"Start it with `python aws_error_feed.py` in {HERE} or check the tower / Tailscale.")
 
 
+_NOTES = []          # notes for the current tool answer (e.g. "this on-demand project was asleep")
+_AWAKE = {}          # profile -> time we last made sure it's awake
+
+
+def _wake(profile):
+    """On-demand projects aren't loaded until opened: wake it and say so if it was asleep."""
+    if not profile or time.time() - _AWAKE.get(profile, 0) < 60:
+        return
+    _AWAKE[profile] = time.time()
+    try:
+        with urllib.request.urlopen(f"{base()}/api/prefs/wake?" + urllib.parse.urlencode({"profile": profile}),
+                                    timeout=10) as r:
+            w = json.loads(r.read().decode("utf-8"))
+        if w.get("was_asleep"):
+            _NOTES.append(f"NOTE: {profile} is an on-demand project and was asleep; it's loading the last 24h "
+                          f"now (a few minutes), so this answer may be incomplete - ask again shortly.")
+    except Exception:
+        pass
+
+
 def api(path, **params):
+    if params.get("profile") and not path.startswith("/api/prefs"):
+        _wake(params["profile"])
     q = urllib.parse.urlencode({k: v for k, v in params.items() if v not in (None, "")})
     for attempt in range(2):
         url = f"{base()}{path}?{q}"
@@ -331,7 +353,20 @@ def top(d, n=4):
 
 
 def finish(lines):
-    return cap("\n".join(lines), MAX_OUT)
+    notes = list(dict.fromkeys(_NOTES))
+    _NOTES.clear()
+    return cap("\n".join(notes + list(lines)), MAX_OUT)
+
+
+def _prefs():
+    try:
+        return {x["profile"]: x for x in api("/api/prefs")["profiles"]}
+    except Exception:
+        return {}
+
+
+def _star(p, prefs):
+    return ("★ " if (prefs.get(p) or {}).get("priority") == "high" else "") + p
 
 
 def _report_usage(tool, chars, ms=0, err=None):
@@ -466,8 +501,10 @@ def error_overview(hours: float = 24, profile: str = "") -> str:
         out.append(f"(Baseline for NEW/SPIKE is still building: {pats[0]['baseline_hours']}h of history.)")
     if not by:
         out.append("No errors or hidden errors in this range.")
-    for prof, b in sorted(by.items(), key=lambda x: -(x[1]["error"] * 3 + x[1]["suspect"])):
-        out.append(f"\n## {prof}: {b['error']} errors, {b['suspect']} hidden errors "
+    prefs = _prefs()
+    rk = lambda p: {"high": 0, "normal": 1, "on_demand": 2}.get((prefs.get(p) or {}).get("priority"), 1)
+    for prof, b in sorted(by.items(), key=lambda x: (rk(x[0]), -(x[1]["error"] * 3 + x[1]["suspect"]))):
+        out.append(f"\n## {_star(prof, prefs)}: {b['error']} errors, {b['suspect']} hidden errors "
                    f"({lines_per.get(prof, 0)} log lines total)")
         pats_sorted = sorted(b["pats"], key=lambda x: -x[0])
         live = [x for x in pats_sorted if not chronic(x[1])]
@@ -484,6 +521,9 @@ def error_overview(hours: float = 24, profile: str = "") -> str:
     quiet = sorted(set(lines_per) - set(by))
     if quiet:
         out.append(f"\nNo errors: {', '.join(quiet)}")
+    asleep = sorted(p for p, x in prefs.items() if x.get("asleep"))
+    if asleep and not profile:
+        out.append(f"On demand, not loaded: {', '.join(asleep)} (pass profile=<name> to load one).")
     out.append("\nMuted patterns and ones marked fixed are hidden (list_muted shows them).")
     return finish(out)
 
@@ -887,11 +927,13 @@ def clients_status() -> str:
     """Red/amber/green status per client with reasons, error counts (1h/6h/24h) and recent deploys.
     Start here for "how are my clients?"."""
     cards = api("/api/ops/clients")
-    out = [f"Dashboard: {link(tab='clients')}"]
-    for c in cards:
+    out = [f"Dashboard: {link(tab='clients')} (★ = priority project)"]
+    asleep = [c["profile"] for c in cards if c.get("asleep")]
+    for c in [c for c in cards if not c.get("asleep")]:
         trend = lambda a, b: "" if b is None else (" (up from %d)" % b if a > b * 1.2 and a - b > 2 else
                                                    " (down from %d)" % b if a < b * 0.8 and b - a > 2 else "")
-        out.append(f"\n## {c['profile']}: {c['status'].upper()}")
+        out.append(f"\n## {'★ ' if c.get('priority') == 'high' else ''}{c['profile']}: {c['status'].upper()}"
+                   + (" (on demand)" if c.get("priority") == "on_demand" else ""))
         out.append(f"errors 24h {c['errors_24h']}{trend(c['errors_24h'], c['errors_prev'])}, hidden {c['hidden_24h']}, "
                    f"runs {c['runs_24h']} ({c['failed_runs_24h']} failed), records {c['records_24h']}"
                    + (f" (usually ~{c['records_usual']}/day)" if c.get("records_usual") else "")
@@ -913,6 +955,8 @@ def clients_status() -> str:
                        + (f" (errors+hidden {rate(d['rate_before'])} -> {rate(d['rate_after'])}, "
                           f"{d['window_hours']}h before vs {d['after_hours']}h after)" if d["before_loaded"] else ""))
         out += [f"- {r}" for r in c["reasons"][:10]]
+    if asleep:
+        out.append(f"\nOn demand, not loaded: {', '.join(asleep)} (ask about one with profile=<name> to load it).")
     return finish(out)
 
 
@@ -2147,7 +2191,8 @@ def find_print_site(message, folder, limit=3):
 @guard
 def more_tools(name: str = "", args: str = "{}") -> str:
     """Every other aws-error-feed tool (infrastructure, schedules, deploys, partner APIs, notes, mutes,
-    reports, runs, history, system_health...). Call with no name for the list, then more_tools(name, args=JSON)."""
+    reports, runs, history, system_health, project_priority, switch_model...). Call with no name for the
+    list, then more_tools(name, args=JSON)."""
     if not name:
         rows = []
         for n, f in sorted(REGISTRY.items()):
@@ -2191,6 +2236,48 @@ def usage_savings(days: int = 7) -> str:
                    f"({d['claude_calls']} calls), ~{d['saved_pct']}% saved" + (f". Biggest: {tools}" if tools else ""))
     out.append("Background triage counts as avoided only if Claude would otherwise have read those lines; "
                "summaries are a direct saving. Claude's own reasoning and code work aren't included.")
+    return finish(out)
+
+
+@tool()
+@guard
+def project_priority(profile: str = "", priority: str = "") -> str:
+    """List or set project priority. priority: high (starred: first everywhere, triaged first),
+    normal, or on_demand (not loaded/polled until someone opens it, then loaded for a couple of hours).
+    No arguments = list all."""
+    if profile and priority:
+        r = api("/api/prefs/set", profile=profile, priority=priority)
+        if r.get("error"):
+            return r["error"]
+    r = api("/api/prefs")
+    out = [("Updated. " if profile and priority else "") + f"Project priority (on-demand stays loaded "
+           f"{r['wake_hours']:g}h after it's opened):"]
+    for x in r["profiles"]:
+        st = ""
+        if x["priority"] == "on_demand":
+            st = " - asleep" if x["asleep"] else f" - loaded, {x['awake_minutes_left']} min left"
+        out.append(f"- {_star(x['profile'], {x['profile']: x})}: {x['priority']}{st}")
+    return finish(out)
+
+
+@tool()
+@guard
+def switch_model(name: str = "", num_ctx: int = 0, download: bool = False) -> str:
+    """The tower's local model: no arguments = list installed models and the one in use; name = switch to
+    it (no restart; optional num_ctx e.g. 8192/16384); download=True = download that model first
+    (runs in the background, check again with no arguments)."""
+    if name and download:
+        r = api("/api/ai/pull", name=name)
+        return r.get("error") or r.get("message")
+    if name:
+        r = api("/api/ai/model", name=name, num_ctx=num_ctx or None)
+        return r.get("error") or r.get("message")
+    m = api("/api/ai/models")
+    out = [f"In use: {m['current']} (context {m['num_ctx']}, set in {m['source']})" + (f" - {m['error']}" if m.get("error") else ""),
+           "Installed: " + ", ".join(f"{x['name']} ({x['size_gb']} GB)" for x in m["installed"])]
+    for n, p in (m.get("pulls") or {}).items():
+        out.append(f"Download {n}: " + (f"failed - {p['error']}" if p.get("error") else "done" if p.get("done") else f"{p['status']} {p['pct']}%"))
+    out.append("Compare models with system_health (day-by-day table records which model each day used).")
     return finish(out)
 
 

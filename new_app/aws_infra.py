@@ -271,10 +271,15 @@ class InfraScanner(threading.Thread):
         self.key = f"{profile}/{region}"
         self.wake = threading.Event()
         self.scanning = False
+        self.asleep = lambda: False             # on-demand project not opened: don't scan
 
     def run(self):
         time.sleep(20)                          # let the log polling start first
         while True:
+            if self.asleep():
+                self.wake.wait(60)
+                self.wake.clear()
+                continue
             try:
                 self.scanning = True
                 self.scan()

@@ -63,6 +63,7 @@ import aws_infra  # noqa: E402  (infrastructure scan: schedules, layers, secrets
 import aws_ops  # noqa: E402    (runs, did-nothing, trace, code links, notes, reports, clients)
 import aws_local  # noqa: E402  (optional local model via Ollama: triage + summaries)
 import aws_health  # noqa: E402 (health / efficiency stats, system log, Drain3 shadow grouping)
+import aws_prefs  # noqa: E402  (project priority / on-demand projects, local model picker)
 DAY_MS = 86_400_000
 LEVELS = ("error", "suspect", "warning", "info", "platform")
 
@@ -90,6 +91,8 @@ DEFAULTS = {
     # an older range in the last keep_hours (then it's kept until keep_hours after that pull)
     "keep_hours": 24,
     "info_keep_hours": 8,
+    "on_demand_wake_hours": 2,    # an on-demand project stays loaded this long after you open it
+    "profile_priority": {},       # optional defaults, e.g. {"hrs": "high", "puretech": "on_demand"} (dashboard wins)
     "full_lines_per_pattern_hour": 200,   # after this many lines of one pattern in an hour, store the rest short
     "repeat_line_chars": 1000,            # ...to this many characters: start + end kept (JSON lines always whole)         # plain info lines are dropped sooner (errors / hidden errors / warnings / platform keep keep_hours)
     "poll_seconds": 30,
@@ -687,6 +690,11 @@ class Store:
             if f.get(k):
                 c.append(f"{col} = ?")
                 p.append(f[k])
+        if f.get("not_profiles") and not f.get("profile"):
+            np_ = [x for x in str(f["not_profiles"]).split(",") if x]
+            if np_:
+                c.append(f"profile NOT IN ({','.join('?' * len(np_))})")
+                p += np_
         if f.get("grp_prefix"):
             esc = f["grp_prefix"].replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
             c.append("grp LIKE ? ESCAPE '\\'")
@@ -1009,7 +1017,7 @@ class Store:
             was_ok, was_err = st.get("ok"), st.get("error")
             st.update(kw, updated=time.time())
             now_ok, now_err = st.get("ok"), st.get("error")
-        if self.on_status and "ok" in kw and was_ok is not None and bool(was_ok) != bool(now_ok) \
+        if self.on_status and "ok" in kw and "asleep" not in kw and was_ok is not None and bool(was_ok) != bool(now_ok) \
                 and was_err != "starting…" and now_err != "starting…":
             try:
                 self.on_status(key, was_ok, now_ok, now_err)
@@ -1217,7 +1225,9 @@ def build_digest(store, workers, cfg, profile=None):
     by_profile = {}
     for w, snap, stats in infra_views(store, workers, profile):
         by_profile.setdefault(w.profile, []).append((w, snap, stats))
-    for prof, views in sorted(by_profile.items()):
+    for prof, views in sorted(by_profile.items(), key=lambda kv: (PREFS.rank(kv[0]) if PREFS else 1, kv[0])):
+        if PREFS and not profile and PREFS.asleep(prof):
+            continue
         sec = []
 
         def add(title, items):
@@ -1349,6 +1359,10 @@ def clients_overview(store, workers, cfg, max_age=60):
     profiles = sorted({w.profile for w in workers})
     cards = []
     for prof in profiles:
+        if PREFS and PREFS.asleep(prof):
+            cards.append({"profile": prof, "priority": "on_demand", "asleep": True, "status": "asleep",
+                          "reasons": [], "red": 0})
+            continue
         views = infra_views(store, workers, prof)
         conn_err = [status.get(w.key, {}).get("error") for w, _, _ in views if not status.get(w.key, {}).get("ok")]
         starting = bool(conn_err) and all(e == "starting…" for e in conn_err)
@@ -1409,11 +1423,15 @@ def clients_overview(store, workers, cfg, max_age=60):
             "windows": error_windows(store, prof, data_from, now),
             "recent_deploys": sorted(recent, key=lambda x: -x["at"])[:6],
             "functions": len(fns), "accounts": [w.key for w, _, _ in views]}
-        cards.append(aws_ops.client_card(prof, parts))
-    # Most critical first: most errors in the last 24h (then last 1h, hidden errors, status as tie-breakers)
-    order = {"red": 0, "amber": 1, "green": 2}
+        card = aws_ops.client_card(prof, parts)
+        card["priority"] = PREFS.priority(prof) if PREFS else "normal"
+        card["asleep"] = False
+        cards.append(card)
+    # Starred projects first, on-demand last; within each: most critical first: most errors in the last 24h (then last 1h, hidden errors, status as tie-breakers)
+    order = {"red": 0, "amber": 1, "green": 2, "asleep": 3}
     win = lambda c, k, f: ((c.get("windows") or {}).get(k) or {}).get(f) or 0   # the numbers shown on the card
-    cards.sort(key=lambda c: (-(win(c, "24h", "errors") or c["errors_24h"] or 0), -win(c, "1h", "errors"),
+    rank = lambda c: 3 if c.get("asleep") else aws_prefs.RANK.get(c.get("priority") or "normal", 1)
+    cards.sort(key=lambda c: (rank(c), -(win(c, "24h", "errors") or c.get("errors_24h") or 0), -win(c, "1h", "errors"),
                               -win(c, "24h", "hidden"), order[c["status"]], -c["red"], c["profile"]))
     _clients_cache.update(at=time.time(), data=cards)
     return cards
@@ -1741,6 +1759,7 @@ class Worker(threading.Thread):
         self.sfn_cursor, self.sfn_last_poll = self.cursor, 0
         self.lam, self.lambda_count, self.lambda_error, self.deploys_checked = None, 0, None, 0
         self.infra = None
+        self.sleeping = False                # on-demand project not opened recently: not polled
         sd = store.get_coverage("seed|" + self.key)
         if sd:
             self.seed_from, self.seed_target = sd["covered_from"], sd["target"]
@@ -1958,9 +1977,31 @@ class Worker(threading.Thread):
             sfn_error=self.sfn.error if self.sfn else None,
             baseline_loading=self.seed_from > self.seed_target, **extra)
 
+    def rewind_for_wake(self):
+        """Woken after sleeping: catch up the last startup_hours live, backfill the rest of keep_hours
+        in the background (like a fresh start) instead of pulling the whole sleep gap at once."""
+        now = int(time.time() * 1000)
+        keep_from = now - self.keep_ms
+        fast_from = now - int(self.cfg["startup_hours"] * 3_600_000)
+        if self.cursor < fast_from:
+            self.cursor = self.covered_from = fast_from
+            self.target = min(self.target, keep_from)
+            self.save()
+
     def run(self):
         logs = None
         while True:
+            if PREFS and PREFS.asleep(self.profile):
+                if not self.sleeping:
+                    self.sleeping = True
+                    self.store.set_status(self.key, ok=True, error=None, asleep=True,
+                                          profile=self.profile, region=self.region)
+                time.sleep(5)
+                continue
+            if self.sleeping:
+                self.sleeping = False
+                self.rewind_for_wake()
+                self.store.set_status(self.key, asleep=False)
             try:
                 if logs is None:
                     logs = self.client()
@@ -2018,6 +2059,8 @@ AIJOBS = None
 TRIAGE = None
 HEALTH = None
 DRAIN = None
+PREFS = None
+PICKER = None
 CODE = None
 
 
@@ -2088,6 +2131,14 @@ def make_handler(store, workers, cfg):
                 jid = AIJOBS.start(question, aws_local.lines_text(lines, LLM.max_input_chars - 2000), kind)
                 return self.json({"id": jid, "lines": len(lines),
                                   "event_ids": [l.get("id") for l in lines if l.get("level") in ("error", "suspect")][:8]})
+            if path == "/api/ai/models":
+                return self.json(PICKER.status())
+            if path == "/api/ai/model":
+                r = PICKER.switch(q.get("name", ""), q.get("num_ctx") or None)
+                _clients_cache["at"] = 0
+                return self.json(r)
+            if path == "/api/ai/pull":
+                return self.json(PICKER.pull(q.get("name", "")))
             if path == "/api/ai/triage_now":
                 if not LLM.ready:
                     return self.json({"error": "Local model not available: " + LLM.state["detail"]})
@@ -2250,6 +2301,31 @@ def make_handler(store, workers, cfg):
             u = urlparse(self.path)
             q = {k: v[0] for k, v in parse_qs(u.query, keep_blank_values=True).items()}
             stamp = time.strftime("%Y%m%d-%H%M")
+            if PREFS:
+                if u.path == "/api/prefs":
+                    return self.json({"profiles": PREFS.listing({w.profile for w in workers}),
+                                      "wake_hours": PREFS.wake_hours, "priorities": list(aws_prefs.PRIORITIES)})
+                if u.path == "/api/prefs/set":
+                    try:
+                        PREFS.set_priority(q["profile"], q.get("priority", "normal"))
+                    except (KeyError, ValueError) as ex:
+                        return self.json({"error": str(ex)})
+                    _clients_cache["at"] = 0
+                    if HEALTH:
+                        HEALTH.event("info", "settings", "priority", f"{q['profile']} -> {q.get('priority')}")
+                    return self.json({"ok": True})
+                if u.path == "/api/prefs/wake":
+                    was = PREFS.wake(q.get("profile", ""), q.get("hours") or None)
+                    _clients_cache["at"] = 0
+                    return self.json({"was_asleep": was, "priority": PREFS.priority(q.get("profile", "")),
+                                      "wake_hours": PREFS.wake_hours})
+                if q.get("profile") and PREFS.asleep(q["profile"]):
+                    PREFS.wake(q["profile"])           # opening an on-demand project wakes it
+                    _clients_cache["at"] = 0
+                elif not q.get("profile") and u.path in ("/api/summary", "/api/events", "/api/volume", "/api/partners"):
+                    asleep = PREFS.asleep_profiles()
+                    if asleep:
+                        q["not_profiles"] = ",".join(asleep)
             if u.path == "/":
                 return self.send(200, PAGE, "text/html; charset=utf-8")
             if u.path == "/api/events":
@@ -2435,6 +2511,10 @@ tr.click:hover{background:var(--bg);cursor:pointer}
 .up{color:var(--err)}.down{color:var(--ok)}
 .cc ul{margin:6px 0 0 16px;padding:0;font-size:12.5px}.cc .foot{margin-top:8px;font-size:12px;color:var(--mute);display:flex;gap:10px;flex-wrap:wrap}
 .cc .foot a{color:var(--acc);cursor:pointer}
+.cc .foot select.prio{font-size:11px;padding:1px 4px;margin-left:auto}
+.cc.high{box-shadow:0 0 0 1px var(--acc) inset}
+#clientSleep{margin-top:12px;font-size:13px;color:var(--mute)}#clientSleep .sl{display:inline-flex;gap:6px;align-items:center;border:1px solid var(--line);border-radius:8px;padding:4px 8px;margin:3px 6px 3px 0;background:var(--panel)}
+#clientSleep a{color:var(--acc);cursor:pointer}#clientSleep select{font-size:11px;padding:1px 4px}
 .note{font-size:12px;color:var(--acc);font-style:italic;margin-top:2px}
 .win{width:100%;border:0;margin:10px 0 2px;background:none}.win th,.win td{border:0;padding:2px 4px;font-size:12px}
 .win th{color:var(--mute);font-weight:500;cursor:default}.win td{text-align:right;font-variant-numeric:tabular-nums}
@@ -2501,7 +2581,7 @@ tr.click:hover{background:var(--bg);cursor:pointer}
 <main>
  <div id="v-clients" class="view on">
   <p class="help">Status of every client at a glance: <b style="color:var(--err)">red</b> = something is broken (jobs not running, regressions, alarms, server errors, syncs that did nothing), <b style="color:var(--sus)">amber</b> = worth a look, <b style="color:var(--ok)">green</b> = all quiet. Click a client to open its errors; "report" opens a printable health report.</p>
-  <div id="clientCards" class="cards"></div></div>
+  <div id="clientCards" class="cards"></div><div id="clientSleep"></div></div>
  <div id="v-runs" class="view">
   <p class="help">Each Lambda run as one row: when it ran, how long, records processed, errors and outcome. Click a run to see everything it logged. Above: functions that ran but processed nothing / far less than usual, or went quiet.</p>
   <div id="nothingBox"></div>
@@ -2546,6 +2626,7 @@ tr.click:hover{background:var(--bg);cursor:pointer}
   <div id="digBody"></div></div>
  <div id="v-health" class="view">
   <p class="help">Is the tower setup working? Local-model speed, queue, GPU fit, triage quality, cache, token savings, connector tools, Drain3 shadow grouping and the dashboard's own error log, with a "what to improve next" list built from them. The daily table shows which settings were active each day, so you can compare before / after a change. Ask Claude with more_tools("system_health").</p>
+  <div id="hlPicker" class="ev info" style="padding:10px 14px;margin-bottom:6px"></div>
   <div id="hlBody"></div></div>
  <div id="v-partners" class="view">
   <p class="help">API problems with partner services across all clients, from error and hidden-error lines: <b>auth</b> (401, expired token), <b>permission</b> (403, missing scopes), <b>rate limit</b> (429), <b>server error</b> (5xx) and <b>timeout</b>. A red flag means the same problem hit several clients in the last hour — usually the partner's side or a shared credential, not your code. Click a row for the lines.</p>
@@ -2798,7 +2879,24 @@ async function loadDigest(){
     +`<p class="small"><button class="act" id="copyDig">copy as text</button></p>`;
   $('copyDig').onclick=()=>navigator.clipboard.writeText(r.text);
 }
+async function loadPicker(){
+  let m; try{m=await getJ('/api/ai/models')}catch(e){return}
+  const box=$('hlPicker'), pulls=Object.entries(m.pulls||{}).map(([n,p])=>`${esc(n)}: ${p.error?'<span style="color:var(--err)">failed — '+esc(p.error)+'</span>':p.done?'<span style="color:var(--ok)">downloaded</span>':esc(p.status)+' '+p.pct+'%'}`).join(' · ');
+  if(!box.dataset.built||box.dataset.sig!==m.installed.map(x=>x.name).join(',')+'|'+m.current){
+    box.dataset.built=1; box.dataset.sig=m.installed.map(x=>x.name).join(',')+'|'+m.current;
+    box.innerHTML=`<div class="row"><b>Local model</b>
+      <select id="mpModel">${m.installed.map(x=>`<option value="${esc(x.name)}"${x.name===m.current?' selected':''}>${esc(x.name)} · ${x.size_gb} GB${x.params?' · '+esc(x.params):''}</option>`).join('')||'<option>Ollama not reachable</option>'}</select>
+      <label>context <select id="mpCtx">${m.contexts.map(c=>`<option value="${c}"${c===m.num_ctx?' selected':''}>${c/1024}k</option>`).join('')}</select></label>
+      <button id="mpGo">Switch</button><span id="mpMsg" class="small"></span></div>
+      <div class="row small" style="color:var(--mute)">In use: <b style="color:var(--fg)">${esc(m.current)}</b> (context ${m.num_ctx}, set in ${esc(m.source)}). Both models stay installed; switching takes 10–30 s to load. Compare them in the day-by-day table below.</div>
+      <div class="row"><input id="mpPull" placeholder="model to download, e.g. qwen3:30b-a3b" style="min-width:260px"><button id="mpPullGo">Download</button><span id="mpPulls" class="small"></span></div>`;
+    $('mpGo').onclick=async()=>{$('mpMsg').textContent='switching…';const r=await getJ('/api/ai/model?'+new URLSearchParams({name:$('mpModel').value,num_ctx:$('mpCtx').value}));$('mpMsg').textContent=r.error||r.message;box.dataset.sig='';setTimeout(()=>{window._hlForce=true;refresh(null,true)},3000)};
+    $('mpPullGo').onclick=async()=>{const n=$('mpPull').value.trim();if(!n)return;const r=await getJ('/api/ai/pull?name='+encodeURIComponent(n));$('mpPulls').textContent=r.error||r.message};
+  }
+  if(pulls&&$('mpPulls'))$('mpPulls').innerHTML=pulls;
+}
 async function loadHealth(){
+  loadPicker();
   const s=await getJ('/api/health'+(window._hlForce?'?force=1':'')); window._hlForce=false;
   const f=(v,suf='')=>v==null||v===''?'—':v+suf, k=n=>n>=1000?(n/1000).toFixed(n>=10000?0:1)+'k':String(n||0);
   const SEV={bad:'--err',warn:'--sus',info:'--acc',ok:'--ok'};
@@ -2856,11 +2954,18 @@ function depList(ds){
     <span class="small">${d.before_loaded?`${r(d.rate_before,d.rate_per)} → ${r(d.rate_after,d.rate_per)}`:''}</span>
     <span style="color:var(${V[d.verdict]||'--mute'});font-weight:600">${esc(d.verdict)}</span></div>`).join('')+'</div>';
 }
+const PRIO_OPTS=[['high','★ Priority'],['normal','Normal'],['on_demand','On demand']];
+const prioSel=(p,cur)=>`<select class="prio" data-p="${esc(p)}" title="Priority: starred projects come first everywhere and are triaged first; on-demand projects aren't loaded until you open them">${PRIO_OPTS.map(([v,l])=>`<option value="${v}"${v===cur?' selected':''}>${l}</option>`).join('')}</select>`;
+let PRIO={};
+async function loadPrefs(){try{const r=await getJ('/api/prefs');PRIO={};r.profiles.forEach(x=>PRIO[x.profile]=x);updateProfiles(true)}catch(e){}}
+function bindPrio(root){root.querySelectorAll('select.prio').forEach(sel=>{sel.onclick=e=>e.stopPropagation();sel.onchange=async()=>{await getJ('/api/prefs/set?'+new URLSearchParams({profile:sel.dataset.p,priority:sel.value}));await loadPrefs();refresh(null,true)}})}
 async function loadClients(){
-  const cards=await getJ('/api/ops/clients'); const red=cards.filter(c=>c.status==='red').length, amb=cards.filter(c=>c.status==='amber').length;
+  const all=await getJ('/api/ops/clients'); loadPrefs();
+  const cards=all.filter(c=>!c.asleep), sleeping=all.filter(c=>c.asleep);
+  const red=cards.filter(c=>c.status==='red').length, amb=cards.filter(c=>c.status==='amber').length;
   $('count').textContent=`${red} red · ${amb} amber · ${cards.length-red-amb} green`;
   const tr=(a,b)=>b==null?'':a>b*1.2&&a-b>2?`<span class="up">▲</span>`:a<b*0.8&&b-a>2?`<span class="down">▼</span>`:'';
-  $('clientCards').innerHTML=cards.map((c,i)=>`<div class="cc ${c.status}"><h3 data-i="${i}"><span style="opacity:.55;font-weight:400;margin-right:6px">#${i+1}</span>${esc(c.profile)}<span class="pill ${c.status}">${c.status==='red'?'needs attention':c.status==='amber'?'watch':'healthy'}</span></h3>
+  $('clientCards').innerHTML=cards.map((c,i)=>`<div class="cc ${c.status} ${c.priority==='high'?'high':''}"><h3 data-i="${i}"><span style="opacity:.55;font-weight:400;margin-right:6px">#${i+1}</span><span>${c.priority==='high'?'<span style="color:var(--acc)">★ </span>':''}${esc(c.profile)}</span><span class="pill ${c.status}">${c.status==='red'?'needs attention':c.status==='amber'?'watch':'healthy'}</span></h3>
     ${winTable(c.windows)}
     <div class="kv"><div>Runs 24h<b>${c.runs_24h}${c.failed_runs_24h?` <span class="up" style="font-size:12px">${c.failed_runs_24h} failed</span>`:''}</b></div>
      <div>Records 24h<b>${c.records_24h||'—'}${c.records_usual?` <span class="small" style="color:var(--mute)">/ ~${c.records_usual}</span>`:''}</b></div>
@@ -2869,8 +2974,11 @@ async function loadClients(){
     ${c.reasons.length?`<ul>${c.reasons.slice(0,6).map(r=>`<li>${esc(r)}</li>`).join('')}${c.reasons.length>6?`<li>+${c.reasons.length-6} more</li>`:''}</ul>`:'<div class="small" style="color:var(--ok)">Nothing needs attention.</div>'}
     <div class="foot"><span>~$${c.cost_30d}/30d</span>${c.last_deploy&&!(c.recent_deploys||[]).length?`<span>Last deploy: ${esc(c.last_deploy.function)} ${ago(c.last_deploy.at)}</span>`:''}
      <a data-go="errors" data-p="${esc(c.profile)}">errors</a><a data-go="runs" data-p="${esc(c.profile)}">runs</a><a data-go="schedules" data-p="${esc(c.profile)}">schedules</a>
-     <a href="/report?profile=${encodeURIComponent(c.profile)}&days=7" target="_blank">weekly report ↗</a></div></div>`).join('')
+     <a href="/report?profile=${encodeURIComponent(c.profile)}&days=7" target="_blank">weekly report ↗</a>${prioSel(c.profile,c.priority)}</div></div>`).join('')
     ||'<div class="empty">Loading clients… (first scan takes about a minute)</div>';
+  $('clientSleep').innerHTML=sleeping.length?`<b>On demand</b> — not loaded until you open one (stays loaded ${esc(String((await getJ('/api/prefs')).wake_hours))}h): `+sleeping.map(c=>`<span class="sl">${esc(c.profile)} <a data-wake="${esc(c.profile)}">load ▸</a>${prioSel(c.profile,'on_demand')}</span>`).join(''):'';
+  $('clientSleep').querySelectorAll('a[data-wake]').forEach(a=>a.onclick=async()=>{a.textContent='loading…';await getJ('/api/prefs/wake?profile='+encodeURIComponent(a.dataset.wake));refresh(null,true)});
+  bindPrio($('clientCards')); bindPrio($('clientSleep'));
   document.querySelectorAll('#clientCards h3').forEach(h=>h.onclick=()=>{$('fProfile').value=cards[h.dataset.i].profile; show('errors')});
   document.querySelectorAll('#clientCards a[data-go]').forEach(a=>a.onclick=()=>{$('fProfile').value=a.dataset.p; show(a.dataset.go)});
 }
@@ -2983,10 +3091,13 @@ async function tick(){
     refresh(new Set(r.live.map(e=>e.id)));
   }catch(e){}
 }
-function updateProfiles(){
-  const sel=$('fProfile'), cur=sel.value, profs=[...knownProfiles].sort();
-  if(sel.options.length===profs.length+1)return;
-  sel.innerHTML='<option value="">All profiles</option>'+profs.map(p=>`<option>${esc(p)}</option>`).join(''); sel.value=cur;
+function updateProfiles(force){
+  const sel=$('fProfile'), cur=sel.value;
+  const rk=p=>({high:0,normal:1,on_demand:2})[(PRIO[p]||{}).priority||'normal'];
+  const profs=[...knownProfiles].sort((a,b)=>rk(a)-rk(b)||a.localeCompare(b));
+  if(!force&&sel.options.length===profs.length+1)return;
+  const lab=p=>{const x=PRIO[p]||{};return (x.priority==='high'?'★ ':'')+p+(x.priority==='on_demand'?(x.asleep?' (on demand, not loaded)':' (on demand)'):'')};
+  sel.innerHTML='<option value="">All profiles</option>'+profs.map(p=>`<option value="${esc(p)}">${esc(lab(p))}</option>`).join(''); sel.value=cur;
 }
 async function aiStatus(){
   try{ const a=await getJ('/api/ai/status');
@@ -3084,7 +3195,7 @@ $('notifySus').checked=store.get('notifySus')==='1'; $('notifySus').onchange=e=>
   if(u.get('level')){const sel=$('fLevel'); if(![...sel.options].some(o=>o.value===u.get('level'))){const o=document.createElement('option');o.value=u.get('level');o.textContent=u.get('level');sel.appendChild(o)} sel.value=u.get('level'); sel.dataset.touched=1}
   if(u.get('grp'))grpFilter=u.get('grp');
   if(u.get('etype'))sigFilter={etype:u.get('etype'),sig:u.get('sig')||''};
-  renderChips(); show(['errors','suspect','all','patterns','volume','deploys','partners','schedules','inventory','apis','digest','health','clients','runs','trace'].includes(u.get('tab'))?u.get('tab'):'clients');
+  loadPrefs(); renderChips(); show(['errors','suspect','all','patterns','volume','deploys','partners','schedules','inventory','apis','digest','health','clients','runs','trace'].includes(u.get('tab'))?u.get('tab'):'clients');
   if(u.get('trace')){$('trTerm').value=u.get('trace'); show('trace'); startTrace()}})();
 onRange(); tick(); setInterval(tick,5000); setInterval(status,5000);
 </script></body></html>"""
@@ -3132,8 +3243,12 @@ def main():
     LLM = aws_local.LocalLLM(cfg)
     LLM.meter = lambda kind, i, o: aws_local.record_usage(store, "local", kind, i, o)
     AIJOBS = aws_local.Jobs(LLM, store)
-    global HEALTH, DRAIN
+    global HEALTH, DRAIN, PREFS, PICKER
     HEALTH = aws_health.Health(store, cfg, db)
+    PREFS = aws_prefs.Prefs(store, cfg)
+    PICKER = aws_local_picker = aws_prefs.ModelPicker(LLM, PREFS, HEALTH)
+    if aws_local_picker.source == "dashboard":
+        print(f"Local model picked in the dashboard: {LLM.model} (num_ctx {LLM.num_ctx})")
     aws_local.HOOKS.update(event=HEALTH.event, count=HEALTH.count, llm_call=HEALTH.llm_call)
     threading.excepthook = HEALTH.thread_hook
     store.on_status = HEALTH.status_change
@@ -3194,6 +3309,14 @@ def main():
                 store.shrink()
     threading.Thread(target=pruner, daemon=True).start()
     TRIAGE = aws_local.Triage(LLM, store, workers, cfg, lambda eid: store.context(eid, 120_000, 30_000))
+    TRIAGE.prefs = PREFS
+
+    def on_wake(prof):
+        for w in workers:
+            if w.profile == prof and w.infra:
+                w.infra.wake.set()             # rescan infrastructure right away
+        HEALTH.event("info", "settings", "wake", f"{prof} opened - loading it (awake {PREFS.wake_hours:g}h)")
+    PREFS.on_wake = on_wake
     TRIAGE.start()
     print("Local model:", LLM.check(force=True)["detail"])
 
@@ -3202,6 +3325,7 @@ def main():
         print(f"  - {w.key}")
         if cfg["infra_scan"]:
             w.infra = aws_infra.InfraScanner(w.profile, w.region, cfg, store)
+            w.infra.asleep = (lambda p: (lambda: PREFS.asleep(p)))(w.profile)
             w.infra.start()
         store.set_status(w.key, ok=False, profile=w.profile, region=w.region, error="starting…")
         w.start()
