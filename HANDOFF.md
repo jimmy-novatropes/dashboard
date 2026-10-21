@@ -1,4 +1,4 @@
-# AWS Error Feed dashboard — handoff / context (as of 2026-10-21)
+# AWS Error Feed dashboard — handoff / context (as of 2026-10-21, evening)
 
 Paste this into a new chat to continue work on the dashboard. Owner: Jimmy (Open Flow). Preference: brief, direct answers.
 
@@ -21,7 +21,7 @@ tower)** does the heavy reading (triage, log/code summaries, small code edits) s
 |---|---|---|---|
 | User / dashboard path | `C:\Users\jagom\Documents\Openflow Repos\dashboard` | `C:\Users\jagom.ADVENTUM\Documents\Openflow\dashboard` | — |
 | Python | `C:\Users\jagom\AppData\Local\Programs\Python\Python311\python.exe` | `C:\Users\jagom.ADVENTUM\AppData\Local\Programs\Python\Python312\python.exe` | — |
-| Runs | `new_app` dashboard (scheduled task **"AWS Error Feed"**, pythonw, port **8766**, log `new_app\dashboard.log`), Ollama 0.40.x **qwen3:14b** (RTX A2000 12 GB, 64 GB RAM, i9); `qwen3:30b-a3b` being installed as an alternative | Claude Desktop connector → `new_app\mcp_server.py` pointed at the tower | Browser |
+| Runs | `new_app` dashboard (scheduled task **"AWS Error Feed"**, pythonw, port **8766**, log `new_app\dashboard.log`), Ollama 0.40.7, models **qwen3:14b** (9.3 GB, 100% GPU) and **qwen3:30b-a3b** (18.6 GB, ~54% GPU) both installed; switch with the picker (RTX A2000 12 GB, 64 GB RAM, i9) | Claude Desktop connector → `new_app\mcp_server.py` pointed at the tower | Browser |
 | Access | `https://initium.tail11109.ts.net` (Tailscale serve → 127.0.0.1:8766) | same URL | same URL (Tailscale app) |
 
 Tower `new_app\config.json` (written by `tower_tune.ps1`; a model picked in the dashboard overrides it):
@@ -79,7 +79,7 @@ sooner; errors/hidden/warnings/platform keep 24h), `full_lines_per_pattern_hour`
 lines of a busy pattern stored as start+end; JSON lines always whole), `startup_hours` (2, fast start), `slim_db_over_mb`
 (800, one-time slim on start), `local_llm` {enabled, url, model, num_ctx, parallel, triage_every_minutes, triage_per_cycle,
 triage_top_n, max_input_chars}, `grouping` {drain3: "on" | "shadow" | "off", drain3_similarity 0.4}, `on_demand_wake_hours`
-(2), `profile_priority` ({"hrs": "high", …} defaults; dashboard wins), `repos_root`, `record_count_patterns`,
+(2), `gpu_vram_gb` (12, for the Health tab's GPU advice), `profile_priority` ({"hrs": "high", …} defaults; dashboard wins), `repos_root`, `record_count_patterns`,
 `partner_services`, `infra_*`, `step_functions`, `track_deploys`, `port`.
 Settings picked in the dashboard (model, context, project priorities) live in errors.db (`meta`, `profile_prefs`).
 
@@ -118,7 +118,7 @@ old long-range pulls not resumed after restart.
 - Endpoints: `GET /api/ai/status|savings|job|triage_map|summarize|claude_usage`, `POST /api/ai/read` (map-reduce reading),
   `POST /api/ai/prompt` (templates: edit, commit, fix, narrative, run, filemap), `POST /api/ai/filemap[_known]`.
 
-**Model picker** (top of Health tab; connector `more_tools("switch_model")`): list installed Ollama models, switch model +
+**Model picker** (🔁 line under the 🤖 status line on every tab, plus top of Health tab; connector `more_tools("switch_model")`): list installed Ollama models, switch model +
 context without restart (10–30 s load), download new ones in the background; persists over config.json; each switch is
 logged in the day-by-day table. Endpoints `/api/ai/models`, `/api/ai/model?name=&num_ctx=`, `/api/ai/pull?name=`.
 **Project priority** (Clients tab dropdown, profile menu shows ★ / on demand; connector `more_tools("project_priority")`):
@@ -134,6 +134,10 @@ claims not backed by lines), cache hit rate, day-by-day table with the settings 
 connector tool time/size/errors, Drain3 shadow merge candidates, system log (model errors, triage/job failures,
 crashed threads, AWS accounts disconnecting). 🤖 line also shows queue, backlog, tok/s and GPU %.
 Model calls go through a priority gate: requests Claude is waiting for run before background triage.
+**Model comparison (7 days)** on the Health tab: per model calls, tok/s out/in, avg/p95, Claude wait p95, triaged,
+unclear %, claims not backed, % on GPU (triage quality from `ai_triage`); a "what to improve next" line compares them once
+two models have 20+ calls. A model bigger than the GPU gets an explanation (judge by speed/quality) instead of a red
+"only N% on GPU" warning.
 
 ## 6. Claude connector tools
 
@@ -230,12 +234,17 @@ Troubleshooting:
 
 ## 10. Open items / next steps
 
-- **Pending on the tower**: run `python new_app\deploy_tower.py` (downloads qwen3:30b-a3b, restarts the dashboard), then
-  fully quit + reopen Claude. Then set ★ / on-demand projects on the Clients tab. Try the 30B model with the picker and
-  compare unclear % / tok/s / p95 / Claude wait in the Health day-by-day table for 1–2 days (expect slower calls: it
-  doesn't fit 12 GB, part runs on CPU; maybe context 8k).
-- Commits since 404294e (0f9f424 model picker + priority, c77beaa/19a799f deploy_tower.py, this HANDOFF) were made on the
-  tower: `git push` there, then `git pull` on the laptop.
+- **Done 2026-10-21**: deploy_tower.py ran (qwen3:30b-a3b downloaded, dashboard restarted on the new code), Claude restarted,
+  priorities set (★ high: hrs, stellaromics, anew, sterling, reliable_roofing, hiniker; others normal, none on-demand yet),
+  switched to qwen3:30b-a3b (16k context).
+- **30B model test (in progress)**: it needs 19.7 GB vs the 12 GB card, so ~54% on GPU is about the max (Ollama 0.40 already
+  keeps always-used parts on GPU, experts in RAM, as long as num_gpu isn't set). Suggested: run it at **8k** context for a
+  day, then check Health → Model comparison. Keep it if unclear % is clearly below qwen3:14b's (~19%) and p95 stays under
+  ~40 s; otherwise switch back to qwen3:14b at 16k. If it wins on quality but is too slow: llama.cpp directly with
+  `--n-cpu-moe` (expert-only offload, reportedly much faster) — bigger change.
+- Commits made on the tower and not yet pushed: 0f9f424 (model picker + priority), c77beaa/19a799f (deploy_tower.py),
+  b668089 (handoff), 5c744c2 (header switcher + model comparison + GPU advice), this handoff update. `git push` on the
+  tower, then `git pull` on the laptop. After pulling 5c744c2 the dashboard needs a restart (deploy_tower.py does it).
 - Optional: quiet the harmless `ConnectionAbortedError` tracebacks in dashboard.log (client closed the request early).
 - Next options discussed: trim `get_log_lines` / `investigate` / `fix_brief` further (tower summary + key lines);
   fix the chronic ncc / statewide issues in client code (HRS on hold); install codebase-memory-mcp on the laptop
