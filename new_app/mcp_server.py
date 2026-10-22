@@ -46,6 +46,11 @@ AUTOSTART = os.environ.get("AWS_ERROR_FEED_AUTOSTART", "1") != "0"
 REPOS = os.environ.get("AWS_ERROR_FEED_REPOS") or None
 _active = {"url": None, "at": 0.0}
 MAX_OUT = 40_000          # keep tool results a sensible size for the conversation
+LINES_SUMMARY_MIN_CHARS = 6000   # get_log_lines brief: longer than this (~1.5k tokens) -> the tower's model summarizes
+LINES_SUMMARY_READ = 200         # lines the model reads for that summary (cloud model; local if the cloud is off)
+LINES_SUMMARY_WAIT = 45          # seconds to wait for the summary, else the folded lines are returned
+PATTERNS_BRIEF_TOP = 6           # list_error_patterns brief: full entries for the top N, one line each for the rest
+PATTERNS_BRIEF_EXAMPLES = 3      # ...with an example only for the top N
 
 INSTRUCTIONS = """\
 Read-only access to the user's AWS Error Feed dashboard, which watches CloudWatch Logs and
@@ -553,8 +558,12 @@ def list_error_patterns(hours: float = 24, profile: str = "", level: str = "erro
         out.append("Lines for a pattern: get_log_lines(error_type=<type>, signature=<message>); "
                    "deeper: investigate / fix_brief.")
         chron = [g for g in rows if chronic(g)]
+        rest = []
         for i, g in enumerate([g for g in rows if not chronic(g)], 1):
-            same_sample = g["sample"].strip()[:300] == g["sig"].strip()[:300]
+            if i > PATTERNS_BRIEF_TOP:
+                rest.append(f"- {i}. [{g['level']}] {g['etype']} — {g['count']}×{flags(g, brief=True)}: {g['sig'][:140]}")
+                continue
+            same_sample = g["sample"].strip()[:300] == g["sig"].strip()[:300] or i > PATTERNS_BRIEF_EXAMPLES
             grp = top(g["log_groups"], 2)
             out += [f"\n### {i}. [{g['level']}] {g['etype']} — {g['count']}×{flags(g, brief=True)}",
                     f"message: {g['sig']}",
@@ -562,6 +571,9 @@ def list_error_patterns(hours: float = 24, profile: str = "", level: str = "erro
                     f"where: {top(g['profiles'], 3)} | {grp} | {t(g['first_seen'])[5:16]} → {t(g['last_seen'])[5:16]}"
                     + (f" | {g['last24']}/24h vs {g['prev7_daily_avg']}/day before" if g.get("last24") is not None else ""),
                     *([] if same_sample else ["example:", "```", _problem_text(g["sample"], 500), "```"])]
+        if rest:
+            out.append("\n### More (one line each; detail=\"full\" for all details):")
+            out += rest
         if chron:
             out.append(f"\n### Chronic — in nearly every run of their function, not new or spiking "
                        f"(normal output or a known, ongoing issue; investigate / fix_brief for detail):")
@@ -592,11 +604,11 @@ def list_error_patterns(hours: float = 24, profile: str = "", level: str = "erro
 def get_log_lines(hours: float = 24, profile: str = "", level: str = "", log_group: str = "",
                   log_group_prefix: str = "", search: str = "", error_type: str = "",
                   signature: str = "", limit: int = 30, detail: str = "brief") -> str:
-    """Individual log lines (newest first) with an event id for get_line_context. Filter by profile,
-    level (comma list), exact log_group or prefix, free-text search, or a pattern (error_type +
-    signature from list_error_patterns). detail="brief" (default) folds lines that repeat (×N) and
-    shortens long messages (tracebacks keep their start + the exception); detail="full" gives whole
-    messages, account and stream."""
+    """Log lines (newest first) with event ids for get_line_context. Filter by profile, level (comma
+    list), exact log_group or prefix, free-text search, or a pattern (error_type + signature from
+    list_error_patterns). detail="brief" (default): short results come back as lines; long ones are
+    read by the tower's model and come back as a summary + key event ids. detail="lines": the lines,
+    repeats folded (×N), long messages shortened. detail="full": whole messages, account and stream."""
     note = ensure_range(hours)
     r = api("/api/events", hours=hours, profile=profile, level=level, grp=log_group,
             grp_prefix=log_group_prefix, q=search, etype=error_type,
@@ -605,6 +617,7 @@ def get_log_lines(hours: float = 24, profile: str = "", level: str = "", log_gro
            f"{link(tab='all', hours=int(hours), profile=profile, level=level or 'error,suspect,warning,info', grp=log_group, q=search, etype=error_type, sig=signature if error_type else '')}"]
     if detail != "full":
         groups = {}
+        head = list(out)
         for e in r["events"]:                      # newest first: later ones in a group are older
             key = (e["profile"], e["group"], e["level"], e.get("etype"), _NUM.sub("#", e["message"][:300]))
             g = groups.get(key)
@@ -623,7 +636,35 @@ def get_log_lines(hours: float = 24, profile: str = "", level: str = "", log_gro
                     _problem_text(e["message"], 1500) if prob else cap(e["message"], 400)]
         if len(groups) < len(r["events"]):
             out.append(f"\n({len(r['events'])} lines folded into {len(groups)}; detail=\"full\" shows each line whole)")
+        if detail == "brief" and len("\n".join(out)) > LINES_SUMMARY_MIN_CHARS:
+            s = _summarize_lines(hours, profile, level, log_group, log_group_prefix, search, error_type, signature, limit)
+            if s:
+                return finish(head + s)
+            out.append("(The tower's model couldn't summarize these right now, so here are the lines.)")
         return finish(out)
+
+
+def _summarize_lines(hours, profile, level, log_group, log_group_prefix, search, error_type, signature, limit):
+    """get_log_lines brief, long result: the tower's model (cloud when on) reads the lines instead of Claude."""
+    try:
+        r = api("/api/ai/summarize", kind="lines", profile=profile, level=level, grp=log_group,
+                grp_prefix=log_group_prefix, q=search, etype=error_type, sig=signature if error_type else "",
+                hours=hours, limit=max(limit, LINES_SUMMARY_READ),
+                question="Summarize these log lines for a developer: what is failing or unusual, how often, "
+                         "which functions / records / partner APIs, and the exact key error messages. Short bullets.")
+        if r.get("error"):
+            return None
+        j = _wait_job(r["id"], LINES_SUMMARY_WAIT)
+        if j.get("status") == "running" or j.get("error") or not j.get("answer"):
+            return None
+    except Exception:
+        return None
+    who = "Cloud-model" if r.get("cloud") else "Local-model"
+    ids = r.get("event_ids") or []
+    return [f"{who} summary of {r['lines']} lines ({r.get('model', '?')}; verify key facts):", j["answer"],
+            *([f"\nKey error lines, newest first (event_id for get_line_context / locate_code): {', '.join(ids)}"]
+              if ids else []),
+            "Raw lines: same call with detail=\"lines\" (folded) or detail=\"full\"."]
     budget = MAX_OUT // max(1, len(r["events"]))
     for e in r["events"]:
         out += [f"\n--- {t(e['ts'])} | {e['profile']} ({e['account']}, {e['region']}) | {e['group']} | "
@@ -1228,14 +1269,15 @@ def summarize_logs(question: str = "", profile: str = "", level: str = "", log_g
         if r.get("error"):
             return r["error"] + " (Use get_log_lines instead.)"
         job_id, n, ids = r["id"], r["lines"], r.get("event_ids") or []
+        who = ("Cloud-model" if r.get("cloud") else "Local-model") + (f" ({r['model']})" if r.get("model") else "")
     else:
-        n, ids = None, []
+        n, ids, who = None, [], "Tower-model"
     j = _wait_job(job_id)
     if j.get("status") == "running":
         return f"The local model is still reading. Call summarize_logs(job_id=\"{job_id}\") again in ~30s."
     if j.get("error"):
         return f"Local model failed: {j['error']}. Use get_log_lines instead."
-    return finish([f"Local-model summary{f' of {n} lines' if n else ''} (verify key facts):", j.get("answer") or "",
+    return finish([f"{who} summary{f' of {n} lines' if n else ''} (verify key facts):", j.get("answer") or "",
                    *([f"\nKey error lines (event_id for get_line_context / locate_code): {', '.join(ids)}"] if ids else [])])
 
 

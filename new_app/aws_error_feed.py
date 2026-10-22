@@ -2232,8 +2232,10 @@ def make_handler(store, workers, cfg):
                 if not lines:
                     return self.json({"error": "No lines matched."})
                 jid = AIJOBS.start(question, aws_local.lines_text(lines, LLM.max_input_for(kind) - 2000), kind)
-                return self.json({"id": jid, "lines": len(lines),
-                                  "event_ids": [l.get("id") for l in lines if l.get("level") in ("error", "suspect")][:8]})
+                return self.json({"id": jid, "lines": len(lines), "model": LLM.model_for(kind),
+                                  "cloud": LLM.route(kind) == "cloud",
+                                  "event_ids": [l.get("id") for l in reversed(lines)          # newest first
+                                                if l.get("level") in ("error", "suspect")][:8]})
             if path == "/api/ai/models":
                 return self.json(PICKER.status())
             if path == "/api/ai/model":
