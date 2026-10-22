@@ -138,7 +138,7 @@ DEFAULTS = {
     "infra_scan_layer_packages": True,   # download each layer version once to list its packages
     "infra_max_layer_mb": 100,
     # Baseline for "new since yesterday" / spikes: hourly error counts kept this many days
-    "baseline_days": 30,
+    "baseline_days": 90,          # also the history behind the Clients tab's 'usual' numbers
     "seed_baseline_days": 7,      # one-time errors-only pull per account to start the baseline
     # Partner API health: service -> words that identify it in a log line (case-insensitive)
     "partner_services": {
@@ -1176,6 +1176,55 @@ def sfn_run_input(client, execution_arn, max_failures=3):
     return {"execution_arn": execution_arn, "run_input": pretty(run_input), "failures": failures}
 
 
+def deploy_impact_hourly(store, d, window_hours=24):
+    """Before/after for a deploy from the hourly counts (kept baseline_days), for when the raw lines from
+    before the deploy are no longer loaded. Whole hours only; the deploy's own hour is skipped."""
+    now_h = int(time.time() // 3600)
+    t0 = d["deployed_at"] // 3_600_000
+    W = max(1, int(round(window_hours)))
+    b0, b1, a0, a1 = t0 - W, t0, t0 + 1, min(now_h, t0 + 1 + W)
+    # only hours the run counts also cover, so errors and runs come from the same hours
+    cov_sql = "hour IN (SELECT DISTINCT hour FROM run_hours WHERE profile = ? AND hour >= ? AND hour < ?)"
+    q_bad = ("SELECT etype, sig, MAX(level), SUM(n) FROM pattern_hours WHERE profile = ? AND grp = ? "
+             f"AND {cov_sql} AND level IN ('error','suspect') GROUP BY etype, sig")
+    q_runs = "SELECT COALESCE(SUM(runs), 0) FROM run_hours WHERE profile = ? AND grp = ? AND hour >= ? AND hour < ?"
+    q_cov = "SELECT COUNT(DISTINCT hour) FROM run_hours WHERE profile = ? AND hour >= ? AND hour < ?"
+    p, g = d["profile"], d["log_group"]
+    with store.lock:
+        cov_b = store.db.execute(q_cov, (p, b0, b1)).fetchone()[0]
+        cov_a = store.db.execute(q_cov, (p, a0, a1)).fetchone()[0] if a1 > a0 else 0
+        pb = {(r[0], r[1]): (r[2], r[3]) for r in store.db.execute(q_bad, (p, g, p, b0, b1))}
+        pa = {(r[0], r[1]): (r[2], r[3]) for r in store.db.execute(q_bad, (p, g, p, a0, a1))} if a1 > a0 else {}
+        rb_n = store.db.execute(q_runs, (p, g, b0, b1)).fetchone()[0]
+        ra_n = store.db.execute(q_runs, (p, g, a0, a1)).fetchone()[0] if a1 > a0 else 0
+    if cov_b < max(1, W // 2):
+        return None                      # not enough history before the deploy either
+    lv = lambda m, l: sum(n for (lev, n) in m.values() if lev == l)
+    cb = {"error": lv(pb, "error"), "suspect": lv(pb, "suspect"), "invocations": rb_n}
+    ca = {"error": lv(pa, "error"), "suspect": lv(pa, "suspect"), "invocations": ra_n}
+    per = "invocation" if rb_n and ra_n else "hour"
+    rate = lambda c, h: (c["error"] + c["suspect"]) / (c["invocations"] if per == "invocation" else max(h, 1e-9))
+    rb, ra = rate(cb, cov_b), rate(ca, max(cov_a, 1))
+    eb, ea = cb["error"] + cb["suspect"], ca["error"] + ca["suspect"]
+    new = [k for k in pa if k not in pb and pa[k][0] == "error"]
+    if a1 - a0 < 1:
+        verdict = "too early"
+    elif new and ea:
+        verdict = "new errors"
+    elif eb and not ea:
+        verdict = "fixed"
+    elif not eb and not ea:
+        verdict = "clean"
+    elif ra < rb * 0.5:
+        verdict = "better"
+    elif ra > rb * 1.5:
+        verdict = "worse"
+    else:
+        verdict = "no change"
+    return {**d, "verdict": verdict, "before": cb, "after": ca, "rate_per": per, "rate_before": rb, "rate_after": ra,
+            "after_hours": max(a1 - a0, 0), "window_hours": W, "source": "hourly counts"}
+
+
 def deploy_impact(store, d, window_hours=24):
     """Errors / hidden errors for a function in equal windows before and after a deploy."""
     now = int(time.time() * 1000)
@@ -1355,27 +1404,29 @@ def ops_helpers(store, workers, cfg):
                                                  cfg.get("partner_function_hints"))}
 
 
-def level_counts_window(store, profile, start, end):
+def level_counts_window(store, profile, start, end, chronic=()):
+    """Errors / hidden errors in a window; hidden errors from chronic patterns are left out."""
     with store.lock:
-        rows = store.db.execute("SELECT level, COUNT(*) FROM events WHERE profile = ? AND ts >= ? AND ts < ? "
-                                "AND level IN ('error','suspect') GROUP BY level", (profile, start, end)).fetchall()
-    d = dict(rows)
-    return {"errors": d.get("error", 0), "hidden": d.get("suspect", 0)}
+        rows = store.db.execute("SELECT level, etype, sig, COUNT(*) FROM events WHERE profile = ? AND ts >= ? AND ts < ? "
+                                "AND level IN ('error','suspect') GROUP BY level, etype, sig", (profile, start, end)).fetchall()
+    return {"errors": sum(r[3] for r in rows if r[0] == "error"),
+            "hidden": sum(r[3] for r in rows if r[0] == "suspect" and (r[1], r[2]) not in chronic)}
 
 
-def error_windows(store, profile, data_from, now):
+def error_windows(store, profile, data_from, now, chronic=()):
     """Errors / hidden errors in the last 1h, 6h, 24h, each with the window just before it.
-    Uses the loaded lines when they cover the window, else the hourly counts (kept 30 days)."""
+    Uses the loaded lines when they cover the window, else the hourly counts (kept baseline_days)."""
     out = {}
     for label, hrs in (("1h", 1), ("6h", 6), ("24h", 24)):
         w = hrs * 3_600_000
-        cur = level_counts_window(store, profile, now - w, now)
+        cur = level_counts_window(store, profile, now - w, now, chronic)
         if now - 2 * w >= data_from:
-            prev = level_counts_window(store, profile, now - 2 * w, now - w)
+            prev = level_counts_window(store, profile, now - 2 * w, now - w, chronic)
         else:
             pt = store.pattern_totals(profile, now - 2 * w, now - w - 1)
             prev = ({"errors": sum(v["n"] for v in pt.values() if v["level"] == "error"),
-                     "hidden": sum(v["n"] for v in pt.values() if v["level"] == "suspect")} if pt else None)
+                     "hidden": sum(v["n"] for k, v in pt.items() if v["level"] == "suspect" and k not in chronic)}
+                    if pt else None)
         out[label] = {**cur, "prev_errors": prev["errors"] if prev else None,
                       "prev_hidden": prev["hidden"] if prev else None}
     return out
@@ -1406,16 +1457,30 @@ def clients_overview(store, workers, cfg, max_age=60):
         pats = store.annotate(store.summary({"hours": 24, "profile": prof, "level": "error,suspect", "hide_muted": "1"}), prof)
         cur, prev = store.pattern_totals(prof, now - DAY_MS, now), store.pattern_totals(prof, now - 2 * DAY_MS, now - DAY_MS)
         rt = aws_ops.run_totals(store, prof, now - DAY_MS, now)
-        hist = aws_ops.run_totals(store, prof, now - 8 * DAY_MS, now - DAY_MS)
-        hist_hours = max((now - DAY_MS) // 3_600_000 - min((v["from_hour"] for v in hist.values() if v["from_hour"]),
-                                                          default=(now - DAY_MS) // 3_600_000), 0)
+        pbase = aws_ops.profile_baseline(store, prof, now)
+        # chronic = hidden-error patterns seen nearly every day, or in nearly every run (EVERY RUN badge)
+        usual_daily = aws_ops.chronic_patterns(store, prof, now)
+        chronic = set(usual_daily) | {(g["etype"], g["sig"]) for g in pats if g.get("likely_format")}
+        jumps = []
+        for g in pats:
+            k = (g["etype"], g["sig"])
+            if g["level"] == "suspect" and k in chronic:
+                g["chronic"] = True
+                u = usual_daily.get(k)
+                if u is not None and g["count"] >= aws_ops.CHRONIC_JUMP_MIN and g["count"] >= aws_ops.CHRONIC_JUMP_RATIO * max(u, 1):
+                    jumps.append({"etype": g["etype"], "count": g["count"], "usual": u})
+        chronic_cur = {k: v for k, v in cur.items() if v["level"] == "suspect" and k in chronic}
         data_from = max((w.covered_from for w, _, _ in views), default=now)
         cov = {(w.profile, w.region): w.covered_from for w, _, _ in views}
 
         def impact(d, win=6):
-            """Before/after for one deploy; 'before' must actually be loaded or the verdict is unknown."""
+            """Before/after for one deploy; 'before' from the loaded lines, else from the hourly counts."""
             imp = deploy_impact(store, d, win)
             loaded = cov.get((d["profile"], d["region"]), now) <= d["deployed_at"] - win * 3_600_000
+            if not loaded:
+                hourly = deploy_impact_hourly(store, d, win)
+                if hourly:
+                    imp, loaded = hourly, True
             return {"function": d["function"], "at": d["deployed_at"], "label": d["label"], "kind": d["kind"],
                     "verdict": imp["verdict"] if loaded else "before not loaded", "before_loaded": loaded,
                     "before": imp["before"]["error"] + imp["before"]["suspect"],
@@ -1438,19 +1503,22 @@ def clients_overview(store, workers, cfg, max_age=60):
             "spikes": [g for g in pats if g.get("is_spike")],
             "alarms": alarms, "api5xx": api5, "nothing": nothing, "bad_deploys": bad_deps,
             "partners": partner_health(store, {"hours": 6, "profile": prof}, cfg["partner_services"],
-                                       cfg.get("partner_function_hints"))[:3],
+                                       cfg.get("partner_function_hints")),
+            "star": bool(PREFS and PREFS.priority(prof) == "high"),
+            "chronic_jumps": jumps, "chronic_24h": sum(v["n"] for v in chronic_cur.values()),
+            "chronic_patterns": len(chronic_cur), "failed_usual": pbase["failed_usual"], "baseline_days": pbase["days"],
             "near_limits": sum(1 for f in fns if any(("timeout" in x or "memory" in x) for x in f["flags"])),
             "deprecated": sum(1 for f in fns if f["runtime_status"] == "deprecated"),
             "errors_24h": sum(v["n"] for v in cur.values() if v["level"] == "error"),
             "errors_prev": sum(v["n"] for v in prev.values() if v["level"] == "error"),
-            "hidden_24h": sum(v["n"] for v in cur.values() if v["level"] == "suspect"),
-            "hidden_prev": sum(v["n"] for v in prev.values() if v["level"] == "suspect"),
+            "hidden_24h": sum(v["n"] for k, v in cur.items() if v["level"] == "suspect" and k not in chronic),
+            "hidden_prev": sum(v["n"] for k, v in prev.items() if v["level"] == "suspect" and k not in chronic),
             "runs_24h": sum(v["runs"] for v in rt.values()), "failed_runs_24h": sum(v["failed"] for v in rt.values()),
             "records_24h": sum(v["records"] for v in rt.values()),
-            "records_usual": round(sum(v["records"] for v in hist.values()) / (hist_hours / 24)) if hist_hours >= 48 else None,
+            "records_usual": pbase["records_usual"],
             "sched_ok": sum(1 for x in sched if x["status"] == "ok"), "sched_total": len(sched),
             "last_deploy": last_dep, "cost_30d": round(sum(f["cost_30d"] for f in fns), 2),
-            "windows": error_windows(store, prof, data_from, now),
+            "windows": error_windows(store, prof, data_from, now, chronic),
             "recent_deploys": sorted(recent, key=lambda x: -x["at"])[:6],
             "functions": len(fns), "accounts": [w.key for w, _, _ in views]}
         card = aws_ops.client_card(prof, parts)
@@ -2460,6 +2528,10 @@ def make_handler(store, workers, cfg):
                     imp.pop("patterns")
                     w = next((w for w in workers if w.profile == d["profile"] and w.region == d["region"]), None)
                     imp["before_loaded"] = bool(w and w.covered_from <= d["deployed_at"] - win * 3_600_000)
+                    if not imp["before_loaded"]:
+                        hourly = deploy_impact_hourly(store, d, win)
+                        if hourly:
+                            imp = {**imp, **hourly, "before_loaded": True}
                     out.append(imp)
                 return self.json(out)
             if u.path == "/api/deploy_impact":
@@ -3143,7 +3215,9 @@ async function loadClients(){
      <div>Records 24h<b>${c.records_24h||'—'}${c.records_usual?` <span class="small" style="color:var(--mute)">/ ~${c.records_usual}</span>`:''}</b></div>
      <div>Schedules<b>${c.sched_total?`${c.sched_ok}/${c.sched_total} ok`:'—'}</b></div></div>
     ${depList(c.recent_deploys)}
-    ${c.reasons.length?`<ul>${c.reasons.slice(0,6).map(r=>`<li>${esc(r)}</li>`).join('')}${c.reasons.length>6?`<li>+${c.reasons.length-6} more</li>`:''}</ul>`:'<div class="small" style="color:var(--ok)">Nothing needs attention.</div>'}
+    ${(()=>{const n=c.reasons.length-(c.info||0), main=c.reasons.slice(0,n), inf=c.reasons.slice(n);
+      return (main.length?`<ul>${main.slice(0,6).map(r=>`<li>${esc(r)}</li>`).join('')}${main.length>6?`<li>+${main.length-6} more</li>`:''}</ul>`:'<div class="small" style="color:var(--ok)">Nothing needs attention.</div>')
+       +inf.map(r=>`<div class="small" style="color:var(--mute)">${esc(r)}</div>`).join('')})()}
     <div class="foot"><span>~$${c.cost_30d}/30d</span>${c.last_deploy&&!(c.recent_deploys||[]).length?`<span>Last deploy: ${esc(c.last_deploy.function)} ${ago(c.last_deploy.at)}</span>`:''}
      <a data-go="errors" data-p="${esc(c.profile)}">errors</a><a data-go="runs" data-p="${esc(c.profile)}">runs</a><a data-go="schedules" data-p="${esc(c.profile)}">schedules</a>
      <a href="/report?profile=${encodeURIComponent(c.profile)}&days=7" target="_blank">weekly report ↗</a>${tlink(c.profile)}${prioSel(c.profile,c.priority)}</div></div>`).join('')
@@ -3483,9 +3557,11 @@ def main():
         while True:
             time.sleep(300 if n else 60)      # first pass a minute after start, then every 5 minutes
             now = int(time.time() * 1000)
-            store.rollup(now - 3 * 3_600_000, now)          # keep the hourly baseline current
+            # first pass: everything loaded (fills the hours a restart missed), then the last 3h
+            since = now - (cfg["keep_hours"] if n == 0 else 3) * 3_600_000
+            store.rollup(since, now)          # keep the hourly baseline current
             try:
-                aws_ops.rollup_runs(store, workers, now - 3 * 3_600_000, now, EXTRA_RX)
+                aws_ops.rollup_runs(store, workers, since, now, EXTRA_RX)
             except Exception as ex:
                 print("run rollup failed:", ex)
                 HEALTH.event("error", "rollup", "runs", f"{type(ex).__name__}: {ex}")

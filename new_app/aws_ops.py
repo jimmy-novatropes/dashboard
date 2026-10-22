@@ -29,6 +29,33 @@ HOUR_MS = 3_600_000
 DAY_MS = 86_400_000
 BC = BotoConfig(retries={"max_attempts": 6, "mode": "adaptive"})
 
+# ---- Client status rules (red / amber / green on the Clients tab). Change here, then deploy.
+HISTORY_DAYS = 90             # hourly run / pattern counts kept this long (the 'usual' baselines)
+BASELINE_DAYS = 14            # days of history a baseline looks at
+BASELINE_MIN_DAYS = 7         # days with data needed before 'low records' / 'zero records' are judged
+FAILED_BASELINE_MIN_DAYS = 3  # days with data needed before failed runs are compared with the usual rate
+BASELINE_MIN_DAY_HOURS = 6    # a day counts only if the dashboard saw at least this many hours of it
+CUR_MIN_HOURS = 6             # the last 24h need this many hours of data to be judged
+LOW_RECORDS_RATIO = 0.5       # 'low records' = last 24h below this share of the usual rate...
+LOW_RECORDS_MIN_DAILY = 50    # ...only for functions that usually do at least this many per day
+ZERO_STREAK = 3               # last N runs with 0 records = 'zero records' (red)...
+ZERO_MAX_USUAL_SHARE = 0.2    # ...only if usually under this share of its runs are empty
+CHRONIC_DAYS = 5              # hidden-error pattern seen on >= this many of the last CHRONIC_LOOKBACK days = chronic
+CHRONIC_LOOKBACK = 7
+CHRONIC_MIN_COVERED_DAYS = 3  # need this many days with data before anything is called chronic
+CHRONIC_JUMP_RATIO = 2.0      # chronic pattern at >= this many times its usual daily count -> amber
+CHRONIC_JUMP_MIN = 50         # ...and at least this many in 24h
+NEW_ERROR_RED_MIN = 5         # a new error type needs this many hits in 24h to make a client red...
+NEW_ERROR_RED_MIN_STAR = 3    # ...or this many on a starred client (fewer -> amber)
+NEW_HIDDEN_MIN = 5            # a new hidden-error type needs this many hits for an amber line
+FAILED_RED_MIN = 10           # failed runs in 24h needed for red...
+FAILED_RED_RATIO = 2.0        # ...and at least this many times the usual failure rate
+FAILED_RED_SHARE = 0.2        # no baseline yet: red when this share of runs failed
+AUTH_RED_MIN = 3              # auth / permission errors to a partner API in 6h -> red
+PARTNER_AMBER_MIN = 20        # other partner problems (rate limit, timeout, 5xx) in 6h -> amber
+API5XX_RED_MIN = 20           # API Gateway 5xx -> red at this many (fewer -> amber)
+ERRORS_AMBER_MIN = 50         # errors in 24h at their usual level (no spike / new type) -> amber at this many
+
 
 def init_db(store):
     with store.lock:
@@ -226,7 +253,7 @@ def rollup_runs(store, workers, since, until, extra_rx=()):
                     "DO UPDATE SET runs = MAX(runs, excluded.runs), failed = MAX(failed, excluded.failed), "
                     "records = MAX(records, excluded.records), counted = MAX(counted, excluded.counted), "
                     "zero_runs = MAX(zero_runs, excluded.zero_runs)", (profile, region, grp, h, *a))
-            store.db.execute("DELETE FROM run_hours WHERE hour < ?", (int(time.time() // 3600) - 31 * 24,))
+            store.db.execute("DELETE FROM run_hours WHERE hour < ?", (int(time.time() // 3600) - HISTORY_DAYS * 24,))
             store.db.commit()
 
 
@@ -243,43 +270,124 @@ def run_totals(store, profile, since, until, grp=None):
                 for r in store.db.execute(q + " GROUP BY grp", p)}
 
 
+# =========================================================================== baselines
+def _day_hours(hours, now_h, days):
+    """{day index: hours with data}; day 0 = the last 24h, 1 = the 24h before, ..."""
+    out = {}
+    for h in hours:
+        i = (now_h - h) // 24
+        if 0 <= i <= days:
+            out[i] = out.get(i, 0) + 1
+    return out
+
+
+def run_baselines(store, profile, now, region=None):
+    """Per function: the last 24h and the usual rate per hour-with-data over the past BASELINE_DAYS.
+    Only hours the dashboard actually saw count, so restarts / gaps don't look like 'low records'."""
+    now_h = now // HOUR_MS
+    since = now_h - 24 * (BASELINE_DAYS + 1) + 1
+    q = "SELECT grp, hour, runs, failed, records, counted, zero_runs FROM run_hours WHERE profile = ? AND hour >= ?"
+    p = [profile, since]
+    if region:
+        q += " AND region = ?"
+        p.append(region)
+    with store.lock:
+        rows = store.db.execute(q, p).fetchall()
+    dh = _day_hours({r[1] for r in rows}, now_h, BASELINE_DAYS)
+    good = [i for i in range(1, BASELINE_DAYS + 1) if dh.get(i, 0) >= BASELINE_MIN_DAY_HOURS]
+    per = {}
+    for grp, hour, runs, failed, records, counted, zero in rows:
+        i = (now_h - hour) // 24
+        d = per.setdefault(grp, {}).setdefault(i, [0, 0, 0, 0, 0])
+        for k, v in enumerate((runs, failed, records, counted, zero)):
+            d[k] += v or 0
+    out = {}
+    for grp, days in per.items():
+        def rate(k):
+            return statistics.median([days.get(i, [0] * 5)[k] / dh[i] for i in good]) if good else 0
+        hist = [days[i] for i in good if i in days]
+        cur = days.get(0, [0] * 5)
+        out[grp] = {"days": len(good), "cur_hours": dh.get(0, 0),
+                    "cur": dict(zip(("runs", "failed", "records", "counted", "zero_runs"), cur)),
+                    "rate_records": rate(2), "rate_runs": rate(0), "rate_failed": rate(1),
+                    "zero_share": (sum(d[4] for d in hist) / max(sum(d[3] for d in hist), 1)) if hist else 0}
+    return out
+
+
+def profile_baseline(store, profile, now):
+    """Whole client: last 24h vs usual, per day (None until BASELINE_MIN_DAYS of data)."""
+    b = run_baselines(store, profile, now)
+    if not b:
+        return {"days": 0, "records_usual": None, "failed_usual": None, "runs_usual": None, "cur_hours": 0}
+    days = max(v["days"] for v in b.values())
+    tot = lambda k, need: round(24 * sum(v[k] for v in b.values())) if days >= need else None
+    return {"days": days, "records_usual": tot("rate_records", FAILED_BASELINE_MIN_DAYS),
+            "failed_usual": tot("rate_failed", FAILED_BASELINE_MIN_DAYS),
+            "runs_usual": tot("rate_runs", FAILED_BASELINE_MIN_DAYS), "cur_hours": max(v["cur_hours"] for v in b.values())}
+
+
+def chronic_patterns(store, profile, now):
+    """Hidden-error patterns seen nearly every day = chronic (known, unchanged). {(etype, sig): usual per day}."""
+    now_h = now // HOUR_MS
+    since = now_h - 24 * (CHRONIC_LOOKBACK + 1) + 1
+    with store.lock:
+        cov = [r[0] for r in store.db.execute("SELECT DISTINCT hour FROM run_hours WHERE profile = ? AND hour >= ?",
+                                               (profile, since))]
+        cov += [r[0] for r in store.db.execute("SELECT DISTINCT hour FROM pattern_hours WHERE profile = ? AND hour >= ?",
+                                                (profile, since))]
+        rows = store.db.execute("SELECT etype, sig, hour, SUM(n) FROM pattern_hours WHERE profile = ? AND hour >= ? "
+                                "AND level = 'suspect' GROUP BY etype, sig, hour", (profile, since)).fetchall()
+    dh = _day_hours(set(cov), now_h, CHRONIC_LOOKBACK)
+    good = [i for i in range(1, CHRONIC_LOOKBACK + 1) if dh.get(i, 0) >= BASELINE_MIN_DAY_HOURS]
+    if len(good) < CHRONIC_MIN_COVERED_DAYS:
+        return {}
+    per = {}
+    for et, sg, hour, n in rows:
+        i = (now_h - hour) // 24
+        per.setdefault((et, sg), {}).setdefault(i, 0)
+        per[(et, sg)][i] += n or 0
+    need = min(CHRONIC_DAYS, len(good))
+    out = {}
+    for k, days in per.items():
+        if sum(1 for i in good if days.get(i)) >= need:
+            out[k] = statistics.median([days.get(i, 0) / dh[i] * 24 for i in good])
+    return out
+
+
 # =========================================================================== did nothing
 def did_nothing(store, snap, profile, region, now, extra_rx=()):
-    """Runs that processed nothing / much less than usual, and log groups that went quiet."""
+    """Runs that processed nothing / much less than usual, and log groups that went quiet.
+    Judged only against a real baseline (BASELINE_MIN_DAYS of history), per hour of data."""
     out = []
+    base_all = run_baselines(store, profile, now, region)
     for prof, reg, grp in lambda_groups(store, profile, now - DAY_MS):
         if reg != region:
             continue
-        runs = [x for x in build_runs(store, prof, reg, grp, now - DAY_MS, now, extra_rx) if x["records"] is not None]
-        if len(runs) < 3:
+        b = base_all.get(grp)
+        if not b or b["days"] < BASELINE_MIN_DAYS:
             continue
+        runs = [x for x in build_runs(store, prof, reg, grp, now - DAY_MS, now, extra_rx) if x["records"] is not None]
         recs = [x["records"] for x in runs]            # newest first
-        older = recs[3:] or recs
-        pos = [r for r in older if r > 0]
-        median = statistics.median(pos) if pos else 0
         zero_streak = 0
         for r in recs:
             if r == 0:
                 zero_streak += 1
             else:
                 break
-        base = {"profile": prof, "region": reg, "group": grp, "runs_checked": len(runs), "usual": median,
-                "latest": recs[:5]}
-        if zero_streak >= 2 and median > 0:
+        usual = b["rate_records"] * 24
+        cur = b["cur"]
+        base = {"profile": prof, "region": reg, "group": grp, "runs_checked": len(runs), "usual": round(usual),
+                "latest": recs[:5], "baseline_days": b["days"]}
+        if zero_streak >= ZERO_STREAK and usual >= 20 and b["zero_share"] < ZERO_MAX_USUAL_SHARE:
             out.append({**base, "kind": "zero records",
-                        "detail": f"Last {zero_streak} runs processed 0 records (usually ~{median:g})."})
-        elif median >= 5 and statistics.mean(recs[:3]) < 0.2 * median:
-            out.append({**base, "kind": "low records",
-                        "detail": f"Last 3 runs averaged {statistics.mean(recs[:3]):.0f} records vs usual ~{median:g}."})
-        # compare today's total with the hourly baseline once a few days exist
-        hist = run_totals(store, prof, now - 8 * DAY_MS, now - DAY_MS, grp).get(grp)
-        if hist and hist["from_hour"] and now // HOUR_MS - hist["from_hour"] >= 72 and hist["counted"]:
-            days = min(7, (now - DAY_MS) / HOUR_MS - hist["from_hour"]) / 24
-            avg = hist["records"] / max(days, 1)
-            today = sum(recs)
-            if avg >= 20 and today < 0.3 * avg and not any(o["group"] == grp for o in out):
+                        "detail": f"Last {zero_streak} runs processed 0 records (usually ~{usual:.0f}/day, "
+                                  f"{100 * b['zero_share']:.0f}% of runs empty)."})
+        elif b["cur_hours"] >= CUR_MIN_HOURS and usual >= LOW_RECORDS_MIN_DAILY and cur["counted"]:
+            now_rate = cur["records"] / b["cur_hours"]
+            if now_rate < LOW_RECORDS_RATIO * b["rate_records"]:
                 out.append({**base, "kind": "low records",
-                            "detail": f"{today} records in the last 24h vs ~{avg:.0f}/day over the past week."})
+                            "detail": f"~{now_rate * 24:.0f}/day in the last 24h vs usual ~{usual:.0f}/day "
+                                      f"(median of {b['days']} days)."})
     for grp, v in (snap.get("log_volume") or {}).items():
         if v["base24"] >= 50 and v["last24"] == 0:
             out.append({"profile": profile, "region": region, "group": grp, "kind": "silent",
@@ -829,22 +937,45 @@ def client_card(profile, parts):
     for a in parts["alarms"]:
         red.append(f"Alarm firing: {a['name']}")
     for a in parts["api5xx"]:
-        red.append(f"API {a['api']} ({a['stage']}): {a['e5']} server errors")
+        (red if a["e5"] >= API5XX_RED_MIN else amber).append(f"API {a['api']} ({a['stage']}): {a['e5']} server errors")
+    for p in parts["partners"]:
+        if p["problem"] in ("auth", "permission") and p["count"] >= AUTH_RED_MIN:
+            red.append(f"{p['service']} {p['problem']} failing: {p['count']} in 6h ({p['last_hour']} last hour)")
     for d in parts["nothing"]:
         (red if d["kind"] in ("zero records", "silent") else amber).append(
             f"{(function_from_group(d['group']) or d['group'])}: {d['kind']}")
     for d in parts["bad_deploys"]:
         red.append(f"Deploy of {d['function']} ({_ago(d['at'])}): {d['verdict']}")
     new_err = [g for g in parts["new"] if g["level"] == "error"]
-    if new_err:
-        red.append(f"{len(new_err)} new error type(s) today")
-    spikes = [g for g in parts["spikes"] if not g.get("below_threshold")]
+    need = NEW_ERROR_RED_MIN_STAR if parts.get("star") else NEW_ERROR_RED_MIN
+    big = [g for g in new_err if g.get("count", 0) >= need]
+    if big:
+        red.append(f"{len(big)} new error type(s) today ({sum(g.get('count', 0) for g in big)} hits)")
+    if len(new_err) > len(big):
+        amber.append(f"{len(new_err) - len(big)} new error type(s) today, few hits")
+    spikes = [g for g in parts["spikes"] if not g.get("below_threshold") and not g.get("chronic")]
     if spikes:
         (red if any(g["level"] == "error" for g in spikes) else amber).append(f"{len(spikes)} spiking error type(s)")
-    if [g for g in parts["new"] if g["level"] == "suspect"]:
-        amber.append("New hidden errors today")
+    new_hidden = [g for g in parts["new"] if g["level"] == "suspect" and g.get("count", 0) >= NEW_HIDDEN_MIN]
+    if new_hidden:
+        amber.append(f"{len(new_hidden)} new hidden-error type(s) today")
+    for g in parts.get("chronic_jumps", []):
+        amber.append(f"Chronic pattern jumped: {g['count']} in 24h vs usual ~{g['usual']:.0f}/day ({g['etype']})")
+    f, base = parts["failed_runs_24h"], parts.get("failed_usual")
+    if f >= FAILED_RED_MIN:
+        if base is not None:
+            if f >= FAILED_RED_RATIO * max(base, 1):
+                red.append(f"{f} failed runs in 24h (usually ~{base}/day)")
+        elif f >= FAILED_RED_SHARE * max(parts["runs_24h"], 1):
+            red.append(f"{f} of {parts['runs_24h']} runs failed in 24h")
+        else:
+            amber.append(f"{f} failed runs in 24h (no baseline yet)")
+    if not red and parts["errors_24h"] >= ERRORS_AMBER_MIN:
+        amber.append(f"{parts['errors_24h']} errors in 24h (about the usual level)")
     for p in parts["partners"]:
-        amber.append(f"{p['service']} {p['problem']}" + (" (several clients)" if p["several_clients_now"] else ""))
+        if p["problem"] not in ("auth", "permission") and p["count"] >= PARTNER_AMBER_MIN:
+            amber.append(f"{p['service']} {p['problem']}: {p['count']} in 6h"
+                         + (" (several clients)" if p["several_clients_now"] else ""))
     if parts["last_failed"]:
         amber.append(f"{len(parts['last_failed'])} scheduled job(s) failed their last run")
     if parts["near_limits"]:
@@ -852,7 +983,13 @@ def client_card(profile, parts):
     if parts["deprecated"]:
         amber.append(f"{parts['deprecated']} function(s) on deprecated runtimes")
     status = "red" if red else "amber" if amber else "green"
-    return {"profile": profile, "status": status, "reasons": red + amber, "red": len(red), "amber": len(amber),
+    info = []
+    if parts.get("chronic_24h"):
+        info.append(f"Chronic hidden errors (left out of the counts): {parts['chronic_24h']} in 24h, "
+                    f"{parts['chronic_patterns']} pattern(s)")
+    return {"profile": profile, "status": status, "reasons": red + amber + info, "red": len(red), "amber": len(amber),
+            "info": len(info),
+            **{k: parts.get(k) for k in ("chronic_24h", "chronic_patterns", "failed_usual", "baseline_days")},
             **{k: parts[k] for k in ("errors_24h", "errors_prev", "hidden_24h", "hidden_prev", "runs_24h", "failed_runs_24h",
                                      "records_24h", "records_usual", "sched_ok", "sched_total", "last_deploy", "cost_30d",
                                      "functions", "accounts", "connected", "windows", "recent_deploys")}}
