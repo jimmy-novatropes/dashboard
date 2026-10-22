@@ -207,6 +207,7 @@ class LocalLLM:
                                   c["model"], c["num_ctx"], c["max_input_chars"], self.cloud_gate, True)
             except Exception as ex:          # offline / credit used up / model missing -> local GPU
                 self.cloud_used["fallbacks"] += 1
+                _hook("count", "cloud:fallback")
                 self.cloud_used["last_error"] = f"{type(ex).__name__}: {ex}"[:300]
                 _hook("event", "warning", "cloud_model", kind, "cloud failed, used local: " + str(ex)[:250])
         return self._chat(system, user, as_json, timeout, max_tokens, kind,
@@ -263,7 +264,8 @@ class LocalLLM:
                    load_ms=ns("load_duration"), prompt_ms=ns("prompt_eval_duration"), gen_ms=ns("eval_duration"),
                    total_ms=int(1000 * (time.time() - t0)), cut_off=resp.get("done_reason") == "length")
         if cloud:
-            self.cloud_used["tokens"] += (resp.get("prompt_eval_count") or 0) + (resp.get("eval_count") or 0)
+            self.cloud_used["tokens"] += ((resp.get("prompt_eval_count") or (len(system) + len(user)) // 4)
+                                          + (resp.get("eval_count") or len(text) // 4))
             self.cloud_used["calls"] += 1
         if (resp.get("prompt_eval_count") or 0) >= num_ctx - max_tokens - 64:
             rec["truncated"] = True           # Ollama silently drops what doesn't fit num_ctx

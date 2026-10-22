@@ -8,6 +8,8 @@ Records (in errors.db, kept KEEP_DAYS days):
                 whether JSON parsed, errors.
   tool_calls  - every Claude connector tool call: time, output size, errors (reported by mcp_server).
   counters    - daily counters: cache hits/misses, triage verdicts, evidence downgrades.
+  cloud_usage - cloud model (Ollama Pro) calls per day / model / kind: tokens + estimated $ (kept
+                CLOUD_KEEP_DAYS, so a whole billing month is always there).
   sys_events  - the dashboard's own error log: model errors, triage/job failures, crashed threads,
                 AWS accounts losing/regaining their connection, settings at each start.
 
@@ -52,6 +54,20 @@ BIG_TOOL_OUTPUT_CHARS = 12000
 DRAIN_GAIN_PCT = 15               # Drain3 would cut patterns by at least this -> worth switching
 DRAIN_MIN_PATTERNS = 30
 DB_WARN_MB = 1500
+# cloud model (Ollama Pro) - config cloud_llm.{monthly_credit_usd, billing_day, prices} override these
+CLOUD_KEEP_DAYS = 400
+CLOUD_CREDIT_USD = 60.0              # usage included in the $20/month Pro plan
+CLOUD_BILLING_DAY = 22               # day of the month the plan renews (credit resets)
+CLOUD_SPEND_WARN_PCT = 80            # projected spend this cycle above this % of the credit = warning
+CLOUD_FALLBACK_PCT = 10              # % of cloud calls that fell back to the local model (24h)
+CLOUD_P95_MAX_S = 60                 # cloud answers slower than this (p95) = worth a look
+CLOUD_CAP_WARN_PCT = 80              # % of the daily token cap used today
+CLAUDE_DAILY_TOKENS_WARN = 150_000   # tokens the connector sent to Claude in one day above this = worth a look
+CLAUDE_TOOL_SHARE_WARN_PCT = 40      # one tool sending more than this % of Claude's tokens (7d) = trim candidate
+CLOUD_PRICES = {                     # $ per 1M tokens (input, output) - ollama.com/pricing, Sep 2026
+    "gpt-oss:120b": (0.15, 0.60), "gpt-oss:20b": (0.07, 0.30), "gemma4": (0.14, 0.40),
+    "nemotron-3-nano": (0.06, 0.24), "deepseek-v4-pro": (1.32, 3.96), "glm-5.3": (1.40, 4.40),
+    "kimi-k3": (3.00, 15.00)}
 
 DRAIN_LEVELS = ("error", "suspect", "warning")
 DAY_MS = 86_400_000
@@ -68,6 +84,19 @@ def _pct(a, b):
 def _p95(xs):
     xs = sorted(x for x in xs if x is not None)
     return xs[min(len(xs) - 1, int(0.95 * len(xs)))] if xs else 0
+
+
+def is_cloud(model):
+    return bool(model) and ("-cloud" in model or model.endswith(":cloud"))
+
+
+def cloud_price(model, prices):
+    """($ in, $ out) per 1M tokens for a cloud model name like gpt-oss:120b-cloud (longest match wins)."""
+    base = (model or "").replace("-cloud", "").replace(":cloud", "")
+    for k in sorted(prices, key=len, reverse=True):
+        if base == k or base.startswith(k):
+            return tuple(prices[k])
+    return None
 
 
 def _day(ms):
@@ -267,6 +296,9 @@ class Health:
                 CREATE TABLE IF NOT EXISTS sys_events(id INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER,
                     last_at INTEGER, level TEXT, source TEXT, kind TEXT, message TEXT, n INTEGER);
                 CREATE INDEX IF NOT EXISTS ix_sysev_at ON sys_events(last_at);
+                CREATE TABLE IF NOT EXISTS cloud_usage(day TEXT, model TEXT, kind TEXT, calls INTEGER,
+                    errors INTEGER, tok_in INTEGER, tok_out INTEGER, usd REAL, ms INTEGER,
+                    PRIMARY KEY(day, model, kind));
             """)
             store.db.commit()
         self.prune()
@@ -283,6 +315,7 @@ class Health:
         for t, col in (("llm_calls", "at"), ("tool_calls", "at"), ("sys_events", "last_at")):
             self._exec(f"DELETE FROM {t} WHERE {col} < ?", (cut,))
         self._exec("DELETE FROM counters WHERE day < ?", (_day(cut),))
+        self._exec("DELETE FROM cloud_usage WHERE day < ?", (_day(_now_ms() - CLOUD_KEEP_DAYS * DAY_MS),))
 
     def llm_call(self, r):
         try:
@@ -291,10 +324,23 @@ class Health:
                 r.get("err"), r.get("in_chars"), r.get("out_chars"), r.get("prompt_tok"), r.get("gen_tok"),
                 r.get("wait_ms"), r.get("load_ms"), r.get("prompt_ms"), r.get("gen_ms"), r.get("total_ms"),
                 r.get("num_ctx"), 1 if r.get("truncated") else 0, 1 if r.get("cut_off") else 0, r.get("json_ok")))
+            if is_cloud(r.get("model")):
+                ti = int(r.get("prompt_tok") or (r.get("in_chars") or 0) // 4)      # chars/4 if the cloud sends no counts
+                to = int(r.get("gen_tok") or (r.get("out_chars") or 0) // 4)
+                pr = cloud_price(r["model"], self.prices()) or (0, 0)
+                self._exec("INSERT INTO cloud_usage VALUES (?,?,?,1,?,?,?,?,?) ON CONFLICT(day, model, kind) DO UPDATE "
+                           "SET calls = calls + 1, errors = errors + excluded.errors, tok_in = tok_in + excluded.tok_in, "
+                           "tok_out = tok_out + excluded.tok_out, usd = usd + excluded.usd, ms = ms + excluded.ms",
+                           (time.strftime("%Y-%m-%d"), r["model"], r.get("kind") or "?", 1 if r.get("err") else 0,
+                            ti, to, (ti * pr[0] + to * pr[1]) / 1e6, int(r.get("total_ms") or 0)))
             if r.get("err"):
-                self.event("error", "local_model", r.get("kind") or "call", r["err"])
+                self.event("error", "cloud_model" if is_cloud(r.get("model")) else "local_model",
+                           r.get("kind") or "call", r["err"])
         except Exception as ex:
             print("health: llm_call record failed:", ex)
+
+    def prices(self):
+        return {**CLOUD_PRICES, **((self.cfg.get("cloud_llm") or {}).get("prices") or {})}
 
     def tool_call(self, tool, ms, out_chars, err=None):
         try:
@@ -343,6 +389,83 @@ class Health:
             self.event("warning", "aws", key, f"lost connection: {err}")
         elif now_ok and was_ok is False:
             self.event("info", "aws", key, "connected again")
+
+    # ---- Claude usage (what the connector sent to Claude; plan usage itself has no API on Pro/Max/Team)
+    def claude_stats(self, now):
+        rows = self._rows("SELECT at, tool, ms, out_chars, ok FROM tool_calls WHERE at >= ?", (now - 14 * DAY_MS,))
+        tok = lambda rs: sum((r["out_chars"] or 0) for r in rs) // 4
+        win = lambda since: [r for r in rows if r["at"] >= since]
+        midnight = time.mktime(time.strptime(_day(now), "%Y-%m-%d")) * 1000
+        part = lambda rs: {"calls": len(rs), "tokens": tok(rs), "errors": sum(1 for r in rs if not r["ok"]),
+                           "avg_tokens": tok(rs) // max(1, len(rs))}
+        w7 = win(now - 7 * DAY_MS)
+        total7 = max(1, tok(w7))
+        tools = {}
+        for r in w7:
+            tools.setdefault(r["tool"], []).append(r)
+        by_tool = sorted(({"tool": t, **part(rs), "share_pct": _pct(tok(rs), total7),
+                           "avg_s": round(sum(r["ms"] or 0 for r in rs) / len(rs) / 1000, 1)}
+                          for t, rs in tools.items()), key=lambda x: -x["tokens"])
+        daily = [{"day": d, **part([r for r in rows if _day(r["at"]) == d])}
+                 for d in sorted({_day(r["at"]) for r in rows}, reverse=True)]
+        return {"today": part(win(midnight)), "d7": part(w7), "d14": part(rows), "by_tool": by_tool, "daily": daily,
+                "note": "Tokens ≈ characters ÷ 4 of what the aws-error-feed connector returned to Claude. Claude's own "
+                        "reading/writing, other connectors and chats aren't included; plan limits are on claude.ai "
+                        "(Settings → Usage)."}
+
+    # ---- cloud model (Ollama Pro) usage
+    def cloud_stats(self, llm, cloud_calls, cnt, now):
+        cc = self.cfg.get("cloud_llm") or {}
+        live = llm.cloud_status() if hasattr(llm, "cloud_status") else {"enabled": False}
+        credit = float(cc.get("monthly_credit_usd") or CLOUD_CREDIT_USD)
+        bday = int(cc.get("billing_day") or CLOUD_BILLING_DAY)
+        t = time.localtime(now / 1000)
+        y, mo = (t.tm_year, t.tm_mon) if t.tm_mday >= bday else ((t.tm_year, t.tm_mon - 1) if t.tm_mon > 1 else (t.tm_year - 1, 12))
+        start = time.mktime((y, mo, min(bday, 28), 0, 0, 0, 0, 0, -1))
+        ny, nm = (y, mo + 1) if mo < 12 else (y + 1, 1)
+        end = time.mktime((ny, nm, min(bday, 28), 0, 0, 0, 0, 0, -1))
+        cycle_days = max(1, round((end - start) / 86400))
+        elapsed = max(1.0, (now / 1000 - start) / 86400)
+        start_day = time.strftime("%Y-%m-%d", time.localtime(start))
+        rows = self._rows("SELECT * FROM cloud_usage WHERE day >= ?", (min(start_day, _day(now - 13 * DAY_MS)),))
+        tot = lambda rs: {"calls": sum(r["calls"] for r in rs), "errors": sum(r["errors"] for r in rs),
+                          "tok_in": sum(r["tok_in"] for r in rs), "tok_out": sum(r["tok_out"] for r in rs),
+                          "usd": round(sum(r["usd"] for r in rs), 4)}
+        today = tot([r for r in rows if r["day"] == _day(now)])
+        cycle = tot([r for r in rows if r["day"] >= start_day])
+        week = [r for r in rows if r["day"] >= _day(now - 6 * DAY_MS)]
+        kinds = {}
+        for r in week:
+            k = kinds.setdefault(r["kind"], {"kind": r["kind"], "calls": 0, "errors": 0, "tok_in": 0, "tok_out": 0,
+                                             "usd": 0.0, "ms": 0})
+            for f in ("calls", "errors", "tok_in", "tok_out", "usd", "ms"):
+                k[f] += r[f]
+        for k in kinds.values():
+            k["avg_s"] = round(k["ms"] / max(1, k["calls"]) / 1000, 1)
+            k["tok_per_call"] = round((k["tok_in"] + k["tok_out"]) / max(1, k["calls"]))
+            k["usd"] = round(k["usd"], 4)
+        daily = []
+        for d in sorted({r["day"] for r in rows if r["day"] >= _day(now - 13 * DAY_MS)}, reverse=True):
+            daily.append({"day": d, **tot([r for r in rows if r["day"] == d])})
+        fb = lambda dd: sum(cnt.get(d, {}).get("cloud:fallback", 0) for d in dd)
+        c24 = [r for r in cloud_calls if r["at"] >= now - DAY_MS]
+        a24 = self.agg(c24)
+        local24 = self._rows("SELECT COUNT(*) AS n FROM llm_calls WHERE at >= ?", (now - DAY_MS,))[0]["n"] - len(c24)
+        fb24 = fb([_day(now)])
+        cap = live.get("daily_token_cap") or 0
+        return {"enabled": bool(live.get("enabled")), "model": live.get("model"), "live": live,
+                "credit_usd": credit, "billing_day": bday, "cycle_start": start_day,
+                "cycle_end": time.strftime("%Y-%m-%d", time.localtime(end)), "cycle_days": cycle_days,
+                "days_elapsed": round(elapsed, 1),
+                "today": today, "cycle": cycle,
+                "credit_used_pct": _pct(cycle["usd"], credit) if credit else None,
+                "projected_usd": round(cycle["usd"] / elapsed * cycle_days, 2),
+                "cap_used_pct": _pct(today["tok_in"] + today["tok_out"], cap) if cap else None,
+                "by_kind": sorted(kinds.values(), key=lambda k: -k["usd"]), "daily": daily,
+                "calls_24h": a24, "fallbacks_24h": fb24, "fallbacks_7d": fb([_day(now - i * DAY_MS) for i in range(7)]),
+                "fallback_pct_24h": _pct(fb24, len(c24) + fb24),
+                "local_calls_24h": local24, "cloud_share_pct_24h": _pct(len(c24), len(c24) + local24),
+                "background_on_cloud_7d": sum(1 for r in cloud_calls if r["kind"] in aws_local.BACKGROUND_KINDS)}
 
     # ---- reads
     def runtime(self, llm):
@@ -423,10 +546,13 @@ class Health:
         cnt = self.counters(days[0])
         merged = lambda dd: {k: sum(cnt.get(d, {}).get(k, 0) for d in dd)
                              for k in {k for d in dd for k in cnt.get(d, {})}}
+        all24 = [r for r in calls if r["at"] >= now - DAY_MS]
+        cloud_calls = [r for r in calls if is_cloud(r["model"])]
+        calls = [r for r in calls if not is_cloud(r["model"])]        # tower stats = local GPU only
         last24 = [r for r in calls if r["at"] >= now - DAY_MS]
         by_kind = {}
-        for r in last24:
-            by_kind.setdefault(r["kind"] or "?", []).append(r)
+        for r in all24:
+            by_kind.setdefault((r["kind"] or "?") + (" (cloud)" if is_cloud(r["model"]) else ""), []).append(r)
         sav = aws_local.savings(self.store, 7)
         sav_by_day = {d["day"]: d for d in sav["days"]}
         settings = self._rows("SELECT at, message FROM sys_events WHERE source='settings' ORDER BY at")
@@ -477,8 +603,8 @@ class Health:
             pass
         loaded = {x["name"]: x for x in (self.runtime(llm).get("loaded") or [])}
         by_model = []
-        for name in sorted({r["model"] for r in calls if r["model"]} | set(tq_by_model)):
-            a = self.agg([r for r in calls if r["model"] == name])
+        for name in sorted({r["model"] for r in calls + cloud_calls if r["model"]} | set(tq_by_model)):
+            a = self.agg([r for r in calls + cloud_calls if r["model"] == name])
             t = tq_by_model.get(name, {"triaged": 0, "unclear": 0, "downgraded": 0})
             lo = loaded.get(name) or {}
             by_model.append({"model": name, **a, "triaged": t["triaged"],
@@ -512,6 +638,19 @@ class Health:
             "accounts_down": sorted(k for k, v in st.items() if not v.get("ok") and v.get("error") != "starting…"),
             "db_mb": db_mb,
         }
+        snap["cloud"] = self.cloud_stats(llm, cloud_calls, cnt, now)
+        snap["claude"] = self.claude_stats(now)
+        tk = lambda rs: sum((r["prompt_tok"] or 0) + (r["gen_tok"] or 0) for r in rs)
+        cl = snap["claude"]
+        snap["overview"] = [
+            {"who": "Local model (tower GPU)", "today": tk([r for r in calls if _day(r["at"]) == _day(now)]),
+             "d7": tk(calls), "calls_today": sum(1 for r in calls if _day(r["at"]) == _day(now)), "usd_today": 0, "usd_7d": 0},
+            {"who": "Cloud model (Ollama Pro)", "today": snap["cloud"]["today"]["tok_in"] + snap["cloud"]["today"]["tok_out"],
+             "d7": sum(x["tok_in"] + x["tok_out"] for x in snap["cloud"]["by_kind"]),
+             "calls_today": snap["cloud"]["today"]["calls"], "usd_today": snap["cloud"]["today"]["usd"],
+             "usd_7d": round(sum(x["usd"] for x in snap["cloud"]["by_kind"]), 4)},
+            {"who": "Claude (via the connector)", "today": cl["today"]["tokens"], "d7": cl["d7"]["tokens"],
+             "calls_today": cl["today"]["calls"], "usd_today": None, "usd_7d": None}]
         snap["recommendations"] = recommendations(snap)
         self._snap, self._snap_at = snap, time.time()
         return snap
@@ -615,6 +754,45 @@ def recommendations(s):
                 "Check the merge candidates below; if they look right, set grouping.drain3 to \"on\" in config.json.")
         else:
             add("ok", "Grouping", f"Drain3 finds only -{d['reduction_pct']}% - the current grouping is already tight.", "")
+    c = s.get("cloud") or {}
+    if c.get("enabled"):
+        a = c["calls_24h"]
+        if c["fallbacks_24h"] and c["fallback_pct_24h"] >= CLOUD_FALLBACK_PCT:
+            add("bad", "Cloud", f"{c['fallbacks_24h']} cloud call(s) fell back to the local model in 24h "
+                f"({c['fallback_pct_24h']}%). Last error: {c['live'].get('last_error') or '?'}",
+                "On the tower: `ollama signin`; check the plan / credit at ollama.com/settings.")
+        if c["projected_usd"] > c["credit_usd"] * CLOUD_SPEND_WARN_PCT / 100:
+            big = (c["by_kind"] or [{}])[0].get("kind")
+            add("warn", "Cloud", f"Cloud spend is heading for ~${c['projected_usd']:.2f} this cycle "
+                f"({_pct(c['projected_usd'], c['credit_usd'])}% of the ${c['credit_usd']:.0f} credit).",
+                f"Lower cloud_llm.daily_token_cap, or move '{big}' to cloud_llm.local_kinds.")
+        if c["cap_used_pct"] is not None and c["cap_used_pct"] >= CLOUD_CAP_WARN_PCT:
+            add("warn", "Cloud", f"{c['cap_used_pct']}% of today's cloud token cap is used - after 100% "
+                "everything goes to the local model until tomorrow.", "Raise cloud_llm.daily_token_cap if that's expected.")
+        if c["background_on_cloud_7d"]:
+            add("warn", "Cloud", f"{c['background_on_cloud_7d']} background triage call(s) ran on the cloud (7d) - "
+                "they should stay local.", "Check cloud_llm.local_kinds contains 'triage'.")
+        if a.get("calls", 0) >= 5 and a["p95_s"] > CLOUD_P95_MAX_S:
+            add("info", "Cloud", f"Cloud answers take up to {a['p95_s']}s (p95, 24h).",
+                "Big inputs: lower cloud_llm.max_input_chars, or check ollama.com status.")
+        if a.get("calls", 0) >= 5 and a["cut_off_pct"] > CUTOFF_PCT:
+            add("info", "Cloud", f"{a['cut_off_pct']}% of cloud answers hit the max length.",
+                "Raise max_tokens for those kinds in aws_local.py (cheap on the cloud).")
+        add("ok", "Cloud", f"{c['model']}: ${c['cycle']['usd']:.2f} used this cycle "
+            f"({c['credit_used_pct']}% of ${c['credit_usd']:.0f}), heading for ~${c['projected_usd']:.2f}; today "
+            f"{c['today']['calls']} calls, {c['today']['tok_in'] + c['today']['tok_out']:,} tokens"
+            + (f" ({c['cap_used_pct']}% of the daily cap)" if c["cap_used_pct"] is not None else "") + ".", "")
+    else:
+        add("info", "Cloud", "Cloud model is off - all model work runs on the tower.",
+            "Turn it on with cloud_llm.enabled in config.json.")
+    cl = s.get("claude") or {}
+    if cl.get("today", {}).get("tokens", 0) > CLAUDE_DAILY_TOKENS_WARN:
+        add("warn", "Claude", f"The connector sent ~{cl['today']['tokens']:,} tokens to Claude today.",
+            "Start a new chat per task; prefer summarize_logs / fix_brief over get_log_lines; see the per-tool table.")
+    top = (cl.get("by_tool") or [None])[0]
+    if top and cl["d7"]["tokens"] >= MIN_CLAUDE_TOKENS_FOR_SAVINGS and top["share_pct"] > CLAUDE_TOOL_SHARE_WARN_PCT:
+        add("info", "Claude", f"{top['tool']} sent {top['share_pct']}% of Claude's connector tokens (7d), "
+            f"~{top['avg_tokens']:,} per call.", "Candidate for a briefer default or a tower/cloud summary first.")
     e = s["events_24h"].get("error", 0)
     if e:
         add("warn", "System", f"{e} internal error(s) in 24h - see the system log.", "")
@@ -647,6 +825,24 @@ def text_report(s):
                      f"{m.get('gen_tps')} tok/s out, {m.get('prompt_tps')} tok/s in, avg {m.get('avg_s')}s p95 {m.get('p95_s')}s, "
                      f"triaged {m['triaged']} (unclear {m['unclear_pct']}%, unbacked {m['downgraded_pct']}%)"
                      + (f", {m['gpu_pct']}% on GPU" if m.get("gpu_pct") is not None else ""))
+    c = s.get("cloud") or {}
+    if c.get("enabled"):
+        lines.append(f"CLOUD {c['model']}: cycle {c['cycle_start']}..{c['cycle_end']} ${c['cycle']['usd']:.2f} of "
+                     f"${c['credit_usd']:.0f} ({c['credit_used_pct']}%), projected ${c['projected_usd']:.2f}; today "
+                     f"{c['today']['calls']} calls, {k(c['today']['tok_in'])} in / {k(c['today']['tok_out'])} out, "
+                     f"${c['today']['usd']:.3f}, cap {c['cap_used_pct']}%; 24h p95 {c['calls_24h'].get('p95_s')}s, "
+                     f"fallbacks {c['fallbacks_24h']} ({c['fallback_pct_24h']}%), cloud share {c['cloud_share_pct_24h']}% "
+                     f"of model calls, background-on-cloud 7d {c['background_on_cloud_7d']}")
+        for x in c["by_kind"][:6]:
+            lines.append(f"  {x['kind']}: {x['calls']} calls 7d, ~{x['tok_per_call']} tok/call, avg {x['avg_s']}s, "
+                         f"${x['usd']:.3f}" + (f", {x['errors']} errors" if x["errors"] else ""))
+    else:
+        lines.append("CLOUD: off")
+    cl = s.get("claude") or {}
+    if cl:
+        lines.append(f"CLAUDE (connector -> Claude, ~chars/4): today {cl['today']['calls']} calls ~{k(cl['today']['tokens'])} tokens; "
+                     f"7d {cl['d7']['calls']} calls ~{k(cl['d7']['tokens'])}; top 7d: "
+                     + ", ".join(f"{x['tool']} {x['share_pct']}%" for x in cl["by_tool"][:4]))
     t = s["triage"]["7d"]
     lines.append(f"TRIAGE 7d: {t['triaged']} verdicts {t['verdicts']}, unclear {t['unclear_pct']}%, "
                  f"downgraded {t['downgraded_pct']}%, backlog {s['triage']['backlog']}")
