@@ -65,6 +65,7 @@ import aws_local  # noqa: E402  (optional local model via Ollama: triage + summa
 import aws_health  # noqa: E402 (health / efficiency stats, system log, Drain3 shadow grouping)
 import aws_prefs  # noqa: E402  (project priority / on-demand projects, local model picker)
 import aws_tasks  # noqa: E402  (tasks / follow-ups, kept in tasks.db)
+import aws_intake  # noqa: E402  (daily: yesterday's Gmail + Fireflies -> proposed tasks)
 DAY_MS = 86_400_000
 LEVELS = ("error", "suspect", "warning", "info", "platform")
 
@@ -2161,6 +2162,7 @@ PREFS = None
 PICKER = None
 CODE = None
 TASKS = None
+INTAKE = None
 
 
 def make_handler(store, workers, cfg):
@@ -2386,6 +2388,16 @@ def make_handler(store, workers, cfg):
                     return self.json(TASKS.get(q.get("id") or 0) or {"error": "not found"})
                 if path == "/api/tasks/delete":
                     return self.json({"deleted": TASKS.delete(q.get("id") or 0)})
+                if path == "/api/tasks/intake":
+                    return self.json(INTAKE.status() if INTAKE else {"error": "intake not loaded"})
+                if path == "/api/tasks/intake/run":          # in the background; poll /api/tasks/intake
+                    if not INTAKE:
+                        return self.json({"error": "intake not loaded"})
+                    if INTAKE.busy:
+                        return self.json({"started": False, "error": "already running"})
+                    day = aws_intake.dt.date.fromisoformat(q["day"]) if q.get("day") else None
+                    threading.Thread(target=INTAKE.run_day, args=(day,), daemon=True).start()
+                    return self.json({"started": True})
             except (ValueError, TypeError) as ex:
                 return self.json({"error": str(ex)})
             return self.send(404, "not found", "text/plain")
@@ -2734,11 +2746,12 @@ tr.click:hover{background:var(--bg);cursor:pointer}
  <div id="v-tasks" class="view">
   <p class="help">Your tasks and follow-ups, kept on the tower in <b>tasks.db</b> (separate from the 24h error cache; never cleaned up, never synced anywhere). Add them by hand, with "+ task" on a pattern, or ask Claude: <i>"look at my task list and my emails from the last 2 days and add the new tasks"</i>. From emails only the request, the reason and any links are stored. Click a row for details.</p>
   <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px">
-   <select id="tStatus"><option value="">Not done + done in the last 7 days</option><option value="open,in_progress,waiting">Not done</option><option value="open">Open</option><option value="in_progress">In progress</option><option value="waiting">Waiting</option><option value="done">Done</option><option value="all">All</option></select>
+   <select id="tStatus"><option value="">Not done + done in the last 7 days</option><option value="open,in_progress,waiting">Not done</option><option value="open">Open</option><option value="in_progress">In progress</option><option value="waiting">Waiting</option><option value="done">Done</option><option value="proposed">Proposed</option><option value="dismissed">Dismissed</option><option value="all">All</option></select>
    <select id="tClient"><option value="">All clients</option></select>
    <input id="tQ" placeholder="search…" style="min-width:140px">
    <button id="tAddBtn">+ Add task</button>
   </div>
+  <div id="tIntake" class="small" style="margin:0 0 8px"></div><div id="tProposed"></div>
   <form id="tForm" class="ev info" style="display:none;padding:10px 14px;margin-bottom:10px">
    <b id="tFormH">New task</b>
    <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:8px;margin:8px 0">
@@ -3146,12 +3159,31 @@ async function loadPrefs(){try{const r=await getJ('/api/prefs');PRIO={};r.profil
 function bindPrio(root){root.querySelectorAll('select.prio').forEach(sel=>{sel.onclick=e=>e.stopPropagation();sel.onchange=async()=>{await getJ('/api/prefs/set?'+new URLSearchParams({profile:sel.dataset.p,priority:sel.value}));await loadPrefs();refresh(null,true)}})}
 // ---------------------------------------------------------------- tasks (tasks.db)
 let taskRows=[], taskOpen=new Set(), taskEdit=null, taskClient=null, tqTimer=null;
-const TST={open:'open',in_progress:'in progress',waiting:'waiting',done:'done'};
+const TST={open:'open',in_progress:'in progress',waiting:'waiting',done:'done',proposed:'proposed',dismissed:'dismissed'};
+async function loadIntake(){
+  const [st,pr]=await Promise.all([getJ('/api/tasks/intake').catch(()=>({})),getJ('/api/tasks?status=proposed').catch(()=>({items:[]}))]);
+  const last=(st.runs||[])[0], warn=[];
+  if(st.enabled===false)warn.push('off (set intake.enabled in config.json)');
+  if(st.enabled&&!st.gmail)warn.push('Gmail not signed in');
+  if(st.enabled&&!st.fireflies)warn.push('no Fireflies key');
+  $('tIntake').innerHTML=`📬 <b>Daily intake</b> ${st.run_at?'at '+esc(st.run_at):''} — `+(st.busy?'running now…':last?`last: ${esc(last.day)} → ${last.emails} emails, ${last.meetings} meetings, <b>${last.added}</b> proposed${last.error?` <span style="color:var(--err)">(${esc(last.error)})</span>`:''}`:'not run yet')
+    +(warn.length?` · <span style="color:var(--sus)">${esc(warn.join(', '))}</span>`:'')+` · <a id="tIntakeRun">run now</a>`;
+  $('tIntakeRun').onclick=async()=>{$('tIntakeRun').textContent='starting…';await getJ('/api/tasks/intake/run');setTimeout(loadTasks,4000)};
+  if(st.busy)setTimeout(loadTasks,8000);
+  const items=pr.items||[];
+  $('tProposed').innerHTML=items.length?`<div class="ev info" style="padding:8px 12px;margin-bottom:10px"><b>Proposed from yesterday's mail & meetings (${items.length})</b> <button class="act" id="tAccAll">accept all</button>
+    ${items.map(t=>`<div style="border-top:1px solid var(--line);padding:6px 0" data-pid="${t.id}"><button class="act" data-pa="open">accept</button><button class="act" data-pa="dismissed">dismiss</button>
+     <b>${esc(t.title)}</b>${t.client?` · ${esc(t.client)}`:''}${t.due?` · due ${esc(t.due)}`:''}${t.priority==='high'?' · <span style="color:var(--err)">high</span>':''} <span class="small" style="color:var(--mute)">${esc(t.source||'')}${t.requester?' from '+esc(t.requester):''}</span>
+     <div class="small">${esc(t.request||'')}${t.reason?` <i>— ${esc(t.reason)}</i>`:''}${(t.links||[]).map(l=>` <a href="${esc(l)}" target="_blank" rel="noopener">open ↗</a>`).join('')}</div></div>`).join('')}</div>`:'';
+  $('tProposed').querySelectorAll('[data-pa]').forEach(b=>b.onclick=async()=>{await postJ('/api/tasks/update',{id:+b.closest('[data-pid]').dataset.pid,status:b.dataset.pa});loadTasks()});
+  const aa=$('tAccAll'); if(aa)aa.onclick=async()=>{for(const t of items)await postJ('/api/tasks/update',{id:t.id,status:'open'});loadTasks()};
+}
 const postJ=async(u,b)=>(await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)})).json();
 const todayStr=()=>new Date().toLocaleDateString('sv');
 const tSel=(k,v,opts,lab)=>`<select class="tsel" data-k="${k}" style="font-size:12px;padding:1px 4px">${opts.map(o=>`<option value="${o}"${o===v?' selected':''}>${esc(lab?lab[o]:o)}</option>`).join('')}</select>`;
 const tDetail=t=>`<div style="padding:6px 4px;font-size:13px;line-height:1.5">${t.request?`<div style="white-space:pre-wrap"><b>Request:</b> ${esc(t.request)}</div>`:''}${t.reason?`<div style="white-space:pre-wrap"><b>Why:</b> ${esc(t.reason)}</div>`:''}${(t.links||[]).length?`<div><b>Links:</b> ${t.links.map(l=>`<a href="${esc(l)}" target="_blank" rel="noopener">${esc(l.length>70?l.slice(0,70)+'…':l)}</a>`).join(' · ')}</div>`:''}${t.notes?`<div style="white-space:pre-wrap"><b>Notes:</b> ${esc(t.notes)}</div>`:''}${t.error_ref?`<div class="small">Error pattern: ${esc(t.error_ref)}</div>`:''}<div class="small" style="color:var(--mute)">#${t.id} · ${esc(t.source||'manual')} · added ${ago(t.created)}${t.done_at?' · done '+ago(t.done_at):''}</div></div>`;
 async function loadTasks(){
+  loadIntake();
   const cur=taskClient!=null?taskClient:$('tClient').value; taskClient=null;
   const p=new URLSearchParams({status:$('tStatus').value,client:cur,q:$('tQ').value.trim()});
   const [r,cl]=await Promise.all([getJ('/api/tasks?'+p),getJ('/api/tasks/clients')]);
@@ -3512,6 +3544,11 @@ def main():
     global TASKS
     TASKS = aws_tasks.open_db(HERE, cfg)
     print(f"Tasks: {TASKS.path}")
+    global INTAKE
+    INTAKE = aws_intake.Intake(LLM, TASKS, cfg, HERE, lambda: sorted({w.profile for w in workers}))
+    INTAKE.start()
+    print("Daily intake:", f"on, {INTAKE.run_at} (Gmail {'signed in' if INTAKE.status()['gmail'] else 'NOT signed in'}, "
+          f"Fireflies {'key set' if INTAKE.ff_key else 'NO key'})" if INTAKE.enabled else "off (intake.enabled in config.json)")
     PICKER = aws_local_picker = aws_prefs.ModelPicker(LLM, PREFS, HEALTH)
     if aws_local_picker.source == "dashboard":
         print(f"Local model picked in the dashboard: {LLM.model} (num_ctx {LLM.num_ctx})")

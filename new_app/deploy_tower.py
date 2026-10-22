@@ -5,7 +5,8 @@ Tower deploy helper for the AWS Error Feed - ONE STEP after any change. Run on t
   2. commits the changed app files locally (COMMIT); pushing to GitHub is off by default (PUSH) - push yourself
   3. downloads an extra Ollama model (MODEL_TO_INSTALL, skipped if empty or already installed)
   4. stops the running dashboard and starts it again (scheduled task "AWS Error Feed")
-  5. waits until it answers and prints a short status (local + cloud model, tasks.db, end of dashboard.log)
+  5. waits until it answers and prints a short status (local + cloud model, tasks.db, daily intake, end of dashboard.log)
+  Daily intake: installs its packages if missing; GMAIL_SIGN_IN once for Gmail; INTAKE_RUN_NOW to test it.
   6. says whether Claude must be restarted (only when mcp_server.py changed since the last run)
 """
 import json
@@ -24,7 +25,11 @@ COMMIT_PATHS = [".gitignore", "CLAUDE.md", "new_app", "old_app", "logging_kit"] 
 COMMIT_TRAILER = ("Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\n"
                   "Claude-Session: https://claude.ai/code/session_011KCTv4MMSvGb1qCJvzuc34")
 CHECK_FILES = ["aws_error_feed.py", "aws_tasks.py", "aws_local.py", "aws_ops.py", "aws_health.py",
-               "aws_prefs.py", "aws_infra.py", "mcp_server.py"]
+               "aws_prefs.py", "aws_infra.py", "aws_intake.py", "mcp_server.py"]
+GMAIL_SIGN_IN = False                   # True ONCE: opens the browser to allow read-only Gmail for the daily intake
+INTAKE_RUN_NOW = False                  # True = run the daily intake for yesterday after the restart (to test it)
+INTAKE_PACKAGES = {"google.auth": "google-auth", "google_auth_oauthlib": "google-auth-oauthlib",
+                   "requests": "requests"}   # import name -> pip name, installed if missing
 MODEL_TO_INSTALL = ""                   # e.g. "qwen3:30b-a3b"; "" = don't download anything
 SWITCH_TO_NEW_MODEL = False             # True = make it the active model after the restart
 NEW_MODEL_CONTEXT = 8192                # context used if SWITCH_TO_NEW_MODEL is True
@@ -150,6 +155,50 @@ def install_model(name):
     return True
 
 
+# ------------------------------------------------------------------ 3b. daily intake (Gmail + Fireflies)
+def intake_setup():
+    import importlib
+    missing = []
+    for mod, pkg in INTAKE_PACKAGES.items():
+        try:
+            importlib.import_module(mod)
+        except ImportError:
+            missing.append(pkg)
+    if missing:
+        say("Installing packages for the daily intake: " + ", ".join(missing))
+        code, out = run([sys.executable, "-m", "pip", "install", "--quiet"] + missing)
+        print(out.splitlines()[-1] if out else "ok")
+    if GMAIL_SIGN_IN:
+        say("Gmail sign-in: a browser window opens - pick your account and allow read-only access")
+        try:
+            sys.path.insert(0, HERE)
+            import aws_intake
+            aws_intake.gmail_sign_in(HERE)
+            print("signed in - gmail_token.json saved (set GMAIL_SIGN_IN back to False)")
+        except Exception as ex:
+            print("!! Gmail sign-in failed:", ex)
+
+
+def intake_run_now():
+    say("Running the daily intake for yesterday")
+    try:
+        r = get_json(DASHBOARD_URL + "/api/tasks/intake/run", timeout=30)
+        if r.get("error"):
+            print("!!", r["error"])
+            return
+        t0 = time.time()
+        while time.time() - t0 < 900:
+            time.sleep(10)
+            st = get_json(DASHBOARD_URL + "/api/tasks/intake")
+            if not st.get("busy"):
+                break
+        last = (st.get("runs") or [{}])[0]
+        print(f"{last.get('day')}: {last.get('emails')} emails, {last.get('meetings')} meetings -> "
+              f"{last.get('added')} proposed task(s)" + (f"\n!! {last['error']}" if last.get("error") else ""))
+    except Exception as ex:
+        print("!! intake run failed:", ex)
+
+
 # ------------------------------------------------------------------ 4. restart the dashboard
 def restart_dashboard():
     say("Stopping the dashboard")
@@ -244,6 +293,15 @@ def report():
     except Exception as ex:
         print("priorities not answering:", ex)
     try:
+        s = get_json(DASHBOARD_URL + "/api/tasks/intake")
+        last = (s.get("runs") or [{}])[0]
+        print("daily intake :", (f"on at {s['run_at']} - Gmail {'signed in' if s['gmail'] else 'NOT signed in'}, "
+                                 f"Fireflies {'key set' if s['fireflies'] else 'NO key'}" if s.get("enabled")
+                                 else "off (intake.enabled in config.json)")
+              + (f"; last {last.get('day')}: {last.get('added')} proposed" if last.get("day") else ""))
+    except Exception as ex:
+        print("daily intake : not answering:", ex)
+    try:
         with open(LOG, encoding="utf-8", errors="replace") as f:
             tail = f.readlines()[-12:]
         print("\n--- end of dashboard.log ---\n" + "".join(tail).rstrip())
@@ -260,10 +318,13 @@ if __name__ == "__main__":
     if COMMIT:
         commit_and_push()
     model_ok = install_model(MODEL_TO_INSTALL) if MODEL_TO_INSTALL else False
+    intake_setup()
     if restart_dashboard():
         up = wait_for_dashboard()
         if up and SWITCH_TO_NEW_MODEL and model_ok:
             switch_model(MODEL_TO_INSTALL, NEW_MODEL_CONTEXT)
+        if up and INTAKE_RUN_NOW:
+            intake_run_now()
     report()
     if claude_restart_needed():
         say("Done. RESTART CLAUDE: YES - the connector changed. After you push: on the laptop `git pull` in the "

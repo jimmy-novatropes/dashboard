@@ -6,7 +6,8 @@ What goes in: things you need to do - from emails (Claude reads your mail in a c
 the tasks_add tool), from error patterns ("+ task" in the dashboard) or added by hand.
 From an email only the request, the reason and any links are kept - never the email body.
 
-Statuses: open, in_progress, waiting, done.   Priorities: high, normal, low.
+Statuses: open, in_progress, waiting, done; proposed (added by the daily intake, waiting for you to accept)
+and dismissed (a proposed task you said no to - kept so it isn't proposed again).   Priorities: high, normal, low.
 Duplicates: an item with the same external_id (e.g. the Gmail thread id), or an open item with the same
 title + client, is updated instead of added twice.
 """
@@ -17,7 +18,8 @@ import sqlite3
 import threading
 import time
 
-STATUSES = ("open", "in_progress", "waiting", "done")
+STATUSES = ("open", "in_progress", "waiting", "done", "proposed", "dismissed")
+HIDDEN = ("proposed", "dismissed")      # not in the normal list / counts until accepted
 PRIORITIES = ("high", "normal", "low")
 SOURCES = ("email", "error", "meeting", "manual")
 FIELDS = ("title", "request", "reason", "links", "client", "requester", "source", "status", "priority",
@@ -209,7 +211,7 @@ class TaskDB:
         """status: '' = everything not done + items done in the last done_days; 'all'; or a comma list."""
         sql, args = "SELECT * FROM items WHERE 1=1", []
         if status in ("", None):
-            sql += " AND (status != 'done' OR done_at >= ?)"
+            sql += " AND status NOT IN ('proposed','dismissed') AND (status != 'done' OR done_at >= ?)"
             args.append(_now() - int(float(done_days or 0) * 86_400_000))
         elif status != "all":
             st = [s.strip() for s in status.split(",") if s.strip()]
@@ -233,7 +235,7 @@ class TaskDB:
         with self.lock:
             rows = self.db.execute(
                 "SELECT ifnull(client,''), count(*), sum(CASE WHEN due IS NOT NULL AND due < ? THEN 1 ELSE 0 END) "
-                "FROM items WHERE status != 'done' GROUP BY 1", (today,)).fetchall()
+                "FROM items WHERE status NOT IN ('done','proposed','dismissed') GROUP BY 1", (today,)).fetchall()
         return {r[0]: {"open": r[1], "overdue": r[2] or 0} for r in rows}
 
     def clients(self):

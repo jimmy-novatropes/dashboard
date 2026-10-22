@@ -8,3 +8,6 @@ last_deploy.json
 repos.json
 __pycache__/
 .idea/
+gmail_client.json
+gmail_token.json
+config.json.bak*
