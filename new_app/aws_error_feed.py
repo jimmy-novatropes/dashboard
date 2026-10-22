@@ -66,6 +66,7 @@ import aws_health  # noqa: E402 (health / efficiency stats, system log, Drain3 s
 import aws_prefs  # noqa: E402  (project priority / on-demand projects, local model picker)
 import aws_tasks  # noqa: E402  (tasks / follow-ups, kept in tasks.db)
 import aws_intake  # noqa: E402  (daily: yesterday's Gmail + Fireflies -> proposed tasks)
+import aws_brief  # noqa: E402  (daily morning brief written by the tower's model)
 DAY_MS = 86_400_000
 LEVELS = ("error", "suspect", "warning", "info", "platform")
 
@@ -1405,6 +1406,46 @@ def ops_helpers(store, workers, cfg):
                                                  cfg.get("partner_function_hints"))}
 
 
+def brief_context(store, workers, cfg):
+    """Everything the morning brief is written from: client cards, hot patterns of red / amber clients, tasks."""
+    cards = clients_overview(store, workers, cfg, max_age=300)
+    out = [f"Snapshot {time.strftime('%Y-%m-%d %H:%M')} (tower time). Red = broken, amber = watch."]
+    for c in cards:
+        if c.get("asleep"):
+            continue
+        out.append(f"\n## {'(priority) ' if c.get('priority') == 'high' else ''}{c['profile']}: {c['status'].upper()}")
+        out.append(f"errors 24h {c.get('errors_24h')} (day before {c.get('errors_prev')}), hidden {c.get('hidden_24h')} "
+                   f"(day before {c.get('hidden_prev')}), runs {c.get('runs_24h')} ({c.get('failed_runs_24h')} failed, "
+                   f"usual ~{c.get('failed_usual')}/day), records {c.get('records_24h')} (usual ~{c.get('records_usual')}/day)")
+        out += [f"- {r}" for r in (c.get("reasons") or [])[:12]]
+        out += [f"- deploy {d['function']} {_ago_s(d['at'])}: {d['verdict']}" for d in c.get("recent_deploys") or []]
+        if c["status"] not in ("red", "amber"):
+            continue
+        pats = store.annotate(store.summary({"hours": 24, "profile": c["profile"], "level": "error,suspect",
+                                             "hide_muted": "1"}), c["profile"])
+        hot = [g for g in pats if (g.get("is_new") or g.get("is_spike") or g.get("regression"))
+               and not g.get("likely_format")][:aws_brief.MAX_PATTERNS]
+        for g in hot:
+            a = g.get("ai") or {}
+            tag = "REGRESSION" if g.get("regression") else "NEW" if g.get("is_new") else "SPIKE"
+            out.append(f"  * [{g['level']}] {g['etype']}: {g['sig'][:200]} - {g['count']}x {tag} in "
+                       f"{', '.join(list(g.get('log_groups') or {})[:2])}"
+                       + (f" | tower triage: {a.get('verdict')}: {str(a.get('summary') or a.get('cause') or '')[:200]}" if a else ""))
+    if TASKS:
+        today = time.strftime("%Y-%m-%d")
+        prop = TASKS.list("proposed")
+        over = [t for t in TASKS.list("open,in_progress,waiting") if t.get("due") and t["due"] < today]
+        out.append(f"\n## Tasks\nproposed from yesterday's mail / meetings: {len(prop)}"
+                   + (": " + "; ".join(f"{t['title']} ({t.get('client') or '-'})" for t in prop[:10]) if prop else ""))
+        out.append(f"overdue: {len(over)}" + (": " + "; ".join(f"{t['title']} (due {t['due']})" for t in over[:10]) if over else ""))
+    return "\n".join(out)
+
+
+def _ago_s(ms):
+    h = (time.time() * 1000 - ms) / 3_600_000
+    return f"{h:.0f}h ago" if h < 48 else f"{h / 24:.0f}d ago"
+
+
 def level_counts_window(store, profile, start, end, chronic=()):
     """Errors / hidden errors in a window; hidden errors from chronic patterns are left out."""
     with store.lock:
@@ -2163,6 +2204,7 @@ PICKER = None
 CODE = None
 TASKS = None
 INTAKE = None
+BRIEF = None
 
 
 def make_handler(store, workers, cfg):
@@ -2491,6 +2533,13 @@ def make_handler(store, workers, cfg):
                                                  [l for l in q.get("notify", "error").split(",") if l]))
             if u.path == "/api/status":
                 return self.json(store.get_status())
+            if u.path == "/api/ai/brief":
+                if not BRIEF:
+                    return self.json({"error": "brief not loaded"})
+                if q.get("refresh") and not BRIEF.busy:
+                    threading.Thread(target=BRIEF.make, daemon=True).start()
+                    return self.json({"started": True, **BRIEF.latest(), "busy": True})
+                return self.json(BRIEF.latest())
             if u.path in ("/api/health", "/api/health/text"):
                 snap = HEALTH.snapshot(LLM, TRIAGE, DRAIN, cfg["keep_hours"], force=bool(q.get("force")))
                 if u.path.endswith("/text"):
@@ -2742,7 +2791,7 @@ tr.click:hover{background:var(--bg);cursor:pointer}
 <main>
  <div id="v-clients" class="view on">
   <p class="help">Status of every client at a glance: <b style="color:var(--err)">red</b> = something is broken (jobs not running, regressions, alarms, server errors, syncs that did nothing), <b style="color:var(--sus)">amber</b> = worth a look, <b style="color:var(--ok)">green</b> = all quiet. Click a client to open its errors; "report" opens a printable health report.</p>
-  <div id="clientCards" class="cards"></div><div id="clientSleep"></div></div>
+  <div id="clientBrief"></div><div id="clientCards" class="cards"></div><div id="clientSleep"></div></div>
  <div id="v-tasks" class="view">
   <p class="help">Your tasks and follow-ups, kept on the tower in <b>tasks.db</b> (separate from the 24h error cache; never cleaned up, never synced anywhere). Add them by hand, with "+ task" on a pattern, or ask Claude: <i>"look at my task list and my emails from the last 2 days and add the new tasks"</i>. From emails only the request, the reason and any links are stored. Click a row for details.</p>
   <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px">
@@ -3235,8 +3284,18 @@ $('tForm').onsubmit=async e=>{e.preventDefault(); const f=e.target, b={};
   const r=taskEdit?await postJ('/api/tasks/update',{id:taskEdit.id,...b}):await postJ('/api/tasks/add',{items:[{...b,source:'manual'}]});
   if(r.error||(r.errors||[]).length){$('tFormErr').textContent=r.error||r.errors.join('; ');return}
   f.style.display='none'; taskEdit=null; loadTasks()};
+let BRIEF_OPEN=null;
+async function loadBrief(refresh){
+  const b=await getJ('/api/ai/brief'+(refresh?'?refresh=1':'')).catch(()=>({}));
+  if(b.error){$('clientBrief').innerHTML='';return}
+  $('clientBrief').innerHTML=`<details id="briefBox" class="ev info" style="padding:8px 12px;margin-bottom:10px"${(BRIEF_OPEN??!!b.text)?' open':''}><summary><b>☀ Morning brief</b> <span class="small" style="color:var(--mute)">${b.busy?'writing…':b.at?ago(b.at)+(b.error?' - failed: '+esc(b.error):''):'not written yet (daily at 10:20)'}</span> <a id="briefRefresh">${b.busy?'':'rewrite now'}</a></summary>
+    <div style="white-space:pre-wrap;font-size:13px;line-height:1.5;margin-top:6px">${esc(b.text||'')}</div></details>`;
+  const r=$('briefRefresh'); if(r)r.onclick=e=>{e.preventDefault();loadBrief(true)};
+  $('briefBox').ontoggle=()=>{BRIEF_OPEN=$('briefBox').open};
+  if(b.busy)setTimeout(()=>loadBrief(false),8000);
+}
 async function loadClients(){
-  const all=await getJ('/api/ops/clients'); loadPrefs();
+  const all=await getJ('/api/ops/clients'); loadPrefs(); loadBrief(false);
   const tc=await getJ('/api/tasks/counts').catch(()=>({})); $('n-tasks').textContent=Object.values(tc).reduce((s,x)=>s+x.open,0)||'';
   const tlink=p=>{const x=tc[p];return x?`<a data-tasks="${esc(p)}"${x.overdue?' style="color:var(--err)"':''}>${x.open} task${x.open>1?'s':''}${x.overdue?` (${x.overdue} overdue)`:''}</a>`:''};
   const cards=all.filter(c=>!c.asleep), sleeping=all.filter(c=>c.asleep);
@@ -3547,6 +3606,9 @@ def main():
     global INTAKE
     INTAKE = aws_intake.Intake(LLM, TASKS, cfg, HERE, lambda: sorted({w.profile for w in workers}))
     INTAKE.start()
+    global BRIEF
+    BRIEF = aws_brief.Brief(LLM, TASKS, lambda: brief_context(store, workers, cfg), *aws_local.TEMPLATES["brief"])
+    BRIEF.start()
     print("Daily intake:", f"on, {INTAKE.run_at} (Gmail {'signed in' if INTAKE.status()['gmail'] else 'NOT signed in'}, "
           f"Fireflies {'key set' if INTAKE.ff_key else 'NO key'})" if INTAKE.enabled else "off (intake.enabled in config.json)")
     PICKER = aws_local_picker = aws_prefs.ModelPicker(LLM, PREFS, HEALTH)

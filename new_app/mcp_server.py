@@ -25,6 +25,7 @@ Several machines (e.g. tower runs the dashboard + local model, laptop runs Claud
                          machine's repo copies, so file paths / VS Code links point at the laptop.
 """
 import json
+import re
 import os
 import subprocess
 import sys
@@ -51,67 +52,36 @@ LINES_SUMMARY_READ = 200         # lines the model reads for that summary (cloud
 LINES_SUMMARY_WAIT = 45          # seconds to wait for the summary, else the folded lines are returned
 PATTERNS_BRIEF_TOP = 6           # list_error_patterns brief: full entries for the top N, one line each for the rest
 PATTERNS_BRIEF_EXAMPLES = 3      # ...with an example only for the top N
+ASK_WAIT = 150                   # ask_tower / morning_brief: seconds to wait for the tower's model
+ASK_CONTEXT_CHARS = 150_000      # dashboard data the tower's model reads per question (~37k tokens, not Claude's)
+BRIEF_MAX_AGE_HOURS = 8          # morning_brief rewrites a brief older than this first
 
 INSTRUCTIONS = """\
-Read-only access to the user's AWS Error Feed dashboard, which watches CloudWatch Logs and
-Step Functions across all of their AWS accounts (one AWS CLI profile per client/project).
+Read-only access to the user's AWS Error Feed dashboard on their tower: CloudWatch Logs + Step Functions
+across all client AWS accounts (one AWS CLI profile per client). The tower runs its own model (cloud
+gpt-oss when on), so let it do the reading:
 
-Levels: error = logged as an error (ERROR/CRITICAL, tracebacks, Lambda crashes/timeouts, failed
-Step Functions executions). suspect = "hidden error": not logged as an error but looks like one
-(a try/except that print()s "failed to...", a 4xx/5xx status, a Step Functions run that only
-succeeded because Retry/Catch absorbed a failure, an execution stuck RUNNING). warning, info,
-platform (Lambda REPORT lines) = everything else.
+- "How are things / what needs attention today?" -> morning_brief() (written each morning by the tower).
+- Any question about a client, function, error, run, deploy or task -> ask_tower(question, profile,
+  function). The tower gathers status, patterns, examples, preceding lines, code and runs, and answers
+  with evidence ids. Prefer it to chaining investigate / get_log_lines / get_line_context; use those
+  (and fix_brief) to verify, when ask_tower says data is missing, or right before editing code.
+- Code: find_code(query, repo) instead of opening files to search; local_read(path, question) instead of
+  reading big files; local_draft_change for small edits (returns a diff); local_run for tests. Tower
+  answers can be wrong - verify the lines you change.
 
-Deploys: list_deploys shows recent Lambda deploys with a before/after verdict; after the user
-deploys a fix, use did_my_fix_work(function, profile) to confirm the error is gone (and nothing new
-appeared). If the deploy was minutes ago, say it's too early and offer to check again later.
-
-Noise control: whats_new shows new / spiking / regressed patterns. Only mute or mark fixed
-(mute_pattern) when the user asks; after a fix is deployed and did_my_fix_work confirms it, offer
-to mark the pattern fixed so it's flagged if it ever returns.
-Reproducing: for Step Functions failures, get_step_function_input gives the exact payload the
-failing Lambda received - use it to write a local test that fails first, then fix.
-Partner problems (expired tokens, 429s) across clients: partner_api_health.
-Tasks: the user's task list lives in the dashboard (tasks.db, local only, no ClickUp). When asked to
-turn recent emails into tasks: tasks_list first, read the emails, then tasks_add only new requests, storing
-just the request, the reason and links (Gmail thread id as external_id). Change a task with tasks_update.
-
-Infrastructure: schedules_health (jobs that silently stopped), inventory / upgrade_checklist
-(runtimes, layers, packages, timeout/memory headroom), apis_and_alarms, secrets_overview (metadata
-only; useful when auth errors start), cost_estimate, daily_digest (morning summary per client).
-
-Big picture: clients_status (red/amber/green per client). Record questions ("what happened to
-deal 991?"): trace_record. Run-level: list_runs / get_run; did_nothing_check for syncs that ran
-but processed nothing. Fixing code: locate_code turns an error's stack trace into repo file paths
-with the code around the failing line. Team notes on patterns appear as "NOTE from the team" -
-respect them (e.g. don't re-investigate known, accepted issues). client_report = weekly report.
-
-Only the everyday tools are listed; more_tools() lists and runs all the others (schedules, inventory,
-deploys, partner APIs, notes, mutes, reports, runs, history...). For code: outline(file) gives
-signatures only and get_symbol(name) returns one function's source - prefer them to reading files.
-Coding with fewer tokens: find_code(query, repo) returns only matching lines (file:line) - use it
-instead of opening files to search; repo_map(repo) gives the repo layout with one-line purposes;
-fix_brief(profile, ...) bundles everything needed to fix one error plus a local diagnosis;
-local_run(command, repo) runs tests/checks and returns only failures; local_draft_change(path,
-start, end, instruction) lets the local model write a small edit and returns a diff (apply=True writes
-it); draft_commit_message(repo) drafts a commit message. Review local-model output before relying on it.
-
-Saving context for code and documents: before reading a big file, a whole folder, a long diff or
-git history yourself, use local_read(path, question) or local_git(repo, what, question): the local
-model reads it and returns a short summary with file:line references. Then open only the exact lines
-you need to change. Its summaries can be wrong - verify before editing.
-
-Saving context: lines tagged LOCAL-MODEL TRIAGE come from a small model on the user's machine -
-use them to prioritise, but verify before acting. For "what's wrong with X" start with investigate
-(one call). To understand many lines, use summarize_logs (the local model reads them) instead of
-pulling raw lines with get_log_lines.
-
-Good workflow: error_overview -> list_error_patterns for the project -> get_log_lines for a
-pattern -> get_line_context on one line to see what the code printed just before it -> find the
-code in the repo (a log group like /aws/lambda/<name> is the Lambda function <name>;
-stepfunctions:<name> is a state machine) -> propose a fix. Always include the dashboard link
-from the tool output so the user can look at the same view. Only the last 24 hours are loaded
-by default; use load_history for older ranges.
+Levels: error = logged as an error (tracebacks, crashes/timeouts, failed executions). suspect = "hidden
+error": not logged as an error but looks like one (try/except print, 4xx/5xx, Step Functions run saved by
+Retry/Catch). Chronic = seen nearly every day / every run (known, ongoing). Lines tagged triage come from
+the tower's model - use them to prioritise, verify before acting. Team notes on patterns ("NOTE from the
+team") must be respected. Only mute or mark fixed when the user asks.
+After a deploy: did_my_fix_work(function, profile) (minutes after a deploy = too early, offer to check later).
+Tasks live in the dashboard (tasks.db): tasks_list, then more_tools tasks_add / tasks_update; store only request, reason, links.
+"proposed" tasks come from the daily mail/meeting intake and wait for the user's accept.
+Everything else (schedules, inventory, deploys, partner APIs, runs, trace_record, notes, mutes, reports,
+history, outline / get_symbol / repo_map / local_git, system_health, usage_savings) -> more_tools().
+Always include the dashboard link from the tool output. Only the last 24 hours are loaded by default;
+load_history (more_tools) for older ranges.
 """
 
 mcp = Server("aws-error-feed", instructions=INSTRUCTIONS)
@@ -420,10 +390,9 @@ def guard(fn):
 # Tool profile: "core" (default) exposes the everyday tools + more_tools (which reaches all the others),
 # so every message carries far fewer tool definitions. AWS_ERROR_FEED_TOOLS=all exposes everything.
 TOOLS_MODE = os.environ.get("AWS_ERROR_FEED_TOOLS", "core").strip().lower()
-CORE = {"clients_status", "dashboard_status", "investigate", "fix_brief", "error_overview", "list_error_patterns",
-        "summarize_logs", "get_log_lines", "get_line_context", "did_my_fix_work", "find_code", "get_symbol",
-        "outline", "repo_map", "local_read", "local_git", "local_draft_change", "local_run", "usage_savings",
-        "tasks_list", "tasks_add", "tasks_update"}
+CORE = {"morning_brief", "ask_tower", "clients_status", "investigate", "fix_brief", "list_error_patterns",
+        "get_log_lines", "get_line_context", "find_code", "local_read", "local_draft_change", "local_run",
+        "tasks_list"}       # the rest (tasks_add, tasks_update, outline, ...): more_tools()
 CORE |= {x.strip() for x in os.environ.get("AWS_ERROR_FEED_EXTRA_TOOLS", "").split(",") if x.strip()}
 REGISTRY, EXPOSED = {}, set()
 
@@ -1279,6 +1248,120 @@ def summarize_logs(question: str = "", profile: str = "", level: str = "", log_g
         return f"Local model failed: {j['error']}. Use get_log_lines instead."
     return finish([f"{who} summary{f' of {n} lines' if n else ''} (verify key facts):", j.get("answer") or "",
                    *([f"\nKey error lines (event_id for get_line_context / locate_code): {', '.join(ids)}"] if ids else [])])
+
+
+# ============================================================================ the tower answers
+_prof_cache = {"at": 0.0, "names": []}
+
+
+def _raw(name):
+    f = REGISTRY[name]
+    return getattr(f, "__wrapped__", f)
+
+
+def _profiles():
+    if time.time() - _prof_cache["at"] > 600:
+        _prof_cache.update(at=time.time(), names=[c["profile"] for c in api("/api/ops/clients")])
+    return _prof_cache["names"]
+
+
+def _guess_profile(text):
+    low = text.lower()
+    for p in sorted(_profiles(), key=len, reverse=True):
+        if re.search(r"(?<![a-z0-9])" + re.escape(p.lower()) + r"(?![a-z0-9])", low) or \
+                ("_" in p and p.lower().replace("_", " ") in low):
+            return p
+    return ""
+
+
+def _client_section(text, profile):
+    for part in text.split("\n## "):
+        head = part.split("\n", 1)[0]
+        if re.search(r"(?<![\w])" + re.escape(profile) + r":", head):
+            return "## " + part
+    return text
+
+
+@tool()
+@guard
+def ask_tower(question: str, profile: str = "", function: str = "", hours: float = 24, job_id: str = "") -> str:
+    """Ask the tower anything about the clients, errors, runs, deploys or tasks ("what's wrong with
+    stellaromics?", "why does hs-to-ns-prod fail?", "what changed since yesterday?"). The tower gathers the
+    dashboard data (status, patterns, latest examples, lines before them, code, runs, deploys, tasks) and
+    its model answers in ~300 words with evidence ids. profile / function are guessed from the question
+    if empty. Prefer this to chaining investigate / get_log_lines / get_line_context."""
+    if job_id:
+        j = _wait_job(job_id, ASK_WAIT)
+        if j.get("status") == "running":
+            return f"Still thinking - call ask_tower(question=..., job_id=\"{job_id}\") again shortly."
+        return finish(["Tower answer (verify before acting):", j.get("answer") or j.get("error") or ""])
+    prof = profile or _guess_profile(question)
+    fn = function
+    if prof and not fn:
+        try:
+            names = sorted({g["function"] for g in api("/api/ops/groups", profile=prof, hours=hours) if g.get("function")},
+                           key=len, reverse=True)
+            fn = next((n for n in names if n.lower() in question.lower()), "")
+        except Exception:
+            fn = ""
+    parts = []
+
+    def add(title, call):
+        try:
+            parts.append((title, call() or ""))
+        except Exception as ex:
+            parts.append((title, f"(couldn't get this: {type(ex).__name__}: {ex})"))
+    if prof:
+        add("client status", lambda: _client_section(_raw("clients_status")(), prof))
+        add("investigation", lambda: _raw("investigate")(prof, fn, "", "", hours))
+        add("error patterns", lambda: _raw("list_error_patterns")(hours=hours, profile=prof, limit=15, detail="full"))
+        if fn:
+            add(f"log lines of {fn}", lambda: _raw("get_log_lines")(hours=hours, profile=prof, log_group_prefix=f"/aws/lambda/{fn}",
+                                                                     level="error,suspect,warning", limit=100, detail="lines"))
+        add("deploys", lambda: _raw("list_deploys")(profile=prof, hours=72))
+        add("tasks", lambda: _raw("tasks_list")(client=prof))
+    else:
+        add("all clients", lambda: _raw("clients_status")())
+        add("morning brief", lambda: api("/api/ai/brief").get("text") or "")
+        if re.search(r"tower|model|cloud|token|usage|health|ollama|dashboard|gpu", question, re.I):
+            add("system health", lambda: _raw("system_health")())
+    text = "\n\n".join(f"===== {t_} =====\n{x}" for t_, x in parts)[:ASK_CONTEXT_CHARS]
+    r = api_post("/api/ai/prompt", {"template": "ask", "text": text, "question": f"Question: {question}"})
+    if r.get("error"):
+        return f"The tower couldn't answer ({r['error']}). Use investigate(profile=...) instead."
+    j = _wait_job(r["id"], ASK_WAIT)
+    if j.get("status") == "running":
+        return f"The tower is still thinking - call ask_tower(question=..., job_id=\"{r['id']}\") in ~30s."
+    if j.get("error") or not j.get("answer"):
+        return f"The tower couldn't answer ({j.get('error') or 'empty answer'}). Use investigate(profile=...) instead."
+    return finish([f"Tower answer for {prof or 'all clients'}{' / ' + fn if fn else ''} (read: {', '.join(t_ for t_, _ in parts)}; "
+                   f"~{len(text) // 4:,} tokens read on the tower) — dashboard: "
+                   f"{link(tab='errors' if prof else 'clients', profile=prof, hours=int(hours))}",
+                   j["answer"], "(Verify before acting: investigate / get_log_lines / get_line_context with the same profile.)"])
+
+
+@tool()
+@guard
+def morning_brief(refresh: bool = False) -> str:
+    """Start here for "how are my clients / what needs attention today?": a short status of every client
+    (needs action / watch / quiet / tasks) written by the tower each morning. refresh=True rewrites it now."""
+    b = api("/api/ai/brief")
+    if b.get("error"):
+        return _raw("clients_status")()
+    stale = not b.get("at") or time.time() * 1000 - b["at"] > BRIEF_MAX_AGE_HOURS * 3_600_000
+    if refresh or stale or b.get("busy"):
+        if not b.get("busy"):
+            api("/api/ai/brief", refresh=1)
+        t0 = time.time()
+        while time.time() - t0 < ASK_WAIT:
+            time.sleep(3)
+            b = api("/api/ai/brief")
+            if not b.get("busy"):
+                break
+    if not b.get("text"):
+        return "The tower couldn't write the brief" + (f" ({b['error']})" if b.get("error") else "") + \
+            ":\n\n" + _raw("clients_status")()
+    return finish([f"Morning brief, written {t(b['at'])} by the tower — dashboard: {link(tab='clients')}", b["text"]])
 
 
 @tool()
@@ -2309,7 +2392,8 @@ def _task_line(it, today):
 @guard
 def tasks_list(status: str = "", client: str = "", search: str = "", done_days: float = 7) -> str:
     """The user's task list kept in the dashboard (tasks.db, local only). Default: everything not done
-    + items done in the last done_days. status: open | in_progress | waiting | done | all (comma list ok).
+    + items done in the last done_days. status: open | in_progress | waiting | done | proposed (from the daily
+    mail/meeting intake, waiting for accept) | dismissed | all (comma list ok).
     Call this before tasks_add (e.g. when turning recent emails into tasks) to see what is already tracked."""
     r = api("/api/tasks", status=status, client=client, q=search, done_days=done_days)
     if r.get("error"):

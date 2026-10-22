@@ -12,6 +12,12 @@
 - `aws_error_feed.py` is ~3,000 lines: use `local_read("dashboard/new_app/aws_error_feed.py", "<question>")`
   or grep for the function instead of reading it all.
 
+## Ask the tower first (fewest Claude tokens)
+- "How are things?" -> `morning_brief()`. Any question about a client / function / error -> `ask_tower(question)`:
+  the tower reads all the data with its own model and returns a short answer with evidence ids.
+- Use the raw tools (investigate, get_log_lines, get_line_context, fix_brief) only to verify or before editing.
+- `outline`, `get_symbol`, `repo_map`, `local_git`, `tasks_add`, `tasks_update` are reached with `more_tools()`.
+
 ## Coding with the tower (fewer Claude tokens)
 - **Find code**: `find_code(query, repo)` returns only the matching lines with file:line — use it instead of
   opening files to search. `repo_map(repo)` gives the layout + one-line purpose per file.

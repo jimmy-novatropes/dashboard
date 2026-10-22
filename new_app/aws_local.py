@@ -512,6 +512,20 @@ language, no jargon, nothing that isn't in the report.""", 400),
 (passed/failed, counts), then each failure: test or step name, file:line and the key error or
 assertion message. Ignore passing noise. At most 12 bullets.""", 700),
     "filemap": ("""Describe what this file does in ONE line of at most 20 words. No preamble, no markdown.""", 60),
+    "ask": ("""You are the on-call assistant for Open Flow's AWS integrations dashboard (CloudWatch Logs + Step
+Functions across client AWS accounts; HubSpot / NetSuite / other syncs in Lambda). You get the question
+and the dashboard's data (client status, error patterns with counts and triage, latest examples, the
+lines logged just before, code around failing lines, runs, deploys, tasks). Answer ONLY from that data.
+Be concrete: client, function, counts, times, exact error messages, file:line. Say what changed
+(new / spiking / chronic). Mark guesses as "likely". Never assume rate limits, auth or outages unless a
+line shows them (429, 401/403, 5xx, timeout). If the data doesn't answer it, say what's missing and
+which tool would get it (get_log_lines, get_line_context, trace_record, local_read...).
+Format: short bullets, max 250 words. Last line: "Evidence:" + up to 5 event_ids or file:line you used.""", 900),
+    "brief": ("""Write the developer's morning brief from this dashboard snapshot of all client integrations.
+Sections: "Needs action" (red clients: what is broken, since when, likely cause, first step),
+"Watch" (amber: only what is new or worse), "Quiet" (one line listing the rest),
+"Tasks" (proposed from yesterday's mail/meetings, overdue). Concrete: function names, counts,
+error messages. Nothing that isn't in the data. Plain text bullets, max 300 words.""", 900),
 }
 
 
