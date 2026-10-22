@@ -1,13 +1,12 @@
 """
-Tower deploy helper for the AWS Error Feed:
-  1. (off by default) pushes the tower's commits to GitHub
-  2. downloads an extra Ollama model (skipped if it's already installed)
-  3. stops the running dashboard and starts it again (scheduled task "AWS Error Feed")
-  4. waits until it answers and prints a short status
-
-Run on the tower from the dashboard folder:
-    python new_app\\deploy_tower.py
-Afterwards: fully quit Claude (tray icon -> Quit) and reopen it, so the connector reloads.
+Tower deploy helper for the AWS Error Feed - ONE STEP after any change. Run on the tower:
+    python new_app\\deploy_tower.py        (from the dashboard folder; or double-click this file)
+  1. checks the code compiles (stops here if it doesn't - the running dashboard is left alone)
+  2. commits the changed app files, pulls the laptop's commits, pushes (COMMIT_AND_PUSH)
+  3. downloads an extra Ollama model (MODEL_TO_INSTALL, skipped if empty or already installed)
+  4. stops the running dashboard and starts it again (scheduled task "AWS Error Feed")
+  5. waits until it answers and prints a short status (local + cloud model, tasks.db, end of dashboard.log)
+  6. says whether Claude must be restarted (only when mcp_server.py changed since the last run)
 """
 import json
 import os
@@ -18,8 +17,15 @@ import urllib.parse
 import urllib.request
 
 # ------------------------------------------------------------------ settings
-PUSH_TO_GITHUB = False                  # already pushed; set True to push from here
-MODEL_TO_INSTALL = "qwen3:30b-a3b"      # "" = don't download anything
+COMMIT_AND_PUSH = True                  # commit COMMIT_PATHS (if changed) and git push
+COMMIT_MESSAGE = ""                     # "" = automatic ("Update: <changed files>"); or write your own
+PULL_BEFORE_PUSH = True                 # git pull --rebase --autostash (gets the laptop's commits) before pushing
+COMMIT_PATHS = [".gitignore", "CLAUDE.md", "new_app", "old_app", "logging_kit"]   # never config.json / *.db (git-ignored)
+COMMIT_TRAILER = ("Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\n"
+                  "Claude-Session: https://claude.ai/code/session_011KCTv4MMSvGb1qCJvzuc34")
+CHECK_FILES = ["aws_error_feed.py", "aws_tasks.py", "aws_local.py", "aws_ops.py", "aws_health.py",
+               "aws_prefs.py", "aws_infra.py", "mcp_server.py"]
+MODEL_TO_INSTALL = ""                   # e.g. "qwen3:30b-a3b"; "" = don't download anything
 SWITCH_TO_NEW_MODEL = False             # True = make it the active model after the restart
 NEW_MODEL_CONTEXT = 8192                # context used if SWITCH_TO_NEW_MODEL is True
 OLLAMA_URL = "http://127.0.0.1:11434"
@@ -30,6 +36,7 @@ WAIT_FOR_DASHBOARD_SECONDS = 180
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
 LOG = os.path.join(HERE, "dashboard.log")
+STAMP = os.path.join(HERE, "last_deploy.json")      # git-ignored: connector hash at the last run
 
 
 def say(t):
@@ -47,8 +54,54 @@ def run(cmd, cwd=None):
     return r.returncode, out
 
 
-# ------------------------------------------------------------------ 1. git push
+# ------------------------------------------------------------------ 1. compile check
+def compile_check():
+    say("Checking the code compiles")
+    bad = []
+    for f in CHECK_FILES:
+        path = os.path.join(HERE, f)
+        if not os.path.exists(path):
+            continue
+        code, out = run([sys.executable, "-m", "py_compile", path])
+        if code:
+            bad.append(f"{f}: {out.splitlines()[-1] if out else 'error'}")
+    print("\n".join("!! " + b for b in bad) if bad else "ok")
+    return not bad
+
+
+# ------------------------------------------------------------------ 2. git commit + push
+def commit_and_push():
+    say("Committing the changes")
+    paths = [p for p in COMMIT_PATHS if os.path.exists(os.path.join(REPO, p))]
+    code, out = run(["git", "add", "--"] + paths, cwd=REPO)
+    if code:
+        print("!! git add failed:", out)
+        return
+    code, staged = run(["git", "diff", "--cached", "--name-only"], cwd=REPO)
+    if not staged:
+        print("nothing new to commit")
+    else:
+        print(staged)
+        files = [os.path.basename(f) for f in staged.splitlines()]
+        auto = "Update: " + ", ".join(sorted(set(files))[:8]) + (" ..." if len(set(files)) > 8 else "")
+        msg = (COMMIT_MESSAGE or auto) + ("\n\n" + COMMIT_TRAILER if COMMIT_TRAILER else "")
+        code, out = run(["git", "commit", "-m", msg], cwd=REPO)
+        print(out.splitlines()[0] if out else "")
+        if code:
+            print("!! git commit failed - commit it yourself (the rest continues).")
+            return
+    push()
+
+
 def push():
+    if PULL_BEFORE_PUSH:
+        say("Getting the laptop's commits (git pull --rebase)")
+        code, out = run(["git", "pull", "--rebase", "--autostash"], cwd=REPO)
+        print(out or "ok")
+        if code:
+            run(["git", "rebase", "--abort"], cwd=REPO)
+            print("!! pull failed (conflict?) - left as it was; sort it out with git, then run this again.")
+            return
     say("Pushing the tower's commits to GitHub")
     code, out = run(["git", "push"], cwd=REPO)
     print(out or "(nothing to push)")
@@ -56,7 +109,7 @@ def push():
         print("!! git push failed - run `git push` yourself in the dashboard folder (the rest continues).")
 
 
-# ------------------------------------------------------------------ 2. model download
+# ------------------------------------------------------------------ 3. model download
 def install_model(name):
     say(f"Model {name}")
     try:
@@ -96,7 +149,7 @@ def install_model(name):
     return True
 
 
-# ------------------------------------------------------------------ 3. restart the dashboard
+# ------------------------------------------------------------------ 4. restart the dashboard
 def restart_dashboard():
     say("Stopping the dashboard")
     ps = ("Get-CimInstance Win32_Process -Filter \"name='pythonw.exe' or name='python.exe'\" | "
@@ -137,14 +190,53 @@ def switch_model(name, ctx):
         print("!! couldn't switch:", ex, "- use the picker at the top of the Health tab")
 
 
+def claude_restart_needed():
+    """True when mcp_server.py (the Claude connector) changed since the last run of this script."""
+    import hashlib
+    try:
+        with open(os.path.join(HERE, "mcp_server.py"), "rb") as f:
+            h = hashlib.sha1(f.read()).hexdigest()
+    except OSError:
+        return False
+    try:
+        with open(STAMP) as f:
+            old = json.load(f).get("mcp_sha")
+    except (OSError, ValueError):
+        old = None
+    try:
+        with open(STAMP, "w") as f:
+            json.dump({"mcp_sha": h, "at": time.strftime("%Y-%m-%d %H:%M")}, f)
+    except OSError:
+        pass
+    return old is not None and old != h
+
+
 def report():
     say("Status")
+    try:
+        st = get_json(DASHBOARD_URL + "/api/ai/status")
+        c = st.get("cloud") or {}
+        print("local model  :", st.get("model"), "-", st.get("detail"))
+        print("cloud model  :", (f"{c.get('model')} ON - today {c.get('calls', 0)} calls, {c.get('tokens', 0):,} of "
+                                 f"{c.get('daily_token_cap', 0):,} tokens, {c.get('fallbacks', 0)} fallbacks")
+                                if c.get("enabled") else "off (cloud_llm in config.json)")
+    except Exception as ex:
+        print("status not answering:", ex)
     try:
         m = get_json(DASHBOARD_URL + "/api/ai/models")
         print("model in use :", m["current"], f"(context {m['num_ctx']}, set in {m['source']})")
         print("installed    :", ", ".join(f"{x['name']} ({x['size_gb']} GB)" for x in m["installed"]))
     except Exception as ex:
         print("model picker not answering:", ex)
+    try:
+        t = get_json(DASHBOARD_URL + "/api/tasks?status=all")
+        if t.get("error"):
+            print("tasks        : !!", t["error"])
+        else:
+            n = len([i for i in t["items"] if i["status"] != "done"])
+            print(f"tasks        : tasks.db ok - {n} not done, {len(t['items'])} total")
+    except Exception as ex:
+        print("tasks        : !! not answering:", ex, "(old version still running?)")
     try:
         p = get_json(DASHBOARD_URL + "/api/prefs")
         print("priorities   :", ", ".join(f"{x['profile']}={x['priority']}" for x in p["profiles"]))
@@ -159,14 +251,23 @@ def report():
 
 
 if __name__ == "__main__":
-    if PUSH_TO_GITHUB:
-        push()
+    if not compile_check():
+        say("Stopped: fix the errors above first. The running dashboard was not touched.")
+        if sys.stdin and sys.stdin.isatty():
+            input("\nPress Enter to close...")
+        sys.exit(1)
+    if COMMIT_AND_PUSH:
+        commit_and_push()
     model_ok = install_model(MODEL_TO_INSTALL) if MODEL_TO_INSTALL else False
     if restart_dashboard():
         up = wait_for_dashboard()
         if up and SWITCH_TO_NEW_MODEL and model_ok:
             switch_model(MODEL_TO_INSTALL, NEW_MODEL_CONTEXT)
     report()
-    say("Done. Now fully quit Claude (tray icon -> Quit) and reopen it so the connector reloads.")
+    if claude_restart_needed():
+        say("Done. RESTART CLAUDE: YES - the connector changed. On the laptop: `git pull` in the dashboard "
+            "folder, then quit Claude (tray icon -> Quit) and reopen it; same for Claude on the tower.")
+    else:
+        say("Done. RESTART CLAUDE: NO - the connector didn't change.")
     if sys.stdin and sys.stdin.isatty():
         input("\nPress Enter to close...")

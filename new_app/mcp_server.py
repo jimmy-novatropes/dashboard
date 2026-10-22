@@ -67,6 +67,9 @@ to mark the pattern fixed so it's flagged if it ever returns.
 Reproducing: for Step Functions failures, get_step_function_input gives the exact payload the
 failing Lambda received - use it to write a local test that fails first, then fix.
 Partner problems (expired tokens, 429s) across clients: partner_api_health.
+Tasks: the user's task list lives in the dashboard (tasks.db, local only, no ClickUp). When asked to
+turn recent emails into tasks: tasks_list first, read the emails, then tasks_add only new requests, storing
+just the request, the reason and links (Gmail thread id as external_id). Change a task with tasks_update.
 
 Infrastructure: schedules_health (jobs that silently stopped), inventory / upgrade_checklist
 (runtimes, layers, packages, timeout/memory headroom), apis_and_alarms, secrets_overview (metadata
@@ -414,7 +417,8 @@ def guard(fn):
 TOOLS_MODE = os.environ.get("AWS_ERROR_FEED_TOOLS", "core").strip().lower()
 CORE = {"clients_status", "dashboard_status", "investigate", "fix_brief", "error_overview", "list_error_patterns",
         "summarize_logs", "get_log_lines", "get_line_context", "did_my_fix_work", "find_code", "get_symbol",
-        "outline", "repo_map", "local_read", "local_git", "local_draft_change", "local_run", "usage_savings"}
+        "outline", "repo_map", "local_read", "local_git", "local_draft_change", "local_run", "usage_savings",
+        "tasks_list", "tasks_add", "tasks_update"}
 CORE |= {x.strip() for x in os.environ.get("AWS_ERROR_FEED_EXTRA_TOOLS", "").split(",") if x.strip()}
 REGISTRY, EXPOSED = {}, set()
 
@@ -587,16 +591,39 @@ def list_error_patterns(hours: float = 24, profile: str = "", level: str = "erro
 @guard
 def get_log_lines(hours: float = 24, profile: str = "", level: str = "", log_group: str = "",
                   log_group_prefix: str = "", search: str = "", error_type: str = "",
-                  signature: str = "", limit: int = 30) -> str:
-    """Individual log lines (newest first) with full messages / stack traces and an event id for
-    get_line_context. Filter by profile, level (comma list), exact log_group or prefix, free-text
-    search, or a pattern (error_type + signature from list_error_patterns)."""
+                  signature: str = "", limit: int = 30, detail: str = "brief") -> str:
+    """Individual log lines (newest first) with an event id for get_line_context. Filter by profile,
+    level (comma list), exact log_group or prefix, free-text search, or a pattern (error_type +
+    signature from list_error_patterns). detail="brief" (default) folds lines that repeat (×N) and
+    shortens long messages (tracebacks keep their start + the exception); detail="full" gives whole
+    messages, account and stream."""
     note = ensure_range(hours)
     r = api("/api/events", hours=hours, profile=profile, level=level, grp=log_group,
             grp_prefix=log_group_prefix, q=search, etype=error_type,
             sig=signature if error_type else "", limit=max(1, min(limit, 200)))
     out = [note + f"Showing {len(r['events'])} of {r['total']} matching lines — dashboard: "
            f"{link(tab='all', hours=int(hours), profile=profile, level=level or 'error,suspect,warning,info', grp=log_group, q=search, etype=error_type, sig=signature if error_type else '')}"]
+    if detail != "full":
+        groups = {}
+        for e in r["events"]:                      # newest first: later ones in a group are older
+            key = (e["profile"], e["group"], e["level"], e.get("etype"), _NUM.sub("#", e["message"][:300]))
+            g = groups.get(key)
+            if g:
+                g["n"] += 1
+                g["oldest"] = e["ts"]
+            else:
+                groups[key] = {"e": e, "n": 1, "oldest": e["ts"]}
+        for g in groups.values():
+            e = g["e"]
+            prob = e["level"] in ("error", "suspect")
+            out += [f"\n--- {t(e['ts'])} | {e['profile']} | {e['group']} | {e['level']}"
+                    + (f" {e['etype']}" if prob else "") + (f" | flagged: {e['hint']}" if e.get("hint") else "")
+                    + (f" | ×{g['n']} (oldest {t(g['oldest'])[11:]})" if g["n"] > 1 else ""),
+                    f"event_id: {e['id']}",
+                    _problem_text(e["message"], 1500) if prob else cap(e["message"], 400)]
+        if len(groups) < len(r["events"]):
+            out.append(f"\n({len(r['events'])} lines folded into {len(groups)}; detail=\"full\" shows each line whole)")
+        return finish(out)
     budget = MAX_OUT // max(1, len(r["events"]))
     for e in r["events"]:
         out += [f"\n--- {t(e['ts'])} | {e['profile']} ({e['account']}, {e['region']}) | {e['group']} | "
@@ -2214,6 +2241,91 @@ def more_tools(name: str = "", args: str = "{}") -> str:
     except TypeError as ex:
         import inspect
         return f"Wrong arguments for {name}: {ex}. Signature: {name}{inspect.signature(f)}"
+
+
+# ============================================================================ tasks (tasks.db on the tower)
+def _task_line(it, today):
+    over = it["status"] != "done" and it.get("due") and it["due"] < today
+    head = (f"#{it['id']} [{it['status']}{'|' + it['priority'] if it['priority'] != 'normal' else ''}"
+            f"{'|due ' + it['due'] if it.get('due') else ''}{' OVERDUE' if over else ''}] "
+            f"{(it.get('client') or '-')} · {it['title']}" + (f" — from {it['requester']}" if it.get("requester") else ""))
+    if it["status"] == "done":
+        return [head]
+    rows = [head]
+    if it.get("request") and it["request"] != it["title"]:
+        rows.append("   request: " + cap(it["request"].replace("\n", " "), 220))
+    if it.get("reason"):
+        rows.append("   why: " + cap(it["reason"].replace("\n", " "), 180))
+    if it.get("links"):
+        rows.append("   links: " + " ".join(it["links"][:3]) + (f" +{len(it['links']) - 3}" if len(it["links"]) > 3 else ""))
+    if it.get("external_id"):
+        rows.append(f"   ref: {it['external_id']}")
+    return rows
+
+
+@tool()
+@guard
+def tasks_list(status: str = "", client: str = "", search: str = "", done_days: float = 7) -> str:
+    """The user's task list kept in the dashboard (tasks.db, local only). Default: everything not done
+    + items done in the last done_days. status: open | in_progress | waiting | done | all (comma list ok).
+    Call this before tasks_add (e.g. when turning recent emails into tasks) to see what is already tracked."""
+    r = api("/api/tasks", status=status, client=client, q=search, done_days=done_days)
+    if r.get("error"):
+        return r["error"]
+    today = time.strftime("%Y-%m-%d")
+    items = r["items"]
+    out = [f"{len([i for i in items if i['status'] != 'done'])} not done, {len([i for i in items if i['status'] == 'done'])} done "
+           f"(shown) — dashboard: {link(tab='tasks')}"]
+    for it in items:
+        out += _task_line(it, today)
+    return finish(out if items else out + ["No tasks match."])
+
+
+@tool()
+@guard
+def tasks_add(items: list[dict]) -> str:
+    """Add tasks to the user's task list in the dashboard (tasks.db on the tower; local only, never synced).
+    Each item: title (short, imperative), request (what the person is asking for), reason (why they need it),
+    links (list of URLs from the source, if any), client, requester (person's name), source ("email" |
+    "meeting" | "error" | "manual"), external_id (e.g. the Gmail thread id: prevents duplicates),
+    priority (high|normal|low), due (YYYY-MM-DD), notes.
+    From emails store ONLY the request, the reason and links - never the email body or other content.
+    An item matching an existing one (same external_id, or same open title + client) updates it instead of
+    adding a duplicate; its status / priority / due are kept. Call tasks_list first."""
+    r = api_post("/api/tasks/add", {"items": items})
+    if r.get("error"):
+        return r["error"]
+    out = []
+    if r["added"]:
+        out.append("Added " + ", ".join(f"#{i}" for i in r["added"]))
+    if r["updated"]:
+        out.append("Updated (already tracked) " + ", ".join(f"#{i}" for i in r["updated"]))
+    if r["unchanged"]:
+        out.append("Already tracked, nothing new: " + ", ".join(f"#{i}" for i in r["unchanged"]))
+    out += [f"Error: {e}" for e in r["errors"]]
+    return "\n".join(out or ["Nothing to add."]) + f"\nDashboard: {link(tab='tasks')}"
+
+
+@tool()
+@guard
+def tasks_update(id: int, status: str = "", priority: str = "", due: str = "", title: str = "",
+                 request: str = "", reason: str = "", client: str = "", notes: str = "",
+                 links: list[str] | None = None) -> str:
+    """Change one task: status (open | in_progress | waiting | done), priority (high|normal|low),
+    due (YYYY-MM-DD, or "none" to clear), title, request, reason, client, notes (replaces the notes),
+    links (replaces the list). Only the fields you pass change."""
+    f = {k: v for k, v in dict(status=status, priority=priority, due=due, title=title, request=request,
+                              reason=reason, client=client, notes=notes).items() if v}
+    if f.get("due", "").lower() == "none":
+        f["due"] = ""
+    if links is not None:
+        f["links"] = links
+    if not f:
+        return "Nothing to change - pass at least one field."
+    r = api_post("/api/tasks/update", {"id": id, **f})
+    if r.get("error"):
+        return r["error"]
+    return "\n".join(_task_line(r, time.strftime("%Y-%m-%d")))
 
 
 @tool()

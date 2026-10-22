@@ -1,0 +1,4 @@
+﻿{
+  "local_llm": { "model": "qwen3:14b", "num_ctx": 8192 },
+  "exclude_profiles": ["BSLLC", "codecommituser", "default", "super_suds", "supersuds"]
+}

@@ -1,8 +1,10 @@
 # local data - never commit (logs can contain customer records)
 errors.db*
+tasks.db*
 *.jsonl.imported
 *.log
 config.json
+last_deploy.json
 repos.json
 __pycache__/
 .idea/

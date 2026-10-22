@@ -64,6 +64,7 @@ import aws_ops  # noqa: E402    (runs, did-nothing, trace, code links, notes, re
 import aws_local  # noqa: E402  (optional local model via Ollama: triage + summaries)
 import aws_health  # noqa: E402 (health / efficiency stats, system log, Drain3 shadow grouping)
 import aws_prefs  # noqa: E402  (project priority / on-demand projects, local model picker)
+import aws_tasks  # noqa: E402  (tasks / follow-ups, kept in tasks.db)
 DAY_MS = 86_400_000
 LEVELS = ("error", "suspect", "warning", "info", "platform")
 
@@ -250,6 +251,14 @@ def structured_level(d):
     lvl = str(d.get("level") or "INFO").upper()
     if lvl in ("ERROR", "CRITICAL", "FATAL", "EXCEPTION"):
         return "error", ""
+    if d.get("event") == "invocation_summary":       # per-run summary line (anew): judge by its fields
+        if d.get("crashed") is True:
+            return "error", ""
+        bad = invocation_problems(d)
+        if bad:
+            return "suspect", ", ".join(bad)
+        if d.get("rate_limited_429"):
+            return "warning", ""
     if d.get("event") == "run_summary" and d.get("status") != "failed":
         res = d.get("results") if isinstance(d.get("results"), dict) else {}
         failed = d.get("records_failed") or res.get("failed")
@@ -260,9 +269,29 @@ def structured_level(d):
     return "info", ""
 
 
+def invocation_problems(d):
+    """Problems an INVOCATION_SUMMARY line reports (an empty list = a clean run)."""
+    bad, sc = [], d.get("status_code")
+    if isinstance(sc, int) and not isinstance(sc, bool) and sc >= 400:
+        bad.append(f"HTTP {sc}")
+    hf = d.get("http_failures")
+    if hf:
+        bad.append("http failures: " + (", ".join(map(str, hf)) if isinstance(hf, (dict, list)) else str(hf)))
+    if d.get("exceptions_logged"):
+        bad.append(f"{d['exceptions_logged']} exception(s) logged")
+    return bad
+
+
 def structured_signature(d, level):
     """Group oflog lines by their stable event name, not the changing message."""
     ev, partner = d["event"], d.get("partner")
+    if ev == "invocation_summary" and level in ("error", "suspect"):
+        what = "crashed" if d.get("crashed") is True else "problems"
+        kinds = normalize(" ".join(b.split(":")[0] for b in invocation_problems(d)))
+        hf = d.get("http_failures")
+        if isinstance(hf, (dict, list)) and hf:
+            kinds += " | " + ", ".join(sorted(map(str, hf))[:4])     # keep 429 vs 500 apart
+        return f"invocation_summary: {what}", kinds[:200]
     etype = ev + (f" ({partner})" if partner and str(partner) not in ev else "")
     if d.get("event") == "run_summary" and level == "suspect":
         return "run_summary: records failed", normalize(str(d.get("function") or ""))
@@ -2063,6 +2092,7 @@ DRAIN = None
 PREFS = None
 PICKER = None
 CODE = None
+TASKS = None
 
 
 def make_handler(store, workers, cfg):
@@ -2079,7 +2109,10 @@ def make_handler(store, workers, cfg):
             if filename:
                 self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
             self.end_headers()
-            self.wfile.write(data)
+            try:
+                self.wfile.write(data)
+            except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError):
+                pass                                # the browser / connector closed the request early
 
         def json(self, obj):
             self.send(200, json.dumps(obj), "application/json")
@@ -2091,6 +2124,7 @@ def make_handler(store, workers, cfg):
                 gpu = next((x for x in rt.get("loaded") or [] if x.get("name", "").startswith(LLM.model.split(":")[0])), None)
                 return self.json({**{k: v for k, v in st.items() if k != "models"}, "model": LLM.model,
                                   "queue": LLM.gate.state(), "last_call": LLM.last_call, "gpu": gpu,
+                                  "cloud": LLM.cloud_status(),
                                   "backlog": getattr(TRIAGE, "backlog", None),
                                   "triaged": TRIAGE.done if TRIAGE else 0,
                                   "working_on": TRIAGE.running_now if TRIAGE else None,
@@ -2129,7 +2163,7 @@ def make_handler(store, workers, cfg):
                         question = (question + f" (Note: showing the newest {len(evs)} of {total} matching lines.)").strip()
                 if not lines:
                     return self.json({"error": "No lines matched."})
-                jid = AIJOBS.start(question, aws_local.lines_text(lines, LLM.max_input_chars - 2000), kind)
+                jid = AIJOBS.start(question, aws_local.lines_text(lines, LLM.max_input_for(kind) - 2000), kind)
                 return self.json({"id": jid, "lines": len(lines),
                                   "event_ids": [l.get("id") for l in lines if l.get("level") in ("error", "suspect")][:8]})
             if path == "/api/ai/models":
@@ -2266,9 +2300,43 @@ def make_handler(store, workers, cfg):
                 return self.json({"digest": dg, "text": digest_text(dg)})
             self.send(404, "not found", "text/plain")
 
+        def tasks_get(self, path, q):
+            if not TASKS:
+                return self.json({"error": "tasks.db is not open"})
+            try:
+                if path == "/api/tasks":
+                    items = TASKS.list(q.get("status", ""), q.get("client", ""), q.get("q", ""),
+                                       float(q.get("done_days") or 7), int(q.get("limit") or 500))
+                    return self.json({"items": items, "open_total": sum(c["open"] for c in TASKS.counts().values())})
+                if path == "/api/tasks/counts":
+                    return self.json(TASKS.counts())
+                if path == "/api/tasks/clients":
+                    return self.json(TASKS.clients())
+                if path == "/api/tasks/get":
+                    return self.json(TASKS.get(q.get("id") or 0) or {"error": "not found"})
+                if path == "/api/tasks/delete":
+                    return self.json({"deleted": TASKS.delete(q.get("id") or 0)})
+            except (ValueError, TypeError) as ex:
+                return self.json({"error": str(ex)})
+            return self.send(404, "not found", "text/plain")
+
+        def tasks_post(self, path, body):
+            if not TASKS:
+                return self.json({"error": "tasks.db is not open"})
+            try:
+                if path == "/api/tasks/add":
+                    items = body.get("items") if isinstance(body.get("items"), list) else [body]
+                    return self.json(TASKS.add(items))
+                if path == "/api/tasks/update":
+                    return self.json(TASKS.update(body.get("id"), {k: v for k, v in body.items() if k != "id"}))
+            except (ValueError, TypeError) as ex:
+                return self.json({"error": str(ex)})
+            return self.send(404, "not found", "text/plain")
+
         def do_POST(self):
             u = urlparse(self.path)
-            if u.path not in ("/api/ai/read", "/api/ai/prompt", "/api/ai/filemap", "/api/ai/filemap_known"):
+            if u.path not in ("/api/ai/read", "/api/ai/prompt", "/api/ai/filemap", "/api/ai/filemap_known",
+                              "/api/tasks/add", "/api/tasks/update"):
                 return self.send(404, "not found", "text/plain")
             n = int(self.headers.get("Content-Length") or 0)
             if n > 12_000_000:
@@ -2277,6 +2345,8 @@ def make_handler(store, workers, cfg):
                 body = json.loads(self.rfile.read(n).decode("utf-8") or "{}")
             except ValueError:
                 return self.send(400, "bad json", "text/plain")
+            if u.path.startswith("/api/tasks/"):
+                return self.tasks_post(u.path, body if isinstance(body, dict) else {"items": body})
             if u.path == "/api/ai/filemap_known":
                 return self.json(AIJOBS.filemap_known(body.get("files") or []))
             if not LLM.ready:
@@ -2329,6 +2399,8 @@ def make_handler(store, workers, cfg):
                         q["not_profiles"] = ",".join(asleep)
             if u.path == "/":
                 return self.send(200, PAGE, "text/html; charset=utf-8")
+            if u.path == "/api/tasks" or u.path.startswith("/api/tasks/"):
+                return self.tasks_get(u.path, q)
             if u.path == "/api/events":
                 evs, total = store.list_events(q, int(q.get("limit") or 500))
                 return self.json({"events": evs, "total": total})
@@ -2443,7 +2515,7 @@ PAGE = r"""<!doctype html>
 header{position:sticky;top:0;z-index:2;background:var(--panel);border-bottom:1px solid var(--line);padding:10px 16px}
 h1{font-size:16px;margin:0 8px 0 0;display:inline}
 .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.row+.row{margin-top:8px}
-input,select,button{font:inherit;background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:5px 9px}
+input,select,button,textarea{font:inherit;background:var(--bg);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:5px 9px}
 button{cursor:pointer}label{font-size:13px;color:var(--mute);display:flex;gap:4px;align-items:center}
 .tabs{display:flex;gap:4px;flex-wrap:wrap}.tabs button.on{border-color:var(--acc);color:var(--acc)}
 .tabs .n{font-size:11px;opacity:.75;margin-left:4px}
@@ -2535,6 +2607,7 @@ tr.click:hover{background:var(--bg);cursor:pointer}
   <h1>AWS Error Feed</h1>
   <div class="tabs">
    <button data-v="clients" class="on">Clients</button>
+   <button data-v="tasks">Tasks<span class="n" id="n-tasks"></span></button>
    <button data-v="errors">Errors<span class="n" id="n-error"></span></button>
    <button data-v="suspect">Hidden errors?<span class="n" id="n-suspect"></span></button>
    <button data-v="all">All logs<span class="n" id="n-all"></span></button>
@@ -2584,6 +2657,29 @@ tr.click:hover{background:var(--bg);cursor:pointer}
  <div id="v-clients" class="view on">
   <p class="help">Status of every client at a glance: <b style="color:var(--err)">red</b> = something is broken (jobs not running, regressions, alarms, server errors, syncs that did nothing), <b style="color:var(--sus)">amber</b> = worth a look, <b style="color:var(--ok)">green</b> = all quiet. Click a client to open its errors; "report" opens a printable health report.</p>
   <div id="clientCards" class="cards"></div><div id="clientSleep"></div></div>
+ <div id="v-tasks" class="view">
+  <p class="help">Your tasks and follow-ups, kept on the tower in <b>tasks.db</b> (separate from the 24h error cache; never cleaned up, never synced anywhere). Add them by hand, with "+ task" on a pattern, or ask Claude: <i>"look at my task list and my emails from the last 2 days and add the new tasks"</i>. From emails only the request, the reason and any links are stored. Click a row for details.</p>
+  <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px">
+   <select id="tStatus"><option value="">Not done + done in the last 7 days</option><option value="open,in_progress,waiting">Not done</option><option value="open">Open</option><option value="in_progress">In progress</option><option value="waiting">Waiting</option><option value="done">Done</option><option value="all">All</option></select>
+   <select id="tClient"><option value="">All clients</option></select>
+   <input id="tQ" placeholder="search…" style="min-width:140px">
+   <button id="tAddBtn">+ Add task</button>
+  </div>
+  <form id="tForm" class="ev info" style="display:none;padding:10px 14px;margin-bottom:10px">
+   <b id="tFormH">New task</b>
+   <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:8px;margin:8px 0">
+    <input name="title" placeholder="Title (short)" required style="grid-column:1/-1">
+    <input name="client" placeholder="Client" list="tClients"><input name="requester" placeholder="Requested by">
+    <select name="priority"><option value="high">high</option><option value="normal">normal</option><option value="low">low</option></select>
+    <input name="due" type="date">
+    <textarea name="request" rows="2" placeholder="Request: what they're asking for" style="grid-column:1/-1"></textarea>
+    <textarea name="reason" rows="2" placeholder="Why: the reason behind it" style="grid-column:1/-1"></textarea>
+    <textarea name="links" rows="1" placeholder="Links (one per line)" style="grid-column:1/-1"></textarea>
+    <textarea name="notes" rows="1" placeholder="Notes" style="grid-column:1/-1"></textarea>
+   </div>
+   <button type="submit">Save</button> <button type="button" id="tCancel">Cancel</button> <span id="tFormErr" class="up small"></span>
+  </form><datalist id="tClients"></datalist>
+  <div id="tBody"></div></div>
  <div id="v-runs" class="view">
   <p class="help">Each Lambda run as one row: when it ran, how long, records processed, errors and outcome. Click a run to see everything it logged. Above: functions that ran but processed nothing / far less than usual, or went quiet.</p>
   <div id="nothingBox"></div>
@@ -2739,7 +2835,7 @@ function renderSummary(){
     <td>${g.regression?'<span class="badge b-reg">REGRESSION</span>':''}${g.is_new?'<span class="badge b-new">NEW</span>':''}${g.is_spike?`<span class="badge b-spike">SPIKE ×${g.spike_ratio}</span>`:''}${g.mute&&!g.regression?`<span class="badge b-${g.mute}">${g.mute.toUpperCase()}</span>`:''}${g.likely_format?`<span class="badge" style="background:var(--line)" title="Appears in ${g.likely_format}% of this function's runs: either its normal output, or a chronic issue that happens every run (still worth fixing). Add a note saying which; mute it only if it's normal output.">EVERY RUN</span>`:''}<br>
       <b>${esc(g.etype)}</b><br><span class="small" style="color:var(--mute)">${esc(g.level)}${g.hint?` · ${esc(g.hint)}`:''}</span>
       ${g.note?`<div class="note">📝 ${esc(g.note)}${g.ignore_below?` (ignore under ${g.ignore_below}/day)`:''}</div>`:''}${aiLine(g.ai)}
-      <div>${g.mute?`<button class="act" data-a="unmute">unmute</button>`:'<button class="act" data-a="muted">mute</button><button class="act" data-a="fixed">mark fixed</button>'}<button class="act" data-a="note">note</button></div></td>
+      <div>${g.mute?`<button class="act" data-a="unmute">unmute</button>`:'<button class="act" data-a="muted">mute</button><button class="act" data-a="fixed">mark fixed</button>'}<button class="act" data-a="note">note</button><button class="act" data-a="task">+ task</button></div></td>
     <td class="sig" title="${esc(g.sample)}">${highlight(g.sig||'—',g.hint)}</td>
     <td class="small">${list(g.profiles)}</td><td class="small">${list(g.log_groups)}</td>
     <td class="small">${new Date(g.first_seen).toLocaleString()}</td>
@@ -2748,6 +2844,7 @@ function renderSummary(){
   document.querySelectorAll('#sumBody tr.click').forEach(tr=>{tr.onclick=()=>{const g=sumRows[tr.dataset.i];
     setSig({etype:g.etype,sig:g.sig}); show(g.level==='error'?'errors':g.level==='suspect'?'suspect':'all')};
     tr.querySelectorAll('.act').forEach(b=>b.onclick=ev=>{ev.stopPropagation(); const g=sumRows[tr.dataset.i], prof=$('fProfile').value;
+      if(b.dataset.a==='task')return patternTask(g,prof,b);
       b.dataset.a==='note'?editNote(g.etype,g.sig,prof):b.dataset.a==='unmute'?unmute(g.etype,g.sig,prof):mute(g.etype,g.sig,prof,b.dataset.a)})});
 }
 async function loadVolume(){
@@ -2773,7 +2870,7 @@ async function counts(){
 async function refresh(newIds,force){
   if(busy)return; busy=true;
   try{
-    const HEAVY={clients:loadClients,runs:loadRuns,trace:pollTrace,volume:loadVolume,deploys:loadDeploys,partners:loadPartners,schedules:loadSchedules,inventory:loadInventory,apis:loadApis,digest:loadDigest,health:loadHealth};
+    const HEAVY={tasks:loadTasks,clients:loadClients,runs:loadRuns,trace:pollTrace,volume:loadVolume,deploys:loadDeploys,partners:loadPartners,schedules:loadSchedules,inventory:loadInventory,apis:loadApis,digest:loadDigest,health:loadHealth};
     if(tab==='patterns'||HEAVY[tab]){
       if(force||Date.now()-lastHeavy>30000){ lastHeavy=Date.now();
         tab==='patterns'?(sumRows=await getJ('/api/summary?'+params(false)),renderSummary()):await HEAVY[tab](); }
@@ -2962,8 +3059,69 @@ const prioSel=(p,cur)=>`<select class="prio" data-p="${esc(p)}" title="Priority:
 let PRIO={};
 async function loadPrefs(){try{const r=await getJ('/api/prefs');PRIO={};r.profiles.forEach(x=>PRIO[x.profile]=x);updateProfiles(true)}catch(e){}}
 function bindPrio(root){root.querySelectorAll('select.prio').forEach(sel=>{sel.onclick=e=>e.stopPropagation();sel.onchange=async()=>{await getJ('/api/prefs/set?'+new URLSearchParams({profile:sel.dataset.p,priority:sel.value}));await loadPrefs();refresh(null,true)}})}
+// ---------------------------------------------------------------- tasks (tasks.db)
+let taskRows=[], taskOpen=new Set(), taskEdit=null, taskClient=null, tqTimer=null;
+const TST={open:'open',in_progress:'in progress',waiting:'waiting',done:'done'};
+const postJ=async(u,b)=>(await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)})).json();
+const todayStr=()=>new Date().toLocaleDateString('sv');
+const tSel=(k,v,opts,lab)=>`<select class="tsel" data-k="${k}" style="font-size:12px;padding:1px 4px">${opts.map(o=>`<option value="${o}"${o===v?' selected':''}>${esc(lab?lab[o]:o)}</option>`).join('')}</select>`;
+const tDetail=t=>`<div style="padding:6px 4px;font-size:13px;line-height:1.5">${t.request?`<div style="white-space:pre-wrap"><b>Request:</b> ${esc(t.request)}</div>`:''}${t.reason?`<div style="white-space:pre-wrap"><b>Why:</b> ${esc(t.reason)}</div>`:''}${(t.links||[]).length?`<div><b>Links:</b> ${t.links.map(l=>`<a href="${esc(l)}" target="_blank" rel="noopener">${esc(l.length>70?l.slice(0,70)+'…':l)}</a>`).join(' · ')}</div>`:''}${t.notes?`<div style="white-space:pre-wrap"><b>Notes:</b> ${esc(t.notes)}</div>`:''}${t.error_ref?`<div class="small">Error pattern: ${esc(t.error_ref)}</div>`:''}<div class="small" style="color:var(--mute)">#${t.id} · ${esc(t.source||'manual')} · added ${ago(t.created)}${t.done_at?' · done '+ago(t.done_at):''}</div></div>`;
+async function loadTasks(){
+  const cur=taskClient!=null?taskClient:$('tClient').value; taskClient=null;
+  const p=new URLSearchParams({status:$('tStatus').value,client:cur,q:$('tQ').value.trim()});
+  const [r,cl]=await Promise.all([getJ('/api/tasks?'+p),getJ('/api/tasks/clients')]);
+  if(r.error){$('tBody').innerHTML=`<div class="empty">${esc(r.error)}</div>`;return}
+  taskRows=r.items;
+  const names=[...new Set([...cl,...[...$('fProfile').options].map(o=>o.value).filter(Boolean),...(cur?[cur]:[])])].sort();
+  $('tClient').innerHTML='<option value="">All clients</option>'+names.map(n=>`<option${n===cur?' selected':''}>${esc(n)}</option>`).join('');
+  $('tClients').innerHTML=names.map(n=>`<option value="${esc(n)}">`).join('');
+  const td=todayStr(), nd=taskRows.filter(t=>t.status!=='done'), od=nd.filter(t=>t.due&&t.due<td).length;
+  $('count').textContent=`${nd.length} not done${od?` · ${od} overdue`:''}`; $('n-tasks').textContent=r.open_total||'';
+  $('tBody').innerHTML=taskRows.length?`<div style="overflow-x:auto"><table><thead><tr><th>Task</th><th>Client</th><th>Due</th><th>Priority</th><th>Status</th><th>Updated</th><th></th></tr></thead><tbody>${taskRows.map(t=>{
+    const over=t.status!=='done'&&t.due&&t.due<td;
+    return `<tr class="click" data-id="${t.id}" style="${t.status==='done'?'opacity:.55':''}"><td>${t.priority==='high'?'<span style="color:var(--err)">● </span>':''}<b>${esc(t.title)}</b>${t.requester?`<div class="small" style="color:var(--mute)">from ${esc(t.requester)}</div>`:''}</td>
+    <td>${esc(t.client||'—')}</td><td style="white-space:nowrap${over?';color:var(--err)':''}">${esc(t.due||'—')}${over?' overdue':''}</td>
+    <td>${tSel('priority',t.priority,['high','normal','low'])}</td><td>${tSel('status',t.status,Object.keys(TST),TST)}</td>
+    <td class="small" style="white-space:nowrap">${ago(t.updated)}</td>
+    <td style="white-space:nowrap"><button class="act" data-a="edit">edit</button><button class="act" data-a="del">delete</button></td></tr>
+    <tr class="run-lines${taskOpen.has(t.id)?' on':''}" data-for="${t.id}"><td colspan="7">${tDetail(t)}</td></tr>`}).join('')}</tbody></table></div>`
+    :'<div class="empty">No tasks here. Add one with "+ Add task", or ask Claude: "look at my emails from the last 2 days and add the tasks to the dashboard".</div>';
+  $('tBody').querySelectorAll('tr.click').forEach(tr=>{const id=+tr.dataset.id;
+    tr.onclick=e=>{if(e.target.closest('select,button,a'))return; taskOpen.has(id)?taskOpen.delete(id):taskOpen.add(id); $('tBody').querySelector(`tr[data-for="${id}"]`).classList.toggle('on')};
+    tr.querySelectorAll('select.tsel').forEach(s=>s.onchange=async()=>{await postJ('/api/tasks/update',{id,[s.dataset.k]:s.value}); loadTasks()});
+    tr.querySelectorAll('.act').forEach(b=>b.onclick=async e=>{e.stopPropagation();
+      if(b.dataset.a==='edit')return taskForm(taskRows.find(t=>t.id===id));
+      if(b.textContent!=='sure?'){b.textContent='sure?';setTimeout(()=>b.textContent='delete',3000);return}
+      await getJ('/api/tasks/delete?id='+id); loadTasks()})});
+}
+function taskForm(t){
+  taskEdit=t||null; const f=$('tForm'); f.style.display=''; $('tFormErr').textContent='';
+  const v=t||{priority:'normal',client:$('tClient').value||$('fProfile').value||''};
+  ['title','client','requester','due','request','reason','notes'].forEach(k=>f.elements[k].value=v[k]||'');
+  f.elements.priority.value=v.priority||'normal'; f.elements.links.value=(v.links||[]).join('\n');
+  $('tFormH').textContent=t?`Edit task #${t.id}`:'New task'; f.elements.title.focus();
+}
+async function patternTask(g,prof,b){
+  const client=prof||Object.keys(g.profiles||{})[0]||'';
+  const r=await postJ('/api/tasks/add',{items:[{title:`Fix ${g.etype}${client?' in '+client:''}`.slice(0,120),
+    request:(g.sig||'').slice(0,600), reason:(g.ai&&(g.ai.summary||g.ai.cause))||`${g.count} line(s) in the selected range`,
+    client, source:'error', error_ref:`${g.etype} | ${g.sig}`.slice(0,500)}]});
+  b.textContent=r.error?'failed':(r.added||[]).length?'task added ✓':'already a task';
+}
+$('tStatus').onchange=()=>loadTasks(); $('tClient').onchange=()=>loadTasks();
+$('tQ').oninput=()=>{clearTimeout(tqTimer); tqTimer=setTimeout(loadTasks,300)};
+$('tAddBtn').onclick=()=>taskForm(null);
+$('tCancel').onclick=()=>{$('tForm').style.display='none'; taskEdit=null};
+$('tForm').onsubmit=async e=>{e.preventDefault(); const f=e.target, b={};
+  ['title','client','requester','due','request','reason','notes','priority'].forEach(k=>b[k]=f.elements[k].value.trim());
+  b.links=f.elements.links.value.split(/\s+/).filter(Boolean);
+  const r=taskEdit?await postJ('/api/tasks/update',{id:taskEdit.id,...b}):await postJ('/api/tasks/add',{items:[{...b,source:'manual'}]});
+  if(r.error||(r.errors||[]).length){$('tFormErr').textContent=r.error||r.errors.join('; ');return}
+  f.style.display='none'; taskEdit=null; loadTasks()};
 async function loadClients(){
   const all=await getJ('/api/ops/clients'); loadPrefs();
+  const tc=await getJ('/api/tasks/counts').catch(()=>({})); $('n-tasks').textContent=Object.values(tc).reduce((s,x)=>s+x.open,0)||'';
+  const tlink=p=>{const x=tc[p];return x?`<a data-tasks="${esc(p)}"${x.overdue?' style="color:var(--err)"':''}>${x.open} task${x.open>1?'s':''}${x.overdue?` (${x.overdue} overdue)`:''}</a>`:''};
   const cards=all.filter(c=>!c.asleep), sleeping=all.filter(c=>c.asleep);
   const red=cards.filter(c=>c.status==='red').length, amb=cards.filter(c=>c.status==='amber').length;
   $('count').textContent=`${red} red · ${amb} amber · ${cards.length-red-amb} green`;
@@ -2977,12 +3135,13 @@ async function loadClients(){
     ${c.reasons.length?`<ul>${c.reasons.slice(0,6).map(r=>`<li>${esc(r)}</li>`).join('')}${c.reasons.length>6?`<li>+${c.reasons.length-6} more</li>`:''}</ul>`:'<div class="small" style="color:var(--ok)">Nothing needs attention.</div>'}
     <div class="foot"><span>~$${c.cost_30d}/30d</span>${c.last_deploy&&!(c.recent_deploys||[]).length?`<span>Last deploy: ${esc(c.last_deploy.function)} ${ago(c.last_deploy.at)}</span>`:''}
      <a data-go="errors" data-p="${esc(c.profile)}">errors</a><a data-go="runs" data-p="${esc(c.profile)}">runs</a><a data-go="schedules" data-p="${esc(c.profile)}">schedules</a>
-     <a href="/report?profile=${encodeURIComponent(c.profile)}&days=7" target="_blank">weekly report ↗</a>${prioSel(c.profile,c.priority)}</div></div>`).join('')
+     <a href="/report?profile=${encodeURIComponent(c.profile)}&days=7" target="_blank">weekly report ↗</a>${tlink(c.profile)}${prioSel(c.profile,c.priority)}</div></div>`).join('')
     ||'<div class="empty">Loading clients… (first scan takes about a minute)</div>';
   $('clientSleep').innerHTML=sleeping.length?`<b>On demand</b> — not loaded until you open one (stays loaded ${esc(String((await getJ('/api/prefs')).wake_hours))}h): `+sleeping.map(c=>`<span class="sl">${esc(c.profile)} <a data-wake="${esc(c.profile)}">load ▸</a>${prioSel(c.profile,'on_demand')}</span>`).join(''):'';
   $('clientSleep').querySelectorAll('a[data-wake]').forEach(a=>a.onclick=async()=>{a.textContent='loading…';await getJ('/api/prefs/wake?profile='+encodeURIComponent(a.dataset.wake));refresh(null,true)});
   bindPrio($('clientCards')); bindPrio($('clientSleep'));
   document.querySelectorAll('#clientCards h3').forEach(h=>h.onclick=()=>{$('fProfile').value=cards[h.dataset.i].profile; show('errors')});
+  document.querySelectorAll('#clientCards a[data-tasks]').forEach(a=>a.onclick=()=>{taskClient=a.dataset.tasks; show('tasks')});
   document.querySelectorAll('#clientCards a[data-go]').forEach(a=>a.onclick=()=>{$('fProfile').value=a.dataset.p; show(a.dataset.go)});
 }
 let runGroups=[];
@@ -3071,7 +3230,7 @@ function show(v){
   tab=v; document.querySelectorAll('.tabs button').forEach(b=>b.classList.toggle('on',b.dataset.v===v));
   const feed=['errors','suspect','all'].includes(v);
   $('v-feed').classList.toggle('on',feed); $('v-patterns').classList.toggle('on',v==='patterns'); $('v-volume').classList.toggle('on',v==='volume'); $('v-deploys').classList.toggle('on',v==='deploys'); $('v-partners').classList.toggle('on',v==='partners');
-  ['schedules','inventory','apis','digest','health','clients','runs','trace'].forEach(x=>$('v-'+x).classList.toggle('on',v===x));
+  ['schedules','inventory','apis','digest','health','clients','tasks','runs','trace'].forEach(x=>$('v-'+x).classList.toggle('on',v===x));
   $('fLevel').style.display=(v==='all'||v==='patterns')?'':'none';
   if(v==='patterns'&&!$('fLevel').dataset.touched)$('fLevel').value='error,suspect';
   if(v==='all'&&!$('fLevel').dataset.touched)$('fLevel').value='error,suspect,warning,info';
@@ -3186,7 +3345,7 @@ async function status(){
   }catch(e){}
 }
 function onRange(){ const h=$('fHours').value;
-  if(h&&!['deploys','schedules','inventory','apis','digest','health','clients','trace'].includes(tab)) fetch('/api/backfill?hours='+h);   // these views don't need old logs
+  if(h&&!['deploys','schedules','inventory','apis','digest','health','clients','tasks','trace'].includes(tab)) fetch('/api/backfill?hours='+h);   // these views don't need old logs
   refresh(null,true); status(); }
 let qt; $('q').oninput=()=>{clearTimeout(qt);qt=setTimeout(()=>refresh(null,true),300)};
 $('fHours').onchange=onRange; $('runGroup').onchange=()=>refresh(null,true); $('runProblems').onchange=()=>refresh(null,true);
@@ -3211,7 +3370,7 @@ $('notifySus').checked=store.get('notifySus')==='1'; $('notifySus').onchange=e=>
   if(u.get('level')){const sel=$('fLevel'); if(![...sel.options].some(o=>o.value===u.get('level'))){const o=document.createElement('option');o.value=u.get('level');o.textContent=u.get('level');sel.appendChild(o)} sel.value=u.get('level'); sel.dataset.touched=1}
   if(u.get('grp'))grpFilter=u.get('grp');
   if(u.get('etype'))sigFilter={etype:u.get('etype'),sig:u.get('sig')||''};
-  loadPrefs(); renderChips(); show(['errors','suspect','all','patterns','volume','deploys','partners','schedules','inventory','apis','digest','health','clients','runs','trace'].includes(u.get('tab'))?u.get('tab'):'clients');
+  loadPrefs(); renderChips(); show(['errors','suspect','all','patterns','volume','deploys','partners','schedules','inventory','apis','digest','health','clients','tasks','runs','trace'].includes(u.get('tab'))?u.get('tab'):'clients');
   if(u.get('trace')){$('trTerm').value=u.get('trace'); show('trace'); startTrace()}})();
 onRange(); tick(); setInterval(tick,5000); setInterval(status,5000);
 </script></body></html>"""
@@ -3262,6 +3421,9 @@ def main():
     global HEALTH, DRAIN, PREFS, PICKER
     HEALTH = aws_health.Health(store, cfg, db)
     PREFS = aws_prefs.Prefs(store, cfg)
+    global TASKS
+    TASKS = aws_tasks.open_db(HERE, cfg)
+    print(f"Tasks: {TASKS.path}")
     PICKER = aws_local_picker = aws_prefs.ModelPicker(LLM, PREFS, HEALTH)
     if aws_local_picker.source == "dashboard":
         print(f"Local model picked in the dashboard: {LLM.model} (num_ctx {LLM.num_ctx})")

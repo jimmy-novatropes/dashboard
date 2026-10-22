@@ -77,6 +77,9 @@ anything that isn't in the notes."""
 # Health hooks (set by aws_error_feed to aws_health.Health methods); all optional.
 HOOKS = {"event": None, "count": None, "llm_call": None}
 BACKGROUND_KINDS = ("triage",)      # everything else is someone (Claude / the page) waiting for an answer
+# Cloud model (Ollama Pro, e.g. gpt-oss:120b-cloud, served through the same local Ollama): does the deep work
+# someone is waiting for. These kinds always stay on the local GPU (background / many tiny calls):
+LOCAL_ONLY_KINDS = ("triage", "repo_map", "filemap", "other")
 
 
 def _hook(name, *a):
@@ -128,6 +131,14 @@ class LocalLLM:
         self.gate = Gate(c.get("parallel") or 1)   # model calls at once (match OLLAMA_NUM_PARALLEL)
         self.last_call = {}                   # timings of the latest call (for the status line)
         self.meter = None                     # meter(kind, chars_read, chars_written) - savings counter
+        cc = cfg.get("cloud_llm") or {}
+        self.cloud = {"enabled": bool(cc.get("enabled")), "model": cc.get("model") or "gpt-oss:120b-cloud",
+                      "local_kinds": tuple(cc.get("local_kinds") or LOCAL_ONLY_KINDS),
+                      "num_ctx": int(cc.get("num_ctx") or 65536),
+                      "max_input_chars": int(cc.get("max_input_chars") or 180000),
+                      "daily_token_cap": int(cc.get("daily_token_cap") or 3_000_000)}
+        self.cloud_gate = Gate(cc.get("parallel") or 3)   # Ollama Pro allows 3 requests at once
+        self.cloud_used = {"day": "", "tokens": 0, "calls": 0, "fallbacks": 0, "last_error": None}
 
     # ------------------------------------------------------------ health
     def check(self, force=False):
@@ -150,6 +161,34 @@ class LocalLLM:
                           "detail": f"Ollama not reachable at {self.url} - install it and run: ollama pull {self.model}"}
         return self.state
 
+    # ------------------------------------------------------------ routing (local GPU vs cloud)
+    def route(self, kind):
+        """"cloud" for deep work someone waits for, "local" for background triage / tiny calls,
+        or when the cloud is off or today's token cap is used up."""
+        c = self.cloud
+        if not c["enabled"] or kind in c["local_kinds"]:
+            return "local"
+        day = time.strftime("%Y-%m-%d")
+        if self.cloud_used["day"] != day:
+            self.cloud_used.update(day=day, tokens=0, calls=0, fallbacks=0)
+        return "cloud" if self.cloud_used["tokens"] < c["daily_token_cap"] else "local"
+
+    def model_for(self, kind):
+        return self.cloud["model"] if self.route(kind) == "cloud" else self.model
+
+    def max_input_for(self, kind):
+        return self.cloud["max_input_chars"] if self.route(kind) == "cloud" else self.max_input_chars
+
+    def chunk_for(self, kind):
+        if self.route(kind) == "cloud":
+            return max(4000, min(self.cloud["max_input_chars"], (self.cloud["num_ctx"] - 1800) * 3))
+        return self.chunk_chars
+
+    def cloud_status(self):
+        c = self.cloud
+        return {"enabled": c["enabled"], "model": c["model"], "daily_token_cap": c["daily_token_cap"],
+                "local_kinds": list(c["local_kinds"]), **self.cloud_used, "queue": self.cloud_gate.state()}
+
     @property
     def ready(self):
         return self.check()["ok"]
@@ -161,23 +200,37 @@ class LocalLLM:
 
     # ------------------------------------------------------------ generation
     def chat(self, system, user, as_json=False, timeout=300, max_tokens=700, kind="other"):
-        cut = len(user) > self.max_input_chars
-        user = user[: self.max_input_chars]
-        body = {"model": self.model, "stream": False,
+        if self.route(kind) == "cloud":
+            c = self.cloud
+            try:
+                return self._chat(system, user, as_json, timeout, max_tokens, kind,
+                                  c["model"], c["num_ctx"], c["max_input_chars"], self.cloud_gate, True)
+            except Exception as ex:          # offline / credit used up / model missing -> local GPU
+                self.cloud_used["fallbacks"] += 1
+                self.cloud_used["last_error"] = f"{type(ex).__name__}: {ex}"[:300]
+                _hook("event", "warning", "cloud_model", kind, "cloud failed, used local: " + str(ex)[:250])
+        return self._chat(system, user, as_json, timeout, max_tokens, kind,
+                          self.model, self.num_ctx, self.max_input_chars, self.gate, False)
+
+    def _chat(self, system, user, as_json, timeout, max_tokens, kind, model, num_ctx, max_input, gate, cloud):
+        cut = len(user) > max_input
+        user = user[: max_input]
+        body = {"model": model, "stream": False,
                 "messages": [{"role": "system", "content": system},
                              {"role": "user", "content": user}],
-                "options": {"num_ctx": self.num_ctx, "temperature": 0.2, "num_predict": max_tokens}}
+                "options": {"num_ctx": num_ctx, "temperature": 0.2, "num_predict": max_tokens,
+                            "repeat_penalty": 1.1}}
         if as_json:
             body["format"] = "json"
-        if self.model.startswith("gpt-oss"):
+        if model.startswith("gpt-oss"):
             body["think"] = "low"                 # gpt-oss: keep its reasoning short
-        elif re.match(r"(qwen3|deepseek-r1)", self.model):
+        elif re.match(r"(qwen3|deepseek-r1)", model):
             body["think"] = False
         prio = 1 if kind in BACKGROUND_KINDS else 0
-        rec = {"kind": kind, "model": self.model, "prio": prio, "num_ctx": self.num_ctx,
+        rec = {"kind": kind, "model": model, "prio": prio, "num_ctx": num_ctx, "cloud": cloud,
                "in_chars": len(system) + len(user), "truncated": cut}
         t_wait = time.time()
-        self.gate.acquire(prio)
+        gate.acquire(prio)
         rec["wait_ms"] = int(1000 * (time.time() - t_wait))
         t0, resp, text = time.time(), {}, ""
         try:
@@ -194,20 +247,27 @@ class LocalLLM:
                     if attempt == 0 and "think" in detail and "think" in body:
                         body.pop("think")          # model doesn't support the think option
                         continue
+                    if attempt == 0 and "repeat limit" in detail:
+                        # the model got stuck repeating itself: one retry, a bit more random
+                        body["options"].update(temperature=0.6, repeat_penalty=1.2)
+                        continue
                     raise RuntimeError(f"Ollama error {ex.code}: {detail[:200]}")
         except Exception as ex:
-            self.gate.release()
+            gate.release()
             rec.update(err=f"{type(ex).__name__}: {ex}"[:300], total_ms=int(1000 * (time.time() - t0)))
             _hook("llm_call", rec)
             raise
-        self.gate.release()
+        gate.release()
         ns = lambda k: int((resp.get(k) or 0) / 1e6)
         rec.update(out_chars=len(text), prompt_tok=resp.get("prompt_eval_count"), gen_tok=resp.get("eval_count"),
                    load_ms=ns("load_duration"), prompt_ms=ns("prompt_eval_duration"), gen_ms=ns("eval_duration"),
                    total_ms=int(1000 * (time.time() - t0)), cut_off=resp.get("done_reason") == "length")
-        if (resp.get("prompt_eval_count") or 0) >= self.num_ctx - max_tokens - 64:
+        if cloud:
+            self.cloud_used["tokens"] += (resp.get("prompt_eval_count") or 0) + (resp.get("eval_count") or 0)
+            self.cloud_used["calls"] += 1
+        if (resp.get("prompt_eval_count") or 0) >= num_ctx - max_tokens - 64:
             rec["truncated"] = True           # Ollama silently drops what doesn't fit num_ctx
-        self.last_call = {"at": time.time(), "kind": kind,
+        self.last_call = {"at": time.time(), "kind": kind, "model": model,
                           "gen_tps": round(rec["gen_tok"] / (rec["gen_ms"] / 1000), 1) if rec.get("gen_ms") else None,
                           "secs": round(rec["total_ms"] / 1000, 1)}
         if self.meter:
@@ -464,8 +524,8 @@ class Jobs:
         """One call with a named template (edit / commit / fix / narrative / run / filemap)."""
         system, max_tokens = TEMPLATES[template]
         kind = kind or template
-        text = text[: self.llm.chunk_chars - 400]
-        key = hashlib.sha1((self.llm.model + "tpl:" + template + question + text).encode()).hexdigest()
+        text = text[: self.llm.chunk_for(kind) - 400]
+        key = hashlib.sha1((self.llm.model_for(kind) + "tpl:" + template + question + text).encode()).hexdigest()
         jid = uuid.uuid4().hex[:10]
         if key in self.cache:
             _hook("count", "cache:hit:" + kind)
@@ -528,7 +588,7 @@ class Jobs:
         return jid
 
     def start(self, question, text, kind="summary"):
-        key = hashlib.sha1((self.llm.model + kind + question + text).encode()).hexdigest()
+        key = hashlib.sha1((self.llm.model_for(kind) + kind + question + text).encode()).hexdigest()
         if key in self.cache:
             _hook("count", "cache:hit:" + kind)
             jid = uuid.uuid4().hex[:10]
@@ -563,14 +623,14 @@ class Jobs:
     def start_docs(self, question, docs, kind="read"):
         """Read a set of documents [{name, text}] - one call if they fit, otherwise notes per part
         (map) combined into one answer (reduce). Runs in the background; poll with get()."""
-        key = hashlib.sha1((self.llm.model + kind + question + json.dumps(docs, sort_keys=True)).encode()).hexdigest()
+        key = hashlib.sha1((self.llm.model_for(kind) + kind + question + json.dumps(docs, sort_keys=True)).encode()).hexdigest()
         jid = uuid.uuid4().hex[:10]
         if key in self.cache:
             _hook("count", "cache:hit:" + kind)
             self.jobs[jid] = {"id": jid, "status": "done", "answer": self.cache[key], "cached": True}
             return jid
         _hook("count", "cache:miss:" + kind)
-        budget = self.llm.chunk_chars - 600
+        budget = self.llm.chunk_for(kind) - 600
         parts = _pack_docs(docs, budget)
         job = {"id": jid, "status": "running", "answer": None, "started": time.time(),
                "parts": len(parts), "done_parts": 0}

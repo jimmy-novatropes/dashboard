@@ -91,7 +91,8 @@ class LocalLLM:
         body = {"model": self.model, "stream": False,
                 "messages": [{"role": "system", "content": system},
                              {"role": "user", "content": user[: self.max_input_chars]}],
-                "options": {"num_ctx": self.num_ctx, "temperature": 0.2, "num_predict": max_tokens}}
+                "options": {"num_ctx": self.num_ctx, "temperature": 0.2, "num_predict": max_tokens,
+                            "repeat_penalty": 1.1}}
         if as_json:
             body["format"] = "json"
         if self.model.startswith("gpt-oss"):
@@ -111,6 +112,10 @@ class LocalLLM:
                     detail = ex.read().decode(errors="ignore")
                     if attempt == 0 and "think" in detail and "think" in body:
                         body.pop("think")          # model doesn't support the think option
+                        continue
+                    if attempt == 0 and "repeat limit" in detail:
+                        # the model got stuck repeating itself: one retry, a bit more random
+                        body["options"].update(temperature=0.6, repeat_penalty=1.2)
                         continue
                     raise RuntimeError(f"Ollama error {ex.code}: {detail[:200]}")
         if not as_json:

@@ -64,13 +64,17 @@ COUNT_RX = [
 def structured(msg):
     """A structured log line from oflog: one JSON object with an "event" key, else None."""
     s = (msg or "").strip()
-    if not (s.startswith("{") and s.endswith("}") and '"event"' in s):
+    if not (s.startswith("{") and s.endswith("}") and ('"event"' in s or '"check"' in s)):
         return None
     try:
         d = json.loads(s)
     except ValueError:
         return None
-    return d if isinstance(d, dict) and isinstance(d.get("event"), str) else None
+    if not isinstance(d, dict):
+        return None
+    if not isinstance(d.get("event"), str) and isinstance(d.get("check"), str):
+        d["event"] = d["check"].lower()       # anew-style: {"check": "INVOCATION_SUMMARY", "crashed": false, ...}
+    return d if isinstance(d.get("event"), str) else None
 
 
 _COUNT_KEY = re.compile(r"(?:^|_)(?:count|records|processed|created|updated|upserted|synced)$", re.I)

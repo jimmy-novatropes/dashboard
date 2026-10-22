@@ -239,6 +239,14 @@ def structured_level(d):
     lvl = str(d.get("level") or "INFO").upper()
     if lvl in ("ERROR", "CRITICAL", "FATAL", "EXCEPTION"):
         return "error", ""
+    if d.get("event") == "invocation_summary":       # per-run summary line (anew): judge by its fields
+        if d.get("crashed") is True:
+            return "error", ""
+        bad = invocation_problems(d)
+        if bad:
+            return "suspect", ", ".join(bad)
+        if d.get("rate_limited_429"):
+            return "warning", ""
     if d.get("event") == "run_summary" and d.get("status") != "failed":
         res = d.get("results") if isinstance(d.get("results"), dict) else {}
         failed = d.get("records_failed") or res.get("failed")
@@ -249,9 +257,29 @@ def structured_level(d):
     return "info", ""
 
 
+def invocation_problems(d):
+    """Problems an INVOCATION_SUMMARY line reports (an empty list = a clean run)."""
+    bad, sc = [], d.get("status_code")
+    if isinstance(sc, int) and not isinstance(sc, bool) and sc >= 400:
+        bad.append(f"HTTP {sc}")
+    hf = d.get("http_failures")
+    if hf:
+        bad.append("http failures: " + (", ".join(map(str, hf)) if isinstance(hf, (dict, list)) else str(hf)))
+    if d.get("exceptions_logged"):
+        bad.append(f"{d['exceptions_logged']} exception(s) logged")
+    return bad
+
+
 def structured_signature(d, level):
     """Group oflog lines by their stable event name, not the changing message."""
     ev, partner = d["event"], d.get("partner")
+    if ev == "invocation_summary" and level in ("error", "suspect"):
+        what = "crashed" if d.get("crashed") is True else "problems"
+        kinds = normalize(" ".join(b.split(":")[0] for b in invocation_problems(d)))
+        hf = d.get("http_failures")
+        if isinstance(hf, (dict, list)) and hf:
+            kinds += " | " + ", ".join(sorted(map(str, hf))[:4])     # keep 429 vs 500 apart
+        return f"invocation_summary: {what}", kinds[:200]
     etype = ev + (f" ({partner})" if partner and str(partner) not in ev else "")
     if d.get("event") == "run_summary" and level == "suspect":
         return "run_summary: records failed", normalize(str(d.get("function") or ""))
@@ -1961,7 +1989,10 @@ def make_handler(store, workers, cfg):
             if filename:
                 self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
             self.end_headers()
-            self.wfile.write(data)
+            try:
+                self.wfile.write(data)
+            except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError):
+                pass                                # the browser / connector closed the request early
 
         def json(self, obj):
             self.send(200, json.dumps(obj), "application/json")

@@ -29,7 +29,23 @@
 - Keep `old_app` and `new_app` in sync for shared fixes; they differ only in port (8765/8766), the local
   model default (off/on), `mcp_server.py` default URL and `install_autostart.ps1`.
 - Read-only toward AWS. Never read secret values (Secrets Manager metadata only), never store Lambda env values.
-- `config.json`, `errors.db*`, `*.log`, `repos.json` are local and git-ignored — never commit them.
+- `config.json`, `errors.db*`, `tasks.db*`, `*.log`, `repos.json` are local and git-ignored — never commit them.
 - The dashboard has no login: share only inside the tailnet (`tailscale serve`), never `tailscale funnel`.
-- After changing `new_app`, the tower needs `git pull` + restart (stop the pythonw process, then
-  `Start-ScheduledTask "AWS Error Feed"`); the laptop needs Claude restarted for connector changes.
+- After changing `new_app`: the user runs `new_app/deploy_tower.py` on the tower (one step: compile check, commit + pull + push, restart, status, "RESTART CLAUDE: YES/NO").
+
+## Tasks (tasks.db)
+- `new_app/aws_tasks.py`: the user's task list in its own SQLite file `tasks.db` (never cleaned up, local only,
+  no ClickUp sync). Dashboard Tasks tab; connector `tasks_list` / `tasks_add` / `tasks_update`. From emails store only
+  the request, the reason and links.
+
+## Handing changes to the user (always this short list, nothing else)
+When code changes are ready, give the user only these steps (adapt the model line if no model changed):
+1. On the tower, run `python new_app\deploy_tower.py` in the dashboard folder (or double-click the file).
+2. Check the Status block: local model ready, cloud model ON (or the new model listed).
+3. Read the last line: `RESTART CLAUDE: YES` or `NO`.
+4. If YES: on the laptop run `git pull` in the dashboard folder, then quit Claude (tray icon -> Quit) and reopen it
+   on the laptop and the tower.
+5. Ask Claude "dashboard status" to confirm it works.
+New Ollama model: set `MODEL_TO_INSTALL` (+ `SWITCH_TO_NEW_MODEL`) at the top of `deploy_tower.py` before step 1.
+Cloud model (Ollama Pro, `gpt-oss:120b-cloud`): `cloud_llm` in `new_app/config.json`; deep work goes to the cloud,
+background triage stays local (see `LOCAL_ONLY_KINDS` in `aws_local.py`).
