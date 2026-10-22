@@ -2,7 +2,7 @@
 Tower deploy helper for the AWS Error Feed - ONE STEP after any change. Run on the tower:
     python new_app\\deploy_tower.py        (from the dashboard folder; or double-click this file)
   1. checks the code compiles (stops here if it doesn't - the running dashboard is left alone)
-  2. commits the changed app files, pulls the laptop's commits, pushes (COMMIT_AND_PUSH)
+  2. commits the changed app files locally (COMMIT); pushing to GitHub is off by default (PUSH) - push yourself
   3. downloads an extra Ollama model (MODEL_TO_INSTALL, skipped if empty or already installed)
   4. stops the running dashboard and starts it again (scheduled task "AWS Error Feed")
   5. waits until it answers and prints a short status (local + cloud model, tasks.db, end of dashboard.log)
@@ -17,9 +17,9 @@ import urllib.parse
 import urllib.request
 
 # ------------------------------------------------------------------ settings
-COMMIT_AND_PUSH = True                  # commit COMMIT_PATHS (if changed) and git push
+COMMIT = True                           # commit COMMIT_PATHS locally (if changed)
+PUSH = False                            # True = also git pull --rebase + git push to GitHub
 COMMIT_MESSAGE = ""                     # "" = automatic ("Update: <changed files>"); or write your own
-PULL_BEFORE_PUSH = True                 # git pull --rebase --autostash (gets the laptop's commits) before pushing
 COMMIT_PATHS = [".gitignore", "CLAUDE.md", "new_app", "old_app", "logging_kit"]   # never config.json / *.db (git-ignored)
 COMMIT_TRAILER = ("Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\n"
                   "Claude-Session: https://claude.ai/code/session_011KCTv4MMSvGb1qCJvzuc34")
@@ -90,11 +90,12 @@ def commit_and_push():
         if code:
             print("!! git commit failed - commit it yourself (the rest continues).")
             return
-    push()
+    if PUSH:
+        push()
 
 
 def push():
-    if PULL_BEFORE_PUSH:
+    if True:                            # get the laptop's commits first
         say("Getting the laptop's commits (git pull --rebase)")
         code, out = run(["git", "pull", "--rebase", "--autostash"], cwd=REPO)
         print(out or "ok")
@@ -256,7 +257,7 @@ if __name__ == "__main__":
         if sys.stdin and sys.stdin.isatty():
             input("\nPress Enter to close...")
         sys.exit(1)
-    if COMMIT_AND_PUSH:
+    if COMMIT:
         commit_and_push()
     model_ok = install_model(MODEL_TO_INSTALL) if MODEL_TO_INSTALL else False
     if restart_dashboard():
@@ -265,8 +266,8 @@ if __name__ == "__main__":
             switch_model(MODEL_TO_INSTALL, NEW_MODEL_CONTEXT)
     report()
     if claude_restart_needed():
-        say("Done. RESTART CLAUDE: YES - the connector changed. On the laptop: `git pull` in the dashboard "
-            "folder, then quit Claude (tray icon -> Quit) and reopen it; same for Claude on the tower.")
+        say("Done. RESTART CLAUDE: YES - the connector changed. After you push: on the laptop `git pull` in the "
+            "dashboard folder, then quit Claude (tray icon -> Quit) and reopen it; same for Claude on the tower.")
     else:
         say("Done. RESTART CLAUDE: NO - the connector didn't change.")
     if sys.stdin and sys.stdin.isatty():
