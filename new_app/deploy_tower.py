@@ -25,11 +25,11 @@ COMMIT_PATHS = [".gitignore", "CLAUDE.md", "new_app", "old_app", "logging_kit"] 
 COMMIT_TRAILER = ("Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\n"
                   "Claude-Session: https://claude.ai/code/session_011KCTv4MMSvGb1qCJvzuc34")
 CHECK_FILES = ["aws_error_feed.py", "aws_tasks.py", "aws_local.py", "aws_ops.py", "aws_health.py",
-               "aws_prefs.py", "aws_infra.py", "aws_intake.py", "aws_brief.py", "mcp_server.py"]
+               "aws_prefs.py", "aws_infra.py", "aws_intake.py", "aws_brief.py", "aws_research.py", "aws_updates.py", "mcp_server.py"]
 GMAIL_SIGN_IN = False                   # True ONCE: opens the browser to allow read-only Gmail for the daily intake
 INTAKE_RUN_NOW = False                  # True = run the daily intake for yesterday after the restart (to test it)
 INTAKE_PACKAGES = {"google.auth": "google-auth", "google_auth_oauthlib": "google-auth-oauthlib",
-                   "requests": "requests"}   # import name -> pip name, installed if missing
+                   "requests": "requests", "pypdf": "pypdf"}   # import name -> pip name, installed if missing
 MODEL_TO_INSTALL = ""                   # e.g. "qwen3:30b-a3b"; "" = don't download anything
 SWITCH_TO_NEW_MODEL = False             # True = make it the active model after the restart
 NEW_MODEL_CONTEXT = 8192                # context used if SWITCH_TO_NEW_MODEL is True

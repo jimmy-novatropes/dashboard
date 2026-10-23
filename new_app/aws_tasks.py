@@ -21,7 +21,7 @@ import time
 STATUSES = ("open", "in_progress", "waiting", "done", "proposed", "dismissed")
 HIDDEN = ("proposed", "dismissed")      # not in the normal list / counts until accepted
 PRIORITIES = ("high", "normal", "low")
-SOURCES = ("email", "error", "meeting", "manual")
+SOURCES = ("email", "error", "meeting", "manual", "report")
 FIELDS = ("title", "request", "reason", "links", "client", "requester", "source", "status", "priority",
           "due", "external_id", "error_ref", "notes")
 _DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")

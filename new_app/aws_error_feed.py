@@ -67,6 +67,8 @@ import aws_prefs  # noqa: E402  (project priority / on-demand projects, local mo
 import aws_tasks  # noqa: E402  (tasks / follow-ups, kept in tasks.db)
 import aws_intake  # noqa: E402  (daily: yesterday's Gmail + Fireflies -> proposed tasks)
 import aws_brief  # noqa: E402  (daily morning brief written by the tower's model)
+import aws_updates  # noqa: E402  (weekly client update email drafts -> proposed tasks)
+import aws_research  # noqa: E402  (web research: Ollama web search + fetch, cloud model writes a cited report)
 DAY_MS = 86_400_000
 LEVELS = ("error", "suspect", "warning", "info", "platform")
 
@@ -2207,6 +2209,7 @@ CODE = None
 TASKS = None
 INTAKE = None
 BRIEF = None
+UPDATES = None
 
 
 def make_handler(store, workers, cfg):
@@ -2432,6 +2435,11 @@ def make_handler(store, workers, cfg):
                     return self.json(TASKS.get(q.get("id") or 0) or {"error": "not found"})
                 if path == "/api/tasks/delete":
                     return self.json({"deleted": TASKS.delete(q.get("id") or 0)})
+                if path == "/api/tasks/updates/run":         # weekly client update drafts, now
+                    if not UPDATES or UPDATES.busy:
+                        return self.json({"started": False})
+                    threading.Thread(target=UPDATES.make, daemon=True).start()
+                    return self.json({"started": True})
                 if path == "/api/tasks/intake":
                     return self.json(INTAKE.status() if INTAKE else {"error": "intake not loaded"})
                 if path == "/api/tasks/intake/run":          # in the background; poll /api/tasks/intake
@@ -2462,7 +2470,7 @@ def make_handler(store, workers, cfg):
         def do_POST(self):
             u = urlparse(self.path)
             if u.path not in ("/api/ai/read", "/api/ai/prompt", "/api/ai/filemap", "/api/ai/filemap_known",
-                              "/api/tasks/add", "/api/tasks/update"):
+                              "/api/ai/research", "/api/tasks/add", "/api/tasks/update"):
                 return self.send(404, "not found", "text/plain")
             n = int(self.headers.get("Content-Length") or 0)
             if n > 12_000_000:
@@ -2477,6 +2485,12 @@ def make_handler(store, workers, cfg):
                 return self.json(AIJOBS.filemap_known(body.get("files") or []))
             if not LLM.ready:
                 return self.json({"error": "Local model not available: " + LLM.state["detail"]})
+            if u.path == "/api/ai/research":
+                q = str(body.get("question") or "").strip()
+                if not q:
+                    return self.json({"error": "No question."})
+                return self.json({"id": aws_research.start(AIJOBS, LLM, aws_research.api_key(cfg), q,
+                                                           str(body.get("depth") or "normal"))})
             if u.path == "/api/ai/prompt":
                 tpl = str(body.get("template") or "")
                 if tpl not in aws_local.TEMPLATES:
@@ -3220,14 +3234,16 @@ async function loadIntake(){
   if(st.enabled&&!st.gmail)warn.push('Gmail not signed in');
   if(st.enabled&&!st.fireflies)warn.push('no Fireflies key');
   $('tIntake').innerHTML=`📬 <b>Daily intake</b> ${st.run_at?'at '+esc(st.run_at):''} — `+(st.busy?'running now…':last?`last: ${esc(last.day)} → ${last.emails} emails, ${last.meetings} meetings, <b>${last.added}</b> proposed${last.error?` <span style="color:var(--err)">(${esc(last.error)})</span>`:''}`:'not run yet')
-    +(warn.length?` · <span style="color:var(--sus)">${esc(warn.join(', '))}</span>`:'')+` · <a id="tIntakeRun">run now</a>`;
+    +(warn.length?` · <span style="color:var(--sus)">${esc(warn.join(', '))}</span>`:'')+` · <a id="tIntakeRun">run now</a> · <a id="tUpdRun" title="Draft this week's client update emails (starred clients) as proposed tasks">draft weekly client updates</a>`;
+  $('tUpdRun').onclick=async()=>{$('tUpdRun').textContent='drafting… (1-2 min)';await getJ('/api/tasks/updates/run');setTimeout(loadTasks,60000)};
   $('tIntakeRun').onclick=async()=>{$('tIntakeRun').textContent='starting…';await getJ('/api/tasks/intake/run');setTimeout(loadTasks,4000)};
   if(st.busy)setTimeout(loadTasks,8000);
   const items=pr.items||[];
-  $('tProposed').innerHTML=items.length?`<div class="ev info" style="padding:8px 12px;margin-bottom:10px"><b>Proposed from yesterday's mail & meetings (${items.length})</b> <button class="act" id="tAccAll">accept all</button>
+  $('tProposed').innerHTML=items.length?`<div class="ev info" style="padding:8px 12px;margin-bottom:10px"><b>Proposed (${items.length}) - from mail, meetings and weekly updates</b> <button class="act" id="tAccAll">accept all</button>
     ${items.map(t=>`<div style="border-top:1px solid var(--line);padding:6px 0" data-pid="${t.id}"><button class="act" data-pa="open">accept</button><button class="act" data-pa="dismissed">dismiss</button>
      <b>${esc(t.title)}</b>${t.client?` · ${esc(t.client)}`:''}${t.due?` · due ${esc(t.due)}`:''}${t.priority==='high'?' · <span style="color:var(--err)">high</span>':''} <span class="small" style="color:var(--mute)">${esc(t.source||'')}${t.requester?' from '+esc(t.requester):''}</span>
-     <div class="small">${esc(t.request||'')}${t.reason?` <i>— ${esc(t.reason)}</i>`:''}${(t.links||[]).map(l=>` <a href="${esc(l)}" target="_blank" rel="noopener">open ↗</a>`).join('')}</div></div>`).join('')}</div>`:'';
+     <div class="small">${esc(t.request||'')}${t.reason?` <i>— ${esc(t.reason)}</i>`:''}${(t.links||[]).map(l=>` <a href="${esc(l)}" target="_blank" rel="noopener">open ↗</a>`).join('')}</div>${t.notes?`<details class="small"><summary>draft</summary><div style="white-space:pre-wrap">${esc(t.notes)}</div><button class="act" data-copy="${t.id}">copy draft</button></details>`:''}</div>`).join('')}</div>`:'';
+  $('tProposed').querySelectorAll('[data-copy]').forEach(b=>b.onclick=()=>{const t=items.find(x=>x.id==b.dataset.copy);navigator.clipboard.writeText((t.notes||'').replace(/^Draft[^\n]*\n/,''));b.textContent='copied ✓'});
   $('tProposed').querySelectorAll('[data-pa]').forEach(b=>b.onclick=async()=>{await postJ('/api/tasks/update',{id:+b.closest('[data-pid]').dataset.pid,status:b.dataset.pa});loadTasks()});
   const aa=$('tAccAll'); if(aa)aa.onclick=async()=>{for(const t of items)await postJ('/api/tasks/update',{id:t.id,status:'open'});loadTasks()};
 }
@@ -3613,6 +3629,14 @@ def main():
     global BRIEF
     BRIEF = aws_brief.Brief(LLM, TASKS, lambda: brief_context(store, workers, cfg), *aws_local.TEMPLATES["brief"])
     BRIEF.start()
+    global UPDATES
+    UPDATES = aws_updates.WeeklyUpdates(
+        LLM, TASKS,
+        lambda prof: aws_ops.report_markdown(aws_ops.client_report(store, workers, prof, 7, ops_helpers(store, workers, cfg))),
+        lambda which: sorted(p for p in {w.profile for w in workers}
+                             if not (PREFS and PREFS.asleep(p))
+                             and (which == "all" or (PREFS and PREFS.priority(p) == "high"))))
+    UPDATES.start()
     print("Daily intake:", f"on, {INTAKE.run_at} (Gmail {'signed in' if INTAKE.status()['gmail'] else 'NOT signed in'}, "
           f"Fireflies {'key set' if INTAKE.ff_key else 'NO key'})" if INTAKE.enabled else "off (intake.enabled in config.json)")
     PICKER = aws_local_picker = aws_prefs.ModelPicker(LLM, PREFS, HEALTH)

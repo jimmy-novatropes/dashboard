@@ -523,6 +523,17 @@ which tool would get it (get_log_lines, get_line_context, trace_record, local_re
 Times are tower local time; "Now" is given first. A deploy marked "too early" has too little data after it:
 don't say it worked or failed - give the time of the last error before / after it instead.
 Format: short bullets, max 250 words. Last line: "Evidence:" + up to 5 event_ids or file:line you used.""", 900),
+    "patch": ("""You change code for a developer. You get one or more files (full text, each after a line
+"===== FILE: <path> =====") and an instruction. Reply ONLY with edit blocks, as many as needed:
+FILE: <path exactly as given>
+<<<<<<< SEARCH
+<lines copied EXACTLY from that file (same spaces), enough lines to be unique>
+=======
+<the new lines>
+>>>>>>> REPLACE
+Keep the existing style, indentation and names; change only what the instruction needs; no unrelated
+refactors. If it can't be done safely from these files, reply exactly: CANNOT: <short reason>.
+After the blocks, one line: NOTE: <what changed and anything the developer should check>.""", 4000),
     "brief": ("""Write the developer's morning brief from this dashboard snapshot of all client integrations.
 Sections: "Needs action" (red clients: what is broken, since when, likely cause, first step),
 "Watch" (amber: only what is new or worse), "Quiet" (one line listing the rest),

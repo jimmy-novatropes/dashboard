@@ -25,6 +25,7 @@ Several machines (e.g. tower runs the dashboard + local model, laptop runs Claud
                          machine's repo copies, so file paths / VS Code links point at the laptop.
 """
 import json
+import uuid
 import re
 import os
 import subprocess
@@ -45,6 +46,12 @@ URLS = [u.strip().rstrip("/") for u in os.environ.get("AWS_ERROR_FEED_URL", "htt
 BASE = URLS[0]
 AUTOSTART = os.environ.get("AWS_ERROR_FEED_AUTOSTART", "1") != "0"
 REPOS = os.environ.get("AWS_ERROR_FEED_REPOS") or None
+# documents the tower's model may read (contracts, PDFs, specs, exports): drop them here, or set the env var
+DOCS = os.environ.get("AWS_ERROR_FEED_DOCS") or os.path.join(os.path.expanduser("~"), "Documents", "Tower Inbox")
+try:
+    os.makedirs(DOCS, exist_ok=True)
+except OSError:
+    pass
 _active = {"url": None, "at": 0.0}
 MAX_OUT = 40_000          # keep tool results a sensible size for the conversation
 LINES_SUMMARY_MIN_CHARS = 6000   # get_log_lines brief: longer than this (~1.5k tokens) -> the tower's model summarizes
@@ -55,6 +62,10 @@ PATTERNS_BRIEF_EXAMPLES = 3      # ...with an example only for the top N
 ASK_WAIT = 150                   # ask_tower / morning_brief: seconds to wait for the tower's model
 ASK_CONTEXT_CHARS = 150_000      # dashboard data the tower's model reads per question (~37k tokens, not Claude's)
 BRIEF_MAX_AGE_HOURS = 8          # morning_brief rewrites a brief older than this first
+RESEARCH_WAIT = 240              # research: seconds to wait for the tower's report
+CODE_CHANGE_CHARS = 120_000      # code_change: file text the tower's model reads per change
+CODE_CHANGE_WAIT = 180           # code_change: seconds to wait for the draft
+PATTERNS_BRIEF_LIMIT = 12        # list_error_patterns brief: one line per pattern, at most this many
 
 INSTRUCTIONS = """\
 Read-only access to the user's AWS Error Feed dashboard on their tower: CloudWatch Logs + Step Functions
@@ -66,9 +77,15 @@ gpt-oss when on), so let it do the reading:
   function). The tower gathers status, patterns, examples, preceding lines, code and runs, and answers
   with evidence ids. Prefer it to chaining investigate / get_log_lines / get_line_context; use those
   (and fix_brief) to verify, when ask_tower says data is missing, or right before editing code.
+- Web research needing several pages (comparing tools / vendors, docs, pricing, how-tos, recent changes)
+  -> research(question): the tower searches, reads the pages and returns a cited report. Use your own
+  web search only for one quick fact or to check a claim from the report.
+- Documents (contracts, PDFs, Word / Excel / PowerPoint, specs, exports): local_read(path, question) - the tower
+  reads them and answers with page / section references. Files dropped in the "Tower Inbox" folder (Documents)
+  are allowed; pass just the file name.
 - Code: find_code(query, repo) instead of opening files to search; local_read(path, question) instead of
-  reading big files; local_draft_change for small edits (returns a diff); local_run for tests. Tower
-  answers can be wrong - verify the lines you change.
+  reading big files; code_change(instruction, files) - the tower writes the change, you review only the
+  diff, then apply it with apply_id; local_run for tests. Tower output can be wrong - review every diff.
 
 Levels: error = logged as an error (tracebacks, crashes/timeouts, failed executions). suspect = "hidden
 error": not logged as an error but looks like one (try/except print, 4xx/5xx, Step Functions run saved by
@@ -390,8 +407,8 @@ def guard(fn):
 # Tool profile: "core" (default) exposes the everyday tools + more_tools (which reaches all the others),
 # so every message carries far fewer tool definitions. AWS_ERROR_FEED_TOOLS=all exposes everything.
 TOOLS_MODE = os.environ.get("AWS_ERROR_FEED_TOOLS", "core").strip().lower()
-CORE = {"morning_brief", "ask_tower", "clients_status", "investigate", "fix_brief", "list_error_patterns",
-        "get_log_lines", "get_line_context", "find_code", "local_read", "local_draft_change", "local_run",
+CORE = {"morning_brief", "ask_tower", "research", "code_change", "clients_status", "investigate", "fix_brief",
+        "list_error_patterns", "get_log_lines", "get_line_context", "find_code", "local_read", "local_run",
         "tasks_list"}       # the rest (tasks_add, tasks_update, outline, ...): more_tools()
 CORE |= {x.strip() for x in os.environ.get("AWS_ERROR_FEED_EXTRA_TOOLS", "").split(",") if x.strip()}
 REGISTRY, EXPOSED = {}, set()
@@ -512,9 +529,9 @@ def list_error_patterns(hours: float = 24, profile: str = "", level: str = "erro
                         log_group_prefix: str = "", search: str = "", limit: int = 12,
                         only_new_or_spiking: bool = False, include_muted: bool = False,
                         detail: str = "brief") -> str:
-    """Recurring problems grouped by type+message with counts, groups, first/last seen and an example;
-    tagged NEW / SPIKE / REGRESSION. level: comma list (error,suspect,warning,info). detail="full"
-    for longer examples."""
+    """Recurring problems grouped by type+message, tagged NEW / SPIKE / REGRESSION / CHRONIC.
+    detail="brief" (default): one line per pattern (type, count, tags, message, where, triage verdict).
+    detail="normal": + examples and trends for the top ones; "full": everything. level: comma list."""
     note = ensure_range(hours)
     rows = api("/api/summary", hours=hours, profile=profile, level=level,
                grp_prefix=log_group_prefix, q=search, hide_muted="" if include_muted else 1)
@@ -523,6 +540,18 @@ def list_error_patterns(hours: float = 24, profile: str = "", level: str = "erro
     rows = rows[: max(1, min(limit, 100))]
     out = [note + f"{len(rows)} patterns, last {hours}h — dashboard: "
            f"{link(tab='patterns', hours=int(hours), profile=profile, level=level, q=search)}"]
+    if detail == "brief":
+        out.append("One line each - details: same call with detail=\"normal\"; lines: get_log_lines(error_type, "
+                   "signature); a question about them: ask_tower.")
+        for i, g in enumerate(rows[:PATTERNS_BRIEF_LIMIT], 1):
+            tags = [x for x, on in (("REGRESSION", g.get("regression")), ("NEW", g.get("is_new")),
+                                    ("SPIKE", g.get("is_spike")), ("CHRONIC", chronic(g))) if on]
+            a = g.get("ai") or {}
+            out.append(f"{i}. [{g['level']}] {g['etype']} {g['count']}x{' ' + '/'.join(tags) if tags else ''} | "
+                       f"{g['sig'][:300]}{'…' if len(g['sig']) > 300 else ''} | {top(g['log_groups'], 1)}" + (f" | triage: {a.get('verdict')}" if a.get("verdict") else ""))
+        if len(rows) > PATTERNS_BRIEF_LIMIT:
+            out.append(f"(+{len(rows) - PATTERNS_BRIEF_LIMIT} more)")
+        return finish(out)
     if detail != "full":
         out.append("Lines for a pattern: get_log_lines(error_type=<type>, signature=<message>); "
                    "deeper: investigate / fix_brief.")
@@ -1197,19 +1226,19 @@ def add_note(error_type: str, signature: str, note: str, profile: str = "", igno
 
 @tool()
 @guard
-def client_report(profile: str, days: float = 7, tower_summary: bool = False) -> str:
+def client_report(profile: str, days: float = 7, tower_summary: bool = True) -> str:
     """Client-facing health report for one client over `days`: Lambda and workflow success rates
     (from CloudWatch metrics), records processed, errors vs the previous period, issues resolved,
     open items, scheduled-job problems, changes deployed, third-party service issues and recommended
     maintenance. Returned as markdown - offer to turn it into a doc. Printable version via the link.
-    tower_summary=True adds a short client-friendly summary paragraph written by the local model."""
+    tower_summary (default on) adds a short client-friendly summary written by the tower's model."""
     r = api("/api/ops/report", profile=profile, days=days)
     if r.get("error"):
         return r["error"]
     out = [r["markdown"], f"\nPrintable / PDF: {base()}/report?profile={urllib.parse.quote(profile)}&days={days:g}"]
     if tower_summary:
         jid, ans, err = _tower_job("narrative", r["markdown"], seconds=60)
-        out.insert(0, f"**Summary** (drafted by the local model - review): {ans.strip()}\n" if ans else
+        out.insert(0, f"**Summary** (drafted by the tower's model - review): {ans.strip()}\n" if ans else
                    f"(No local summary: {err or 'still being written, try again shortly'})\n")
     return finish(out)
 
@@ -1338,6 +1367,134 @@ def ask_tower(question: str, profile: str = "", function: str = "", hours: float
                    f"~{len(text) // 4:,} tokens read on the tower) — dashboard: "
                    f"{link(tab='errors' if prof else 'clients', profile=prof, hours=int(hours))}",
                    j["answer"], "(Verify before acting: investigate / get_log_lines / get_line_context with the same profile.)"])
+
+
+@tool()
+@guard
+def research(question: str, depth: str = "normal", job_id: str = "") -> str:
+    """Web research done on the tower: its model plans searches, reads the pages (Ollama web search +
+    fetch) and returns a short report with numbered sources. Use for anything needing several pages
+    (comparing tools / vendors, docs, pricing, how-tos, recent changes). depth: quick | normal | deep.
+    Takes 30 s - 3 min; poll with job_id."""
+    if not job_id:
+        r = api_post("/api/ai/research", {"question": question, "depth": depth})
+        if r.get("error"):
+            return f"The tower can't research right now ({r['error']}) - use your own web search."
+        job_id = r["id"]
+    j = _wait_job(job_id, RESEARCH_WAIT)
+    if j.get("status") == "running":
+        return (f"Still researching ({j.get('stage', '')}) - call research(question=..., job_id=\"{job_id}\") "
+                f"again in ~30s.")
+    if j.get("error") or not j.get("answer"):
+        return f"The tower's research failed ({j.get('error') or 'empty'}) - use your own web search."
+    return finish([f"Tower research report (searched: {'; '.join(j.get('queries') or [])}). Verify key facts "
+                   f"against the sources before relying on them:", j["answer"]])
+
+
+_pending_changes = {}
+
+
+def _apply_blocks(texts, answer):
+    """texts {rel: text} + the model's SEARCH/REPLACE blocks -> ({rel: new text}, problems)."""
+    new, problems = dict(texts), []
+    blocks = _re.findall(r"FILE:[ \t]*([^\n]+)\n<<<<<<< SEARCH\n(.*?)\n?=======\n(.*?)\n?>>>>>>> REPLACE", answer, _re.S)
+    if not blocks:
+        problems.append("no edit blocks in the answer")
+    for n, (f, s, r) in enumerate(blocks, 1):
+        f = f.strip().strip("`")
+        key = f if f in new else next((k for k in new if k.endswith(f) or f.endswith(k)), None)
+        if not key:
+            problems.append(f"block {n}: unknown file {f}")
+            continue
+        if not s.strip():
+            problems.append(f"block {n}: empty SEARCH")
+            continue
+        t = new[key]
+        if t.count(s) == 1:
+            new[key] = t.replace(s, r)
+            continue
+        # tolerate trailing-space differences: match line by line
+        tl, sl = t.split("\n"), [x.rstrip() for x in s.split("\n")]
+        hits = [i for i in range(len(tl) - len(sl) + 1) if [x.rstrip() for x in tl[i:i + len(sl)]] == sl]
+        if len(hits) == 1:
+            i = hits[0]
+            new[key] = "\n".join(tl[:i] + r.split("\n") + tl[i + len(sl):])
+        else:
+            problems.append(f"block {n} ({key}): SEARCH text found {t.count(s) or len(hits)} times, needs exactly 1")
+    return new, problems
+
+
+@tool()
+@guard
+def code_change(instruction: str, files: str, apply_id: str = "", job_id: str = "") -> str:
+    """The tower's model writes a code change across one or more files and you get ONLY the diff - you
+    don't read the files. files: comma list of paths (relative to the repos folder, or absolute); use
+    find_code / fix_brief first to know which. Review the diff, then call again with apply_id=<id> to
+    write exactly that diff (Python is syntax-checked; refused if a file changed meanwhile). Write
+    tricky logic yourself."""
+    if apply_id:
+        p = _pending_changes.pop(apply_id, None)
+        if not p:
+            return "Unknown or already used apply_id - draft it again."
+        for real, (raw, txt, crlf) in p["files"].items():
+            if open(real, "rb").read() != raw:
+                return f"{real} changed since the draft - nothing written; draft it again."
+        for real, (raw, txt, crlf) in p["files"].items():
+            with open(real, "wb") as fh:
+                fh.write((txt.replace("\n", "\r\n") if crlf else txt).encode("utf-8"))
+        return f"Applied to {len(p['files'])} file(s): " + ", ".join(p["files"]) + ". Run the tests (local_run)."
+    reals = {}
+    for f in [x.strip() for x in files.split(",") if x.strip()]:
+        try:
+            real = _resolve(f)
+        except ValueError as ex:
+            return str(ex)
+        if not os.path.isfile(real) or DENY.search(os.path.basename(real)):
+            return f"Not a file I can change: {f}"
+        root = next((r for r in _roots() if real.startswith(r + os.sep)), os.path.dirname(real))
+        reals[os.path.relpath(real, root).replace(os.sep, "/")] = real
+    if not reals:
+        return "Give files=\"path1, path2\"."
+    raws = {rel: open(real, "rb").read() for rel, real in reals.items()}
+    texts = {rel: b.decode("utf-8", errors="replace").replace("\r\n", "\n") for rel, b in raws.items()}
+    blob = "\n\n".join(f"===== FILE: {rel} =====\n{t}" for rel, t in texts.items())
+    if len(blob) > CODE_CHANGE_CHARS:
+        return f"Those files are {len(blob):,} chars (limit {CODE_CHANGE_CHARS:,}) - pass fewer files."
+    if job_id:
+        j = _wait_job(job_id, seconds=CODE_CHANGE_WAIT)
+        jid, ans, err = (job_id, None, None) if j.get("status") == "running" else (None, j.get("answer"), j.get("error"))
+    else:
+        jid, ans, err = _tower_job("patch", blob, f"Instruction: {instruction}", seconds=CODE_CHANGE_WAIT)
+    if err:
+        return f"The tower couldn't draft it ({err}) - make this change yourself."
+    if ans is None:
+        return f"Still drafting - call code_change(instruction=..., files=..., job_id=\"{jid}\") again shortly."
+    if ans.strip().startswith("CANNOT:"):
+        return "The tower declined: " + ans.strip()[:400] + " - make this change yourself."
+    new, problems = _apply_blocks(texts, ans)
+    if problems:
+        return "The tower's draft couldn't be applied cleanly (" + "; ".join(problems)[:600] + \
+            "). Try a narrower instruction or fewer files, or make the change yourself."
+    diff, bad = [], []
+    for rel, t in texts.items():
+        if new[rel] == t:
+            continue
+        diff += list(_difflib.unified_diff(t.split("\n"), new[rel].split("\n"), f"a/{rel}", f"b/{rel}", n=2, lineterm=""))
+        if rel.endswith(".py"):
+            try:
+                compile(new[rel], rel, "exec")
+            except SyntaxError as ex:
+                bad.append(f"{rel} line {ex.lineno}: {ex.msg}")
+    if not diff:
+        return "The tower's draft changes nothing."
+    note = next((l for l in ans.splitlines() if l.startswith("NOTE:")), "")
+    if bad:
+        return finish(["Draft has a syntax error (" + "; ".join(bad) + ") - not saved. Diff:", "```diff", *diff, "```"])
+    aid = uuid.uuid4().hex[:8]
+    _pending_changes[aid] = {"files": {reals[rel]: (raws[rel], new[rel], b"\r\n" in raws[rel])
+                                       for rel in texts if new[rel] != texts[rel]}, "at": time.time()}
+    return finish([f"Tower draft ({len(diff)} diff lines) - review, then code_change(instruction=..., files=..., "
+                   f"apply_id=\"{aid}\") writes exactly this:", "```diff", *diff, "```", note])
 
 
 @tool()
@@ -1499,7 +1656,7 @@ MAX_TOTAL = 4_000_000
 
 
 def _roots():
-    roots = [r for r in (REPOS or "").split(";") if r.strip()]
+    roots = [r for r in (REPOS or "").split(";") + (DOCS or "").split(";") if r.strip()]
     roots.append(os.path.dirname(HERE))                   # the dashboard repo itself
     return [os.path.realpath(r.strip()) for r in roots]
 
@@ -1514,6 +1671,56 @@ def _resolve(path):
             return real
     raise ValueError(f"'{path}' isn't inside the allowed folders ({'; '.join(_roots())}). "
                      f"Set AWS_ERROR_FEED_REPOS to your repos folder (several: separate with ;).")
+
+
+DOC_EXT = {".pdf", ".docx", ".xlsx", ".pptx"}
+MAX_DOC_CHARS = 1_500_000        # text taken from one PDF / Office file
+
+
+def _doc_text(path):
+    """Text of a PDF / Word / Excel / PowerPoint file -> (text, reason if empty)."""
+    import zipfile
+    ext = os.path.splitext(path)[1].lower()
+    try:
+        if ext == ".pdf":
+            try:
+                from pypdf import PdfReader
+            except ImportError:
+                return "", "PDF reader missing: pip install pypdf"
+            pages = PdfReader(path).pages
+            text = "\n\n".join(f"[page {i}]\n{p.extract_text() or ''}" for i, p in enumerate(pages, 1))
+            return (text[:MAX_DOC_CHARS], "") if text.strip() else ("", "no text layer (scanned PDF)")
+        with zipfile.ZipFile(path) as z:
+            names = z.namelist()
+            strip = lambda x: _re.sub(r"<[^>]+>", "", x)
+            if ext == ".docx":
+                xml = z.read("word/document.xml").decode("utf-8", "replace")
+                text = "\n".join(strip(p) for p in _re.findall(r"<w:p[ >].*?</w:p>", xml, _re.S))
+            elif ext == ".pptx":
+                slides = sorted((n for n in names if _re.match(r"ppt/slides/slide\d+\.xml$", n)),
+                                key=lambda n: int(_re.search(r"(\d+)", n.rsplit("/", 1)[1]).group(1)))
+                text = "\n\n".join(f"[slide {i}] " + " ".join(_re.findall(r"<a:t>([^<]*)</a:t>", z.read(n).decode("utf-8", "replace")))
+                                     for i, n in enumerate(slides, 1))
+            else:
+                ss = []
+                if "xl/sharedStrings.xml" in names:
+                    ss = [strip(x) for x in _re.findall(r"<si>(.*?)</si>", z.read("xl/sharedStrings.xml").decode("utf-8", "replace"), _re.S)]
+                rows = []
+                for n in sorted(x for x in names if _re.match(r"xl/worksheets/sheet\d+\.xml$", x)):
+                    rows.append(f"[{n.rsplit('/', 1)[1]}]")
+                    for row in _re.findall(r"<row[^>]*>(.*?)</row>", z.read(n).decode("utf-8", "replace"), _re.S):
+                        cells = []
+                        for attrs, body in _re.findall(r"<c([^>]*)>(.*?)</c>", row, _re.S):
+                            v = _re.search(r"<v>(.*?)</v>", body) or _re.search(r"<t[^>]*>(.*?)</t>", body)
+                            v = v.group(1) if v else ""
+                            cells.append(ss[int(v)] if 't="s"' in attrs and v.isdigit() and int(v) < len(ss) else v)
+                        rows.append("\t".join(cells))
+                text = "\n".join(rows)
+        import html as _html
+        text = _html.unescape(text)
+        return (text[:MAX_DOC_CHARS], "") if text.strip() else ("", "no text found")
+    except Exception as ex:
+        return "", f"couldn't read: {type(ex).__name__}"
 
 
 def _is_text(path):
@@ -1543,6 +1750,17 @@ def _collect(path, include, max_files):
             skipped.append(f"{rel} (looks like secrets/credentials - never sent)")
             continue
         ext = os.path.splitext(name)[1].lower()
+        if ext in DOC_EXT:
+            text, why = _doc_text(f)
+            if not text:
+                skipped.append(f"{rel} ({why})")
+                continue
+            if len(docs) >= max_files or total + len(text) > MAX_TOTAL:
+                skipped.append(f"{rel} (limit reached)")
+                continue
+            docs.append({"name": rel, "text": text})
+            total += len(text)
+            continue
         if ext not in TEXT_EXT or not _is_text(f):
             continue
         size = os.path.getsize(f)
@@ -1584,9 +1802,10 @@ def _read_job(docs, question, kind, header, skipped=(), job_id=""):
 @tool()
 @guard
 def local_read(path: str = "", question: str = "", include: str = "", max_files: int = 60, job_id: str = "") -> str:
-    """The LOCAL model reads a file or folder from the repos (path relative to the repos root, e.g.
-    "hrs/serverless_lambdas/hrs_deals") and returns a summary with file:line refs or an answer to
-    `question`. include="*.py" filters. Secrets are never sent. Poll with job_id."""
+    """The tower's model reads a file or folder - code in the repos, or documents (PDF, Word, Excel,
+    PowerPoint, text) e.g. dropped in the "Tower Inbox" folder (pass the file name) - and returns a summary
+    with file:line / page refs or an answer to `question`. include="*.py" filters. Secrets are never sent.
+    Poll with job_id."""
     if job_id:
         return _read_job(None, question, "read", "Read", job_id=job_id)
     try:

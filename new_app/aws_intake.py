@@ -34,7 +34,7 @@ EMAIL_CHARS = 3000               # per email, after quoted replies are cut
 MEETING_CHARS = 6000             # per meeting (Fireflies action items + overview)
 FIREFLIES_ONLY_MINE = True       # only meetings you organised or were invited to
 BATCH_CHARS = 24000              # text per model call
-MAX_TOKENS = 2000                # model answer size per batch
+MAX_TOKENS = 3500                # model answer size per batch (tasks + reply drafts)
 GMAIL_CLIENT_FILE = "gmail_client.json"
 GMAIL_TOKEN_FILE = "gmail_token.json"
 GMAIL_SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
@@ -52,7 +52,9 @@ thread, and tasks that belong to someone else.
 Answer JSON only: {{"tasks": [{{"source_id": "<the [E..] / [M..] id of the item>", "title": "short imperative,
 max 10 words", "request": "what is asked, 1-2 sentences", "reason": "why it matters / context, 1 sentence",
 "client": "one of the known clients or empty", "requester": "Name <email> or empty", "due": "YYYY-MM-DD or
-empty", "priority": "high|normal|low"}}]}}. One task per distinct action. No tasks -> {{"tasks": []}}."""
+empty", "priority": "high|normal|low", "reply_draft": "for an email that needs an answer from the person: a short,
+friendly reply they can edit (no promises of dates they didn't make; sign 'Best, Jimmy'); else empty"}}]}}.
+One task per distinct action. No tasks -> {{"tasks": []}}."""
 
 
 def _hook(*a):
@@ -265,6 +267,8 @@ def to_item(it, t, n, clients):
             "reason": str(t.get("reason") or "")[:600], "client": client, "requester": str(t.get("requester") or "")[:200],
             "due": due if re.match(r"^\d{4}-\d{2}-\d{2}$", due) else "", "priority": pr if pr in ("high", "normal", "low") else "normal",
             "links": [it["link"]] if it.get("link") else [], "source": it["kind"], "status": TASK_STATUS,
+            **({"notes": "Draft reply (edit before sending):\n" + str(t["reply_draft"]).strip()[:3000]}
+               if it["kind"] == "email" and str(t.get("reply_draft") or "").strip() else {}),
             "external_id": f"{it['id']}#{n}"}
 
 

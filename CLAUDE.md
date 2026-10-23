@@ -16,6 +16,8 @@
 - "How are things?" -> `morning_brief()`. Any question about a client / function / error -> `ask_tower(question)`:
   the tower reads all the data with its own model and returns a short answer with evidence ids.
 - Use the raw tools (investigate, get_log_lines, get_line_context, fix_brief) only to verify or before editing.
+- Web research needing several pages -> `research(question)` (tower searches + reads, returns a cited report).
+- Code edits -> `code_change(instruction, files)`: the tower drafts, you review only the diff, then `apply_id` writes it.
 - `outline`, `get_symbol`, `repo_map`, `local_git`, `tasks_add`, `tasks_update` are reached with `more_tools()`.
 
 ## Coding with the tower (fewer Claude tokens)
