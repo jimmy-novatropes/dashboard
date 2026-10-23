@@ -235,13 +235,16 @@ def batches(items):
 
 
 def parse_json(text):
-    m = re.search(r"\{.*\}", text or "", re.S)
-    if not m:
-        return []
-    try:
-        d = json.loads(m.group(0))
-    except ValueError:
-        return []
+    if isinstance(text, dict):            # LocalLLM.chat(as_json=True) already returns the parsed object
+        d = text
+    else:
+        m = re.search(r"\{.*\}", text or "", re.S)
+        if not m:
+            return []
+        try:
+            d = json.loads(m.group(0))
+        except ValueError:
+            return []
     return [t for t in (d.get("tasks") or []) if isinstance(t, dict) and (t.get("title") or t.get("request"))]
 
 

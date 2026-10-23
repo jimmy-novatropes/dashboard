@@ -57,9 +57,10 @@ def research(llm, key, question, depth="normal", progress=lambda s: None):
     n_q, n_pages = DEPTH.get(depth, DEPTH["normal"])
     progress("planning searches")
     try:
-        plan = json.loads(re.search(r"\{.*\}", llm.chat(PLAN_SYSTEM, f"Today: {time.strftime('%Y-%m-%d')}\n"
-                                                        f"Question: {question}", as_json=True, max_tokens=400,
-                                                        kind=MODEL_KIND), re.S).group(0))
+        plan = llm.chat(PLAN_SYSTEM, f"Today: {time.strftime('%Y-%m-%d')}\nQuestion: {question}", as_json=True,
+                        max_tokens=400, kind=MODEL_KIND)
+        if not isinstance(plan, dict):        # chat(as_json=True) returns the parsed object; be safe with text
+            plan = json.loads(re.search(r"\{.*\}", str(plan), re.S).group(0))
         queries = [str(q) for q in plan.get("queries") or []][:n_q]
     except Exception:
         queries = []

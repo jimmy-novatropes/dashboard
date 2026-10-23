@@ -1,35 +1,56 @@
-# AWS Error Feed dashboard — handoff / context (as of 2026-10-21, evening)
+# AWS Error Feed dashboard — handoff / context (as of 2026-10-22, midday)
 
-Paste this into a new chat to continue work on the dashboard. Owner: Jimmy (Open Flow). Preference: brief, direct answers.
+Paste this into a new chat to continue work on the dashboard. Owner: Jimmy (Open Flow). Preference: brief, direct answers,
+settings as variables at the top of files, short step lists.
+This replaces the 10-21 handoff and the addenda (tasks-and-efficiency, cloud-model-routing, usage-stats).
 
 ---
+
+## 0. Current state (everything below is live)
+
+- Tower dashboard running the latest code since 2026-10-22 12:11 (`deploy_tower.py` run). 16 AWS accounts connected.
+- **Three AI layers, load-balanced by job type** (see §5): local GPU model for background work, Ollama Pro cloud model
+  for deep work, Claude only gets short answers.
+- Local model **qwen3:30b-a3b** (16k ctx, ~54% on GPU, ~36–44 tok/s, unclear 6.7% vs 13.3% on qwen3:14b → keep it).
+- Cloud model **gpt-oss:120b-cloud** via Ollama Pro ($20/mo, $60 credit/cycle, renews the 22nd) — tested, working.
+- Health tab shows local / cloud / Claude usage and "what to improve next".
+- Git: last commit `4117bae` on the tower is **not pushed** (Jimmy pushes manually).
 
 ## 1. What it is
 
 A local Python app that watches **CloudWatch Logs + Step Functions across all AWS CLI profiles** (one profile = one client),
-stores a 24h cache in SQLite, and serves a web dashboard + a **Claude connector (MCP server)**. A **local model (Ollama on the
-tower)** does the heavy reading (triage, log/code summaries, small code edits) so Claude uses fewer tokens.
+stores a 24h cache in SQLite, and serves a web dashboard + a **Claude connector (MCP server)**. Model work is split:
+**local model (Ollama on the tower GPU)** does background triage and small jobs, **cloud model (Ollama Pro)** does the
+deep reading Claude asks for, so Claude itself uses few tokens.
 
 - Read-only toward AWS. Never reads secret values (Secrets Manager metadata only), never stores Lambda env values.
 - No login → shared only inside the Tailscale tailnet (`tailscale serve`, never `funnel`).
-- The user does NOT want event-logging changes on Lambdas/Step Functions (no CloudWatch config changes); errors are caught
-  via `print` / structured log lines in the code instead.
+- No event-logging changes on Lambdas/Step Functions (no CloudWatch config changes); errors are caught via `print` /
+  structured log lines in the code instead.
+- Privacy note: cloud calls send log lines / code snippets to Ollama's servers (secret-like files are never sent).
 
 ## 2. Machines
 
 | | Tower **initium** (does the work) | Laptop **adventum** (where repos are edited) | Phone |
 |---|---|---|---|
-| User / dashboard path | `C:\Users\jagom\Documents\Openflow Repos\dashboard` | `C:\Users\jagom.ADVENTUM\Documents\Openflow\dashboard` | — |
+| Dashboard path | `C:\Users\jagom\Documents\Openflow Repos\dashboard` | `C:\Users\jagom.ADVENTUM\Documents\Openflow\dashboard` | — |
 | Python | `C:\Users\jagom\AppData\Local\Programs\Python\Python311\python.exe` | `C:\Users\jagom.ADVENTUM\AppData\Local\Programs\Python\Python312\python.exe` | — |
-| Runs | `new_app` dashboard (scheduled task **"AWS Error Feed"**, pythonw, port **8766**, log `new_app\dashboard.log`), Ollama 0.40.7, models **qwen3:14b** (9.3 GB, 100% GPU) and **qwen3:30b-a3b** (18.6 GB, ~54% GPU) both installed; switch with the picker (RTX A2000 12 GB, 64 GB RAM, i9) | Claude Desktop connector → `new_app\mcp_server.py` pointed at the tower | Browser |
+| Runs | `new_app` dashboard (scheduled task **"AWS Error Feed"**, pythonw, port **8766**, log `new_app\dashboard.log`), Ollama 0.40.7 signed in to Jimmy's ollama.com Pro account, models qwen3:30b-a3b (in use), qwen3:14b, gpt-oss:120b-cloud | Claude Desktop connector → `new_app\mcp_server.py` pointed at the tower | Browser |
 | Access | `https://initium.tail11109.ts.net` (Tailscale serve → 127.0.0.1:8766) | same URL | same URL (Tailscale app) |
 
-Tower `new_app\config.json` (written by `tower_tune.ps1`; a model picked in the dashboard overrides it):
+Tower hardware: Lenovo ThinkStation P360 Tower (30FM002KUS), i9-12900, 64 GB DDR5 (2 free slots, max 128), RTX A2000
+12 GB (70 W), 750 W PSU (per retailer spec), 1 TB NVMe + 4 TB Samsung T7. Upgrade research done; decision was Ollama Pro
+instead of hardware (best later options: RTX PRO 4000 Blackwell SFF 24 GB, or a 128 GB Strix Halo box).
+
+Tower `new_app\config.json` (git-ignored; a model picked in the dashboard overrides `local_llm.model`):
 ```json
 { "local_llm": { "model": "qwen3:14b", "num_ctx": 16384, "parallel": 1 },
+  "exclude_profiles": ["BSLLC", "codecommituser", "default", "super_suds", "supersuds"],
   "grouping": { "drain3": "on" },
-  "tuning_note": "fa=1 kv=q8_0 keep=24h par=1 ctx=16384 …",
-  "exclude_profiles": ["BSLLC", "codecommituser", "default", "super_suds", "supersuds"] }
+  "tuning_note": "fa=1 kv=q8_0 keep=24h par=1 ctx=16384 2026-10-20",
+  "cloud_llm": { "enabled": true, "model": "gpt-oss:120b-cloud", "daily_token_cap": 3000000, "parallel": 3,
+                 "local_kinds": ["triage", "repo_map", "filemap", "other"],
+                 "billing_day": 22, "monthly_credit_usd": 60 } }
 ```
 Tower Ollama user env (set by `tower_tune.ps1`): `OLLAMA_FLASH_ATTENTION=1`, `OLLAMA_KV_CACHE_TYPE=q8_0`,
 `OLLAMA_KEEP_ALIVE=24h`, `OLLAMA_NUM_PARALLEL=1`, `OLLAMA_MAX_LOADED_MODELS=1`. Tower git: `core.autocrlf true`.
@@ -46,218 +67,187 @@ Tower's Claude Desktop runs `...\Openflow Repos\dashboard\new_app\mcp_server.py`
 
 Watched accounts (16): anew, cielo, corganics, hiniker, hrs, intead, jackie_london, kindlyhuman, konsylcodecommituser,
 ncc (eu-north-1), puretech, reliable_roofing, statewide, stellaromics, sterling, uniqode.
+Priorities: ★ high = hrs, stellaromics, anew, sterling, reliable_roofing, hiniker; others normal; none on-demand.
 
-## 3. Repo layout (GitHub `jimmy-novatropes/dashboard`)
+## 3. Deploying updates (one step) — `new_app/deploy_tower.py`
+
+Run on the tower from the dashboard folder: `python new_app\deploy_tower.py` (or run/double-click it from PyCharm /
+Explorer). Settings are variables at the top of the file. What it does, in order:
+1. Compile check of `CHECK_FILES` → stops if broken (running dashboard untouched).
+2. Local commit of `COMMIT_PATHS` (`COMMIT = True`; message auto "Update: <files>" unless `COMMIT_MESSAGE` set).
+   **`PUSH = False`** — Jimmy pushes manually. `PUSH = True` = `git pull --rebase --autostash` + push.
+3. Optional model download (`MODEL_TO_INSTALL`, `SWITCH_TO_NEW_MODEL`, `NEW_MODEL_CONTEXT`).
+4. Stops the pythonw dashboard, starts scheduled task "AWS Error Feed", waits until it answers.
+5. Status: local model, cloud model ON/OFF + today's usage, installed models, tasks.db, priorities, dashboard.log tail.
+6. `RESTART CLAUDE: YES/NO` — YES only if `mcp_server.py` changed since the last run (hash in git-ignored
+   `new_app/last_deploy.json`).
+
+**Steps to give Jimmy after every change (always this list, nothing longer):**
+1. On the tower, run `python new_app\deploy_tower.py`.
+2. Check the Status block: local model ready, cloud model ON (or the new model listed).
+3. Read the last line: `RESTART CLAUDE: YES` or `NO`.
+4. If YES: push from the tower, `git pull` on the laptop, then quit Claude (tray → Quit) and reopen on laptop + tower.
+5. Ask Claude "dashboard status" (or check the Health tab) to confirm.
+
+Editing flow used so far: Claude edits the tower's files directly (Cowork, device bridge → connected folder
+`dashboard`), with a python read-modify-write that keeps line endings, then `py_compile` + a fake-server test, then
+Jimmy runs deploy_tower.py. No extra launcher files (.cmd) — Jimmy wants it all in deploy_tower.py.
+
+## 4. Repo layout (GitHub `jimmy-novatropes/dashboard`)
 
 ```
 dashboard/
   old_app/       single-computer version (port 8765, local model OFF) - stable, change only shared fixes
-  new_app/       the one in use (port 8766, local model ON, multi-device)
+  new_app/       the one in use (port 8766, local + cloud model, multi-device)
   logging_kit/   oflog.py (structured logs for client Lambdas) + apply_oflog.py (adds it to a repo)
-  CLAUDE.md, README.md, .gitignore (errors.db*, *.log, config.json, repos.json, __pycache__, .idea)
+  CLAUDE.md, README.md, HANDOFF.md, .gitignore (errors.db*, tasks.db*, *.log, config.json, last_deploy.json,
+                 repos.json, __pycache__, .idea)
 ```
-`old_app` and `new_app` must stay in sync for shared fixes; they differ only in port, local-model default, `mcp_server.py`
-default URL and `install_autostart.ps1` (new_app only).
+`old_app` and `new_app` stay in sync for shared fixes; they differ in port, local-model default, `mcp_server.py` default
+URL, `install_autostart.ps1`, tasks and cloud routing / cloud + Claude stats (new_app only).
 
 ### new_app modules
 | File | Role |
 |---|---|
-| `aws_error_feed.py` (~3.1k lines) | Main app: Store (SQLite), Worker per profile/region, StepFunctionsScanner, classification, HTTP API + the whole HTML/JS page, `main()` |
+| `aws_error_feed.py` (~3.4k lines) | Main app: Store (SQLite), Worker per profile/region, StepFunctionsScanner, classification, HTTP API + the whole HTML/JS page (`PAGE = r"""…"""`), `main()` |
 | `aws_infra.py` | Infra scanner: schedules / missed runs, Lambda inventory + runtimes + layers, secrets metadata, API Gateway, alarms, cost |
-| `aws_ops.py` | Runs (REPORT-based), did-nothing, trace a record, code index (function → repo folder), notes, client reports, client cards, structured-line parsing (`structured()`, `structured_count()`) |
-| `aws_local.py` | Local model: LocalLLM (Ollama), background Triage (+ evidence check), Jobs (summaries, map-reduce reads, templates, file map), PCache (answers cached 30 days in `ai_cache`), savings counter (`ai_usage`), Gate (Claude requests before triage) |
-| `aws_health.py` | Health tab: model-call telemetry (`llm_calls`), connector tool calls (`tool_calls`), daily `counters`, own error log (`sys_events`), Drain3 shadow grouping, "what to improve next" rules (thresholds at the top) |
-| `aws_prefs.py` | Project priority (high ★ / normal / on_demand = not polled until opened, then awake `on_demand_wake_hours`), dashboard-picked settings (meta table), ModelPicker (list / switch / download Ollama models without restart) |
-| `tower_tune.ps1` | Tower: Ollama env (flash attention, q8_0 KV, keep_alive 24h), biggest num_ctx that fits the GPU, drain3 install, `tuning_note`, restarts Ollama + dashboard; `-Undo` |
-| `mcp_server.py` | Claude connector (runs on whichever machine Claude is on; talks HTTP to the dashboard; reads local repos itself) |
-| `install_autostart.ps1` | Registers the scheduled task + `tailscale serve --bg 8766`; `-Remove` undoes it |
-| `deploy_tower.py` | Tower helper: (optional git push, off) → download a model (`MODEL_TO_INSTALL`, default qwen3:30b-a3b) → restart dashboard → status. Settings at the top |
+| `aws_ops.py` | Runs, did-nothing, trace a record, code index, notes, client reports/cards, structured-line parsing |
+| `aws_local.py` | `LocalLLM` (Ollama) with **local/cloud routing** (§5), Gate (priority queue), background Triage (+ evidence check), Jobs (summaries, map-reduce reads, templates, file map), PCache (30-day answer cache), savings counter |
+| `aws_health.py` | Health tab: `llm_calls`, `tool_calls`, `counters`, `sys_events`, **`cloud_usage`** (400 days), Drain3, model comparison, **cloud stats, Claude stats, AI usage overview**, "what to improve next" rules (thresholds at the top) |
+| `aws_prefs.py` | Project priority, dashboard-picked settings (meta table), ModelPicker (list / switch / download models without restart) |
+| `aws_tasks.py` | Task list in its own `tasks.db` (git-ignored, never slimmed, local only, no ClickUp) |
+| `tower_tune.ps1` | Ollama env tuning, biggest num_ctx that fits, drain3 install; `-Undo` |
+| `mcp_server.py` | Claude connector (talks HTTP to the dashboard; reads local repos itself) |
+| `install_autostart.ps1` | Scheduled task + `tailscale serve --bg 8766`; `-Remove` undoes it |
+| `deploy_tower.py` | One-step deploy (§3) |
 
-## 4. Configuration (`config.json` next to `aws_error_feed.py` is auto-loaded; `-c` overrides; nested keys merge)
-Useful keys: `profiles`, `exclude_profiles`, `regions`, `keep_hours` (24), `info_keep_hours` (8: plain info lines dropped
-sooner; errors/hidden/warnings/platform keep 24h), `full_lines_per_pattern_hour` (200) + `repeat_line_chars` (1000: later
-lines of a busy pattern stored as start+end; JSON lines always whole), `startup_hours` (2, fast start), `slim_db_over_mb`
-(800, one-time slim on start), `local_llm` {enabled, url, model, num_ctx, parallel, triage_every_minutes, triage_per_cycle,
-triage_top_n, max_input_chars}, `grouping` {drain3: "on" | "shadow" | "off", drain3_similarity 0.4}, `on_demand_wake_hours`
-(2), `gpu_vram_gb` (12, for the Health tab's GPU advice), `profile_priority` ({"hrs": "high", …} defaults; dashboard wins), `repos_root`, `record_count_patterns`,
-`partner_services`, `infra_*`, `step_functions`, `track_deploys`, `port`.
-Settings picked in the dashboard (model, context, project priorities) live in errors.db (`meta`, `profile_prefs`).
+## 5. Load balancing between the three AI layers
 
-## 5. Features (dashboard)
+| Layer | What runs there | Where |
+|---|---|---|
+| **Local model** (tower GPU, free) | background `triage` of new/spiking patterns, `repo_map` / `filemap` one-liners, `other` (`LOCAL_ONLY_KINDS` in aws_local.py = `cloud_llm.local_kinds`) | Ollama 127.0.0.1:11434, model from the picker |
+| **Cloud model** (Ollama Pro, per-token) | everything someone waits for: `fix` (fix_brief diagnosis), `read` (local_read map-reduce), `summary` / `lines` (summarize_logs), `edit` (local_draft_change), `commit`, `narrative`, `run` | same local Ollama URL, model `gpt-oss:120b-cloud` (Ollama proxies it; tower is signed in) |
+| **Claude** | gets only the short answers / trimmed tool outputs | via the connector |
+
+- `LocalLLM.route(kind)` → "cloud" if cloud enabled, kind not local-only, and today's tokens < `daily_token_cap`.
+- Cloud calls: own Gate (3 at once = Pro limit), 64k context, 180k input chars (bigger chunks → fewer map-reduce calls).
+  Local calls: Gate(1); Claude-waiting calls go before background triage.
+- **Fallback**: any cloud error (offline, credit used up, model missing) → same call on the local model; counted as
+  `cloud:fallback`, logged in the Health system log (`cloud_model`).
+- **Daily cap** 3M tokens (≈ $0.5–2/day) → local until midnight. Tokens = Ollama's counts, else chars/4.
+- Cache keys include the routed model. Health "Model comparison" lists the cloud model as its own row.
+- Off switch: `cloud_llm.enabled = false` + deploy. Usage baseline: ~68 model requests/day, ~2k tokens in / 170 out →
+  ~$1/month on gpt-oss:120b (well inside the $60 credit).
+- Ollama Pro billing: $60 credit/cycle, unused credit doesn't roll over; over-credit usage only from pre-bought credits
+  (keep auto top-up OFF at ollama.com settings). Ollama emails at 90%.
+- The Ollama requests every ~2–5 s in the Ollama log = the dashboard's 🤖 status line (each open tab polls every 5 s →
+  /api/tags, /api/version, /api/ps). No tokens, local only.
+
+## 6. Features (dashboard)
 
 **Feed & classification**
 - Levels: error / suspect ("hidden error": try/except prints, 4xx/5xx, caught SFN failures) / warning / info / platform.
 - Patterns grouped by type + normalized message; NEW / SPIKE / REGRESSION; mute / mark fixed; team notes.
-- **Structured lines** (oflog JSON with `"event"`): level from the line, grouped by event (+partner, status kept: 429 vs 500),
-  `run_summary` gives exact record counts; a run with failed records = hidden error.
-- **False-alarm reduction**: counters like `records=200, missing=49, skipped=3` and zero counts (`0 failed`, `errors=0`)
-  are normal output; non-zero fail/error/timeout counters still flag.
-- **"EVERY RUN" badge** (was "LOG FORMAT?"): a hidden-error pattern in ≥80% of a function's runs (≥30 runs) = normal output
-  **or a chronic issue** (not "mute it"). Never applied to errors or `run_summary` failed-records patterns. Chronic,
-  unchanged patterns are re-triaged weekly (spikes re-triage at once) and listed compactly by the connector.
-- **Drain3 grouping ON**: patterns are Drain3 templates (`<*>` = variable part). At start, stored patterns, hourly baseline,
-  mutes, notes and triage are renamed to their template; live template changes are remapped. Never merged: different error
-  types, different HTTP codes (429 vs 500), `run_summary`, messages < 3 tokens. Undo: `grouping.drain3 = "shadow"`.
-  Side effect: a mute on one old pattern covers its whole merged group.
+- **Structured lines** (oflog JSON with `"event"`): level from the line, grouped by event (+partner, status kept),
+  `run_summary` exact record counts; failed records = hidden error. anew `{"check": "INVOCATION_SUMMARY"}` lines parsed
+  (crashed=true → error; HTTP ≥400 / http_failures / exceptions_logged → suspect; 429 → warning; clean → info).
+- **False-alarm reduction**: counters like `records=200, missing=49` and zero counts are normal output.
+- **"EVERY RUN" badge**: hidden-error pattern in ≥80% of a function's runs (≥30 runs) = normal output or chronic issue.
+- **Drain3 grouping ON** (templates with `<*>`; never merges different error types / HTTP codes / run_summary).
+  Undo: `grouping.drain3 = "shadow"`.
 - Partner API health, deploy tracking with before/after verdicts, did-my-fix-work.
 
-**Clients tab**: red/amber/green cards, ★ priority projects first, then by most errors (#1, #2…), 1h/6h/24h windows,
-recent deploys, reasons, priority dropdown on each card. On-demand projects sit asleep in a strip below with "load ▸".
-"Connecting…" (amber) while an account's first pull runs.
-**Other tabs**: Errors, Hidden errors, All logs, Patterns, Volume, Deploys, Partner APIs, Runs, Trace a record, Schedules,
-Inventory, APIs & alarms, Digest, **Health**. Account chips collapse into one "▸ Accounts: N connected" line (problems always shown).
-Mobile-friendly layout.
-**Performance**: fast start (2h live catch-up, rest backfilled), one-time DB slim, batched deletes, WAL size limit,
-old long-range pulls not resumed after restart.
+**Tabs**: Clients (red/amber/green cards, ★ first, priority dropdown, on-demand strip, open-task count), Errors,
+Hidden errors, All logs, Patterns, Volume, Deploys, Partner APIs, Runs, Trace a record, Schedules, Inventory,
+APIs & alarms, Digest, **Tasks**, **Health**. Mobile-friendly.
 
-**Local model (tower)**
-- Background triage of new/spiking/busy patterns: verdict, category, summary, cause, next step, **evidence quote**;
-  claims (rate limit / auth / outage / timeout / config) not visible in the lines are downgraded to "unclear"
-  (also applied to old cached verdicts when displayed).
-- 🤖 line: model status, triaged count, **💰 savings** (tower tokens read vs Claude tokens received, % saved).
-- Endpoints: `GET /api/ai/status|savings|job|triage_map|summarize|claude_usage`, `POST /api/ai/read` (map-reduce reading),
-  `POST /api/ai/prompt` (templates: edit, commit, fix, narrative, run, filemap), `POST /api/ai/filemap[_known]`.
+**Status line (every tab)**: 🤖 local model, triaged count, queue, backlog, tok/s, GPU %, **☁ cloud calls / tokens
+today (+ fallbacks)**, 💰 tower-read vs Claude-received tokens; 🔁 model picker (switch model + context without restart,
+download new models).
 
-**Model picker** (🔁 line under the 🤖 status line on every tab, plus top of Health tab; connector `more_tools("switch_model")`): list installed Ollama models, switch model +
-context without restart (10–30 s load), download new ones in the background; persists over config.json; each switch is
-logged in the day-by-day table. Endpoints `/api/ai/models`, `/api/ai/model?name=&num_ctx=`, `/api/ai/pull?name=`.
-**Project priority** (Clients tab dropdown, profile menu shows ★ / on demand; connector `more_tools("project_priority")`):
-`high` = first everywhere (clients, overview, digest, menu) + triaged first; `normal`; `on_demand` = asleep: not polled,
-not infra-scanned, not triaged, excluded from all-client views/summary/events/volume/partners. Opening it (card "load ▸",
-picking it in the profile menu, or any connector call with `profile=`) wakes it: catches up 2h live + backfills 24h,
-stays awake `on_demand_wake_hours`, connector answers carry a "was asleep, loading" note. Endpoints `/api/prefs`,
-`/api/prefs/set?profile=&priority=`, `/api/prefs/wake?profile=`.
+**Health tab** (`/api/health`, `/api/health/text`, connector `more_tools("system_health")`):
+- What to improve next (bad / warn / info / ok).
+- Tower / local model: GPU fit, 1h/24h/7d calls, speed, waits, inputs/answers cut, bad JSON, reloads (local calls only).
+- **AI usage overview**: Local / Cloud / Claude — calls today, tokens today + 7d, est. $ today + 7d.
+- **Claude usage (via the connector)**: today / 7d / 14d calls + tokens (out_chars ÷ 4 of what the connector returned),
+  per tool (share bar, avg/call, time, errors), per day. Claude plan usage itself has no API on Pro/Max/Team (Jimmy's
+  plan is a team setup, unknown) → claude.ai Settings → Usage. If it's API/Console: Usage & Cost API (Admin key) could
+  add real $; Enterprise: Enterprise Analytics API.
+- **Cloud model (Ollama Pro)**: billing cycle (billing_day → next), $ used of credit (bar), projected cycle spend,
+  today calls / tokens / $ / % of daily cap, 24h avg/p95, fallbacks, cloud share of model calls, per kind 7d
+  (calls, tokens/call, time, $), per day 14d. $ = dashboard's own calls × `CLOUD_PRICES` (ollama.com/pricing Sep 2026,
+  overridable in `cloud_llm.prices`); other Ollama use only on ollama.com.
+- Model comparison (7d), by kind (24h, "(cloud)" marked), triage quality, day-by-day with settings, connector tools,
+  Drain3, system log.
+- Rules (constants at the top of aws_health.py): local errors/truncation/speed/queue/reloads/unclear %, plus
+  **cloud**: fallbacks ≥10% (bad), projected spend >80% of credit, ≥80% of daily cap, any triage on the cloud,
+  cloud p95 >60 s, answers cut >10%, an OK line with spend/projection; **Claude**: >150k connector tokens/day (warn),
+  one tool >40% of 7d tokens (trim candidate).
 
-**Health tab** (`/api/health`, `/api/health/text`, connector `more_tools("system_health")`): what to improve next,
-model speed / queue / GPU fit / inputs cut / answers cut / bad JSON / reloads, per-kind stats, triage quality (unclear,
-claims not backed by lines), cache hit rate, day-by-day table with the settings active each day (before/after compare),
-connector tool time/size/errors, Drain3 shadow merge candidates, system log (model errors, triage/job failures,
-crashed threads, AWS accounts disconnecting). 🤖 line also shows queue, backlog, tok/s and GPU %.
-Model calls go through a priority gate: requests Claude is waiting for run before background triage.
-**Model comparison (7 days)** on the Health tab: per model calls, tok/s out/in, avg/p95, Claude wait p95, triaged,
-unclear %, claims not backed, % on GPU (triage quality from `ai_triage`); a "what to improve next" line compares them once
-two models have 20+ calls. A model bigger than the GPU gets an explanation (judge by speed/quality) instead of a red
-"only N% on GPU" warning.
+**Tasks** (`aws_tasks.py`, `tasks.db`): title, request, reason, links, client, requester, source, status, priority, due,
+external_id (dedupe), error_ref, notes, history. Tasks tab, "+ task" on patterns. Connector `tasks_list` / `tasks_add`
+/ `tasks_update`. From emails only request + reason + links are stored.
 
-## 6. Claude connector tools
+## 7. Claude connector tools
 
-Default **core mode** (≈3.4k tokens of tool definitions per message instead of ≈6.4k). `AWS_ERROR_FEED_TOOLS=all` lists
-everything; `AWS_ERROR_FEED_EXTRA_TOOLS="list_runs,get_run"` adds specific ones.
+Default **core mode** (≈3.4k tokens of tool definitions). `AWS_ERROR_FEED_TOOLS=all` lists everything;
+`AWS_ERROR_FEED_EXTRA_TOOLS="list_runs,get_run"` adds specific ones.
+Core: `clients_status`, `dashboard_status`, `investigate`, `fix_brief`, `error_overview`, `list_error_patterns`,
+`summarize_logs`, `get_log_lines`, `get_line_context`, `did_my_fix_work`, `find_code`, `get_symbol`, `outline`,
+`repo_map`, `local_read`, `local_git`, `local_draft_change`, `local_run`, `usage_savings`, `tasks_list`, `tasks_add`,
+`tasks_update`, **`more_tools`** (add_note, apis_and_alarms, client_report, cost_estimate, daily_digest,
+did_nothing_check, draft_commit_message, get_run, get_step_function_input, inventory, list_deploys, list_muted,
+list_runs, load_history, locate_code, log_group_volume, mute_pattern, partner_api_health, project_priority,
+rescan_infrastructure, schedules_health, secrets_overview, switch_model, system_health, trace_record, unmute_pattern,
+upgrade_checklist, whats_new).
+- `summarize_logs`, `fix_brief`, `local_read`, `local_draft_change`, `draft_commit_message`, client narratives now run
+  on the **cloud model** (fallback local); output header still says "Local-model summary".
+- Trimmed outputs by default (`detail="full"` for everything). `get_log_lines` brief: repeats folded, problems capped.
+- `local_read` / `local_git`: secrets-like files never sent (`.env`, keys, *secret*, *credential*, *password*, *.db).
+- `local_run`: allow-listed checks only. Multi-machine: `AWS_ERROR_FEED_URL` (comma list), `AWS_ERROR_FEED_REPOS`.
 
-Core (19 + more_tools): `clients_status`, `dashboard_status`, `investigate`, `fix_brief`, `error_overview`,
-`list_error_patterns`, `summarize_logs`, `get_log_lines`, `get_line_context`, `did_my_fix_work`, `find_code`, `get_symbol`,
-`outline`, `repo_map`, `local_read`, `local_git`, `local_draft_change`, `local_run`, `usage_savings`, **`more_tools`**.
+## 8. Structured logging kit (oflog) and client repos
 
-Via `more_tools(name, args=JSON)`: add_note, apis_and_alarms, client_report (`tower_summary`), cost_estimate, daily_digest,
-did_nothing_check, draft_commit_message, get_run, get_step_function_input, inventory, list_deploys, list_muted, list_runs,
-load_history, locate_code, log_group_volume (top 25 + summary, `limit=0` all), mute_pattern, partner_api_health,
-**project_priority**, rescan_infrastructure, schedules_health, secrets_overview, **switch_model**, **system_health**,
-trace_record, unmute_pattern, upgrade_checklist, whats_new.
+- `logging_kit/oflog.py`: `@oflog.run` on `lambda_handler` (run_start / run_summary / lambda_failed),
+  `oflog.log(level, event, record=…, partner=…)`, `oflog.count()`, `oflog.check_response(resp, label)`.
+- `apply_oflog.py <repo>`: adds it to every Lambda folder; keeps CRLF; idempotent.
+- **HRS**: applied to all 14 Lambdas (push to `main` deploys ALL Lambdas to prod). Others not converted yet.
+- `CLAUDE.md` with "use the tower first" guidance in: dashboard, hrs, anew, keap_praxis.
 
-Key tools:
-- `find_code(query, repo)` — laptop-side ranked line search (no model). `/regex/` supported.
-- `outline(file)` signatures only; `get_symbol(name, repo|file)` one function's source (Python via ast; JS rough).
-- `repo_map(repo, focus, budget)` — layout + cached one-line purposes; with `focus` returns only relevant files + callers.
-- `fix_brief(profile, function, …)` — error, preceding logs (deduped), failing code **or the print that wrote the line**,
-  runs, + tower diagnosis (evidence-bound). Poll with `job_id`.
-- `local_read(path, question)` / `local_git(repo, what, …)` — tower reads files/folders/git; secrets-like files never sent
-  (`.env`, keys, *secret*, *credential*, *password*, *.db); only inside `AWS_ERROR_FEED_REPOS` + dashboard folder.
-- `local_draft_change(path, start, end, instruction, apply)` — tower writes a small edit → diff; `apply=True` writes it
-  (syntax-checked, line endings kept).
-- `local_run(command, repo)` — allow-listed checks only (pytest, py_compile, unittest, python <test script>, npm test/lint,
-  node --test, git status, serverless print); no shell operators.
-- Trimmed outputs (brief by default; `detail="full"`, `investigate`, `fix_brief`, `get_log_lines` keep full detail):
-  `list_error_patterns` (compact "where" line, one-line tower verdict, example only if it adds something, tracebacks keep
-  start + exception, chronic every-run patterns one line each at the end), `error_overview` (chronic folded per client,
-  ★ first, asleep listed), `list_runs` (consecutive runs with the same problem folded), `get_run` (a problem line repeated
-  in a run is counted once; info runs folded), `log_group_volume` (top 25). Test fixture: ~102k → ~12k chars (−89%);
-  live `list_error_patterns(ncc)` ~8.5k → ~2.8k. `MAX_OUT` 40k. Every tool reports size, time and errors (Health tab).
-- Multi-machine: `AWS_ERROR_FEED_URL` (comma list, first reachable wins, local 127.0.0.1 entries can autostart),
-  `AWS_ERROR_FEED_REPOS` (repos root on this machine, `;` for several).
+## 9. Troubleshooting
 
-## 7. Structured logging kit (oflog) and client repos
+- Path with a space → quote it in PowerShell. Port in use → stop the old pythonw (deploy_tower.py does it).
+- `tailscale … NoState` → `tailscale up`; HTTPS enabled in the Tailscale admin DNS page. Laptop "DNS address could not
+  be found" → Brave secure DNS bypasses MagicDNS.
+- Local model off / wrong model → `config.json` missing or misnamed; `ollama list`; picker on the Health tab.
+- Cloud falling back → `ollama signin` on the tower; check plan/credit at ollama.com; Health system log `cloud_model`.
+- Connector "can't open file" → wrong `args` path (tower user `jagom`, laptop `jagom.ADVENTUM`). Connector output in the
+  old format → Claude wasn't fully restarted (tray → Quit).
+- git shows files modified but identical → `git config core.autocrlf true` then `git checkout -- new_app`.
+- Dashboard started before Ollama → picks the model up within a minute.
 
-- `logging_kit/oflog.py`: `@oflog.run` on `lambda_handler` (run_start / run_summary / lambda_failed), `oflog.log(level,
-  event, record=…, partner=…)`, `oflog.count()`, `oflog.check_response(resp, label)` (also catches HubSpot 207 partial
-  failures, which were silent before).
-- `apply_oflog.py <repo>`: copies oflog into every Lambda folder, converts shared `http_retry.py`, replaces
-  `if not resp.ok: print("❌ Error …")` blocks, adds the decorator; keeps CRLF; idempotent.
-- **HRS**: applied to all 14 Lambdas (warning: push to `main` deploys ALL Lambdas to prod). Others not converted yet.
-- `CLAUDE.md` with "use the tower first" guidance added to: dashboard, hrs, anew, keap_praxis.
+## 10. Stats snapshot (2026-10-22)
 
-## 8. Runbook
+- Savings 7d: tower read ~1.29M tokens, Claude received ~175k → ~87% saved.
+- Claude via connector 7d: 55 calls, ~78k tokens; top senders get_log_lines 57%, list_error_patterns 21%.
+- Local 24h: 123 calls, 1.6% failed, p95 ~24 s, Claude wait p95 0 s, backlog 0. Triage 7d unclear 16% overall.
+- Cloud: cycle 10-22 → 11-22, ~$0 so far. Drain3: 191 raw patterns → 144 (−25%).
+- Chronic client issues found (client code NOT changed): ncc `4_process_associations` MySQL deadlocks (1213/1205);
+  ncc `7a_` HubSpot duplicate `order_id` VALIDATION_ERROR + broken error parsing; statewide `statewide-query` empty
+  seller's-attorney email lookups + HubSpot 429 secondly limit; hrs `set-company-props-in-deal` HubSpot 429 retries.
 
-Deploy an update:
-```
-# laptop (dashboard folder):  git add -A ; git commit -m "..." ; git push
-# tower (dashboard folder):
-git pull
-Get-CimInstance Win32_Process -Filter "name='pythonw.exe' or name='python.exe'" | Where-Object { $_.CommandLine -match 'aws_error_feed' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
-Start-ScheduledTask "AWS Error Feed"
-Get-Content "C:\Users\jagom\Documents\Openflow Repos\dashboard\new_app\dashboard.log" -Tail 15   # expect "Config: …" and "Local model: qwen3:14b ready"
-```
-Then fully quit + reopen Claude (tray → Quit) on laptop and tower when `mcp_server.py` changed.
-Shortcut on the tower: `python new_app\deploy_tower.py` (model download + restart + status).
-Tower tuning: `powershell -ExecutionPolicy Bypass -File ".\new_app\tower_tune.ps1"` (`-Undo` reverts).
+## 11. Open items / next steps
 
-Troubleshooting:
-- Path with a space → quote it in PowerShell.
-- `tailscale … NoState` → `tailscale up` (same account on both machines); HTTPS must be enabled in the Tailscale admin DNS page.
-- Laptop browser "DNS address could not be found" → Brave secure DNS bypasses MagicDNS; disable it or use another browser.
-- Local model off / wrong model → `new_app\config.json` missing or misnamed; `ollama list`.
-- Connector "can't open file" → wrong `args` path for that machine (tower user is `jagom`, laptop `jagom.ADVENTUM`).
-- Port in use → stop the old pythonw process (command above) or `Get-NetTCPConnection -LocalPort 8766`.
-- git shows files modified but content identical → line endings: `git config core.autocrlf true` then `git checkout -- new_app`.
-- Connector output still in the old format → Claude Desktop wasn't fully restarted (tray → Quit).
-- Dashboard started before Ollama → it picks the model up within a minute by itself.
-
-## 9. What the stats showed (2026-10-20/21)
-
-- Savings: ~90% of log reading on the tower (7d: tower read ~1.2M tokens, Claude received ~120k).
-- Tower after tuning: qwen3:14b 100% on GPU at 16k context, 0 failed calls, ~20–21 tok/s, avg ~13s / p95 ~28s per call,
-  Claude-request wait p95 0–11s, triage 13.5% unclear, 8.7% unbacked claims, backlog ~0. Cache hit 0% (expected for logs).
-- errors.db was 1.5 GB → slimmed to ~0.8 GB; info lines are ~95% of volume (~2.2M lines/day).
-- Drain3: 213 → 111 patterns in shadow (−48%); live ~140 → ~89.
-- Biggest senders to Claude before trimming: get_run (~26k), list_runs (~22k), list_error_patterns (~14k), error_overview (~11k).
-- Biggest Claude credit levers left (user side): new chat per task, turn off unused connectors (Gmail/Drive/Calendar/
-  ClickUp/Fireflies) in dev chats, smaller model for routine checks.
-
-**Chronic issues found (real bugs, not noise; ~75k problem lines/day, client code NOT changed yet):**
-- ncc `4_process_associations`: MySQL deadlocks (1213) + lock wait timeouts (1205), transactions rolled back, ~26–69k/day,
-  every run → needs retry-with-backoff / smaller transactions / ordered locking.
-- ncc `7a_`: HubSpot rejects `order_id` already on another deal (VALIDATION_ERROR), ~4–10k/day, each failure logged twice,
-  and the code then fails parsing the error (`Expecting property name enclosed in double quotes` — parses a Python repr /
-  bytes as JSON).
-- statewide `statewide-query`: empty seller's-attorney email `''` looked up in contact map, ~43k/day, spiked 3.4× → skip empty.
-- hrs `set-company-props-in-deal`: HubSpot 429 retries ~81k/day on `/crm/v3/objects/deals/search` (handled by retry; only a
-  failure if retries run out) → throttle/batch searches. HRS changes on hold (push to main deploys all Lambdas).
-
-## 10. Open items / next steps
-
-- **Done 2026-10-21**: deploy_tower.py ran (qwen3:30b-a3b downloaded, dashboard restarted on the new code), Claude restarted,
-  priorities set (★ high: hrs, stellaromics, anew, sterling, reliable_roofing, hiniker; others normal, none on-demand yet),
-  switched to qwen3:30b-a3b (16k context).
-- **30B model test (in progress)**: it needs 19.7 GB vs the 12 GB card, so ~54% on GPU is about the max (Ollama 0.40 already
-  keeps always-used parts on GPU, experts in RAM, as long as num_gpu isn't set). Suggested: run it at **8k** context for a
-  day, then check Health → Model comparison. Keep it if unclear % is clearly below qwen3:14b's (~19%) and p95 stays under
-  ~40 s; otherwise switch back to qwen3:14b at 16k. If it wins on quality but is too slow: llama.cpp directly with
-  `--n-cpu-moe` (expert-only offload, reportedly much faster) — bigger change.
-- Commits made on the tower and not yet pushed: 0f9f424 (model picker + priority), c77beaa/19a799f (deploy_tower.py),
-  b668089 (handoff), 5c744c2 (header switcher + model comparison + GPU advice), this handoff update. `git push` on the
-  tower, then `git pull` on the laptop. After pulling 5c744c2 the dashboard needs a restart (deploy_tower.py does it).
-- Optional: quiet the harmless `ConnectionAbortedError` tracebacks in dashboard.log (client closed the request early).
-- Next options discussed: trim `get_log_lines` / `investigate` / `fix_brief` further (tower summary + key lines);
-  fix the chronic ncc / statewide issues in client code (HRS on hold); install codebase-memory-mcp on the laptop
-  (code graph MCP, ~10× fewer tokens for code exploration); rtk only if using Claude Code.
-- Verify the counter fix: `list_error_patterns(profile="hrs")` — the `missing=` progress pattern should stop growing.
-- HRS findings (not acted on, user said hold HRS changes):
-  - `hrs-assoc-compliance-2-companies-hs`: ~600 failed records per run, HubSpot `VALIDATION_ERROR … is not valid` on
-    association batch create (`/crm/v4/associations/2-59343072/2-59343072/batch/create`), spiking.
-  - `look-4-insurance-agents` progress print → a `local_draft_change` to convert it to `oflog.log("INFO","page_progress",…)`
-    was drafted (handler.py lines 351-355) but NOT applied.
-  - `hrs_record_creations` Step Function: `HRSSyncFailed` in `SetCompanyPropsInDealLambda` (34×/24h).
-- **keap_praxis security**: `.env` (Keap API key + HubSpot token) committed and pushed since the first commit; no
-  `.gitignore`; 5 customer export files tracked. Rotate both keys, add .gitignore, `git rm --cached`.
-- Not built yet (discussed): Savings charts; LLMLingua-2 compression on the tower (after Drain3, lower value);
-  anew / other repos oflog conversion; CLAUDE.md for remaining client repos.
-- Researched and skipped: houtini-lm / OllamaClaude (duplicate the local_* tools), token-optimizer (overlaps core mode).
+- Push `4117bae` (and anything newer) from the tower when ready; laptop `git pull`; restart Claude on the laptop once
+  (it may still lack the tasks tools / newest connector).
+- Remove the 3 committed `new_app/config.json.bak-2026102*` files (harmless, no secrets) and git-ignore `config.json.bak*`.
+- Check ollama.com billing settings: auto top-up OFF.
+- Watch the Health tab for a few days: cloud spend/projection, fallbacks, Claude top tools (get_log_lines is the
+  biggest → candidate for a briefer default or cloud summary first).
+- Optional: connector output still says "Local-model summary" for cloud answers → relabel by routed model.
+- Earlier backlog: trim `investigate` / `fix_brief` further; fix chronic ncc / statewide issues in client code (HRS on
+  hold); codebase-memory-mcp on the laptop; keap_praxis security (`.env` with Keap + HubSpot keys committed → rotate
+  keys, add .gitignore, `git rm --cached`); oflog for anew/other repos; CLAUDE.md for remaining client repos;
+  HRS findings (assoc-compliance VALIDATION_ERROR ~600/run, look-4-insurance-agents progress print draft not applied,
+  `HRSSyncFailed` in SetCompanyPropsInDealLambda).
+- old_app is not synced with cloud routing / usage stats (by design: local model off there).
