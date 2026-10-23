@@ -414,12 +414,25 @@ CORE |= {x.strip() for x in os.environ.get("AWS_ERROR_FEED_EXTRA_TOOLS", "").spl
 REGISTRY, EXPOSED = {}, set()
 
 
+# Tools that change something (files, tasks, notes, mutes, settings) or run commands. Every other tool only
+# reads, and is marked read-only so Claude can group them and you can set "Always allow" once for all of them.
+WRITE_TOOLS = {"code_change", "local_draft_change", "local_run", "more_tools", "tasks_add", "tasks_update",
+               "add_note", "mute_pattern", "unmute_pattern", "switch_model", "project_priority",
+               "rescan_infrastructure", "load_history"}
+
+
 def tool():
     def deco(f):
         REGISTRY[f.__name__] = f
         if TOOLS_MODE == "all" or f.__name__ in CORE:
             EXPOSED.add(f.__name__)
-            return mcp.tool()(f)
+            try:
+                from mcp.types import ToolAnnotations
+                ro = f.__name__ not in WRITE_TOOLS
+                return mcp.tool(annotations=ToolAnnotations(readOnlyHint=ro, destructiveHint=False, idempotentHint=ro,
+                                                            openWorldHint=f.__name__ == "research"))(f)
+            except Exception:               # older mcp package without annotations
+                return mcp.tool()(f)
         return f
     return deco
 
