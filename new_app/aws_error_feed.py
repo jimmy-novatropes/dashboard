@@ -1431,6 +1431,8 @@ def brief_context(store, workers, cfg):
             out.append(f"  * [{g['level']}] {g['etype']}: {g['sig'][:200]} - {g['count']}x {tag} in "
                        f"{', '.join(list(g.get('log_groups') or {})[:2])}"
                        + (f" | tower triage: {a.get('verdict')}: {str(a.get('summary') or a.get('cause') or '')[:200]}" if a else ""))
+    green = [c["profile"] for c in cards if c.get("status") == "green"]
+    out.append(f"\n## GREEN (quiet): {', '.join(green) or 'none'}")
     if TASKS:
         today = time.strftime("%Y-%m-%d")
         prop = TASKS.list("proposed")
@@ -2479,8 +2481,10 @@ def make_handler(store, workers, cfg):
                 tpl = str(body.get("template") or "")
                 if tpl not in aws_local.TEMPLATES:
                     return self.json({"error": f"unknown template {tpl}"})
-                return self.json({"id": AIJOBS.start_prompt(tpl, str(body.get("text") or ""),
-                                                            str(body.get("question") or ""))})
+                text = str(body.get("text") or "")
+                if tpl == "ask":                     # the model needs the time to judge "since the deploy"
+                    text = f"Now: {time.strftime('%Y-%m-%d %H:%M')} (tower local time)\n\n" + text
+                return self.json({"id": AIJOBS.start_prompt(tpl, text, str(body.get("question") or ""))})
             if u.path == "/api/ai/filemap":
                 files = [f for f in (body.get("files") or []) if isinstance(f, dict)]
                 return self.json({"id": AIJOBS.start_filemap(files), "files": len(files)})

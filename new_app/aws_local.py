@@ -520,12 +520,16 @@ Be concrete: client, function, counts, times, exact error messages, file:line. S
 (new / spiking / chronic). Mark guesses as "likely". Never assume rate limits, auth or outages unless a
 line shows them (429, 401/403, 5xx, timeout). If the data doesn't answer it, say what's missing and
 which tool would get it (get_log_lines, get_line_context, trace_record, local_read...).
+Times are tower local time; "Now" is given first. A deploy marked "too early" has too little data after it:
+don't say it worked or failed - give the time of the last error before / after it instead.
 Format: short bullets, max 250 words. Last line: "Evidence:" + up to 5 event_ids or file:line you used.""", 900),
     "brief": ("""Write the developer's morning brief from this dashboard snapshot of all client integrations.
 Sections: "Needs action" (red clients: what is broken, since when, likely cause, first step),
 "Watch" (amber: only what is new or worse), "Quiet" (one line listing the rest),
 "Tasks" (proposed from yesterday's mail/meetings, overdue). Concrete: function names, counts,
-error messages. Nothing that isn't in the data. Plain text bullets, max 300 words.""", 900),
+error messages. Nothing that isn't in the data: "first step" = what to check, based on the lines shown
+(no guessed fixes like raising memory unless a line shows memory/timeouts). Use the "usual" numbers as
+given. For "Quiet" copy the GREEN list given at the end. Plain text bullets, max 300 words.""", 900),
 }
 
 
