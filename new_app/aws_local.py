@@ -82,7 +82,9 @@ BACKGROUND_KINDS = ("triage",)      # everything else is someone (Claude / the p
 LOCAL_ONLY_KINDS = ("other",)
 BACKGROUND_CLOUD_MAX_PCT = 60       # background triage uses the cloud only until this % of the daily token cap is
                                     # used, so Claude's / the page's requests always keep cloud headroom
-CLOUD_RETRY_AFTER_S = 600           # after a cloud failure, background work stays on the local GPU this long
+CLOUD_RETRY_AFTER_S = 600
+LIVE_KINDS = ("ask", "lines", "digest")   # answers about live data: reused only for the same question
+LIVE_CACHE_S = 600                  # within this many seconds (the "Now: ..." line is ignored)           # after a cloud failure, background work stays on the local GPU this long
 
 
 def _hook(name, *a):
@@ -296,6 +298,8 @@ class LocalLLM:
             out = {"verdict": "unclear", "category": "unknown", "summary": text[:300], "confidence": 0.1}
             rec["json_ok"] = 0
         _hook("llm_call", rec)
+        if isinstance(out, dict):
+            out["_model"] = model                 # which model answered (triage stores it per verdict)
         return out
 
 
@@ -421,6 +425,7 @@ class Triage(threading.Thread):
                 + (f"Team note: {g['note']}\n" if g.get("note") else "")
                 + f"\nSample lines:\n{samples}\n\nWhat the same log stream printed around the latest one:\n{ctx_txt}")
         res = self.llm.chat(TRIAGE_SYSTEM, user, as_json=True, timeout=600, max_tokens=500, kind="triage")
+        used_model = res.pop("_model", None) or self.llm.model     # cloud or local, whichever answered
         res = {"verdict": res.get("verdict") if res.get("verdict") in VERDICTS else "unclear",
                "category": res.get("category") if res.get("category") in CATEGORIES else "unknown",
                "summary": str(res.get("summary", ""))[:400], "likely_cause": str(res.get("likely_cause", ""))[:300],
@@ -436,7 +441,7 @@ class Triage(threading.Thread):
             _hook("count", "triage:evidence_dropped")
         with self.store.lock:
             self.store.db.execute("INSERT OR REPLACE INTO ai_triage VALUES (?,?,?,?,?,?,?)",
-                                  (g["etype"], g["sig"], prof, int(time.time() * 1000), self.llm.model, g["count"],
+                                  (g["etype"], g["sig"], prof, int(time.time() * 1000), used_model, g["count"],
                                    json.dumps(res)))
             self.store.db.commit()
         return res
@@ -461,6 +466,14 @@ class Triage(threading.Thread):
 
 
 # ============================================================================ on-demand jobs
+def cache_text(kind, text):
+    """What the answer cache keys on: live-data kinds drop the clock line and expire every LIVE_CACHE_S,
+    so asking the same thing twice in a few minutes reuses the answer instead of a new model call."""
+    if kind in LIVE_KINDS:
+        return re.sub(r"^Now: [^\n]*\n+", "", text) + f"|t{int(time.time() // LIVE_CACHE_S)}"
+    return text
+
+
 class PCache:
     """Answers kept in errors.db, so a restart doesn't re-read the same files / logs (30 days)."""
 
@@ -570,7 +583,7 @@ class Jobs:
         system, max_tokens = TEMPLATES[template]
         kind = kind or template
         text = text[: self.llm.chunk_for(kind) - 400]
-        key = hashlib.sha1((self.llm.model_for(kind) + "tpl:" + template + question + text).encode()).hexdigest()
+        key = hashlib.sha1((self.llm.model_for(kind) + "tpl:" + template + question + cache_text(kind, text)).encode()).hexdigest()
         jid = uuid.uuid4().hex[:10]
         if key in self.cache:
             _hook("count", "cache:hit:" + kind)
@@ -633,7 +646,7 @@ class Jobs:
         return jid
 
     def start(self, question, text, kind="summary"):
-        key = hashlib.sha1((self.llm.model_for(kind) + kind + question + text).encode()).hexdigest()
+        key = hashlib.sha1((self.llm.model_for(kind) + kind + question + cache_text(kind, text)).encode()).hexdigest()
         if key in self.cache:
             _hook("count", "cache:hit:" + kind)
             jid = uuid.uuid4().hex[:10]
