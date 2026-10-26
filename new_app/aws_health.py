@@ -770,8 +770,9 @@ def recommendations(s):
             add("warn", "Cloud", f"{c['cap_used_pct']}% of today's cloud token cap is used - after 100% "
                 "everything goes to the local model until tomorrow.", "Raise cloud_llm.daily_token_cap if that's expected.")
         if c["background_on_cloud_7d"]:
-            add("warn", "Cloud", f"{c['background_on_cloud_7d']} background triage call(s) ran on the cloud (7d) - "
-                "they should stay local.", "Check cloud_llm.local_kinds contains 'triage'.")
+            add("ok", "Cloud", f"{c['background_on_cloud_7d']} background triage call(s) ran on the cloud (7d); they "
+                f"switch to the local GPU after a cloud failure or above {aws_local.BACKGROUND_CLOUD_MAX_PCT}% of the "
+                "daily cap.", "")
         if a.get("calls", 0) >= 5 and a["p95_s"] > CLOUD_P95_MAX_S:
             add("info", "Cloud", f"Cloud answers take up to {a['p95_s']}s (p95, 24h).",
                 "Big inputs: lower cloud_llm.max_input_chars, or check ollama.com status.")

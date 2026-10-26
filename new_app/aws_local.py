@@ -77,9 +77,12 @@ anything that isn't in the notes."""
 # Health hooks (set by aws_error_feed to aws_health.Health methods); all optional.
 HOOKS = {"event": None, "count": None, "llm_call": None}
 BACKGROUND_KINDS = ("triage",)      # everything else is someone (Claude / the page) waiting for an answer
-# Cloud model (Ollama Pro, e.g. gpt-oss:120b-cloud, served through the same local Ollama): does the deep work
-# someone is waiting for. These kinds always stay on the local GPU (background / many tiny calls):
-LOCAL_ONLY_KINDS = ("triage", "repo_map", "filemap", "other")
+# Cloud model (Ollama Pro, e.g. gpt-oss:120b-cloud, served through the same local Ollama): does all the model
+# work, background triage included. These kinds always stay on the local GPU (config cloud_llm.local_kinds overrides):
+LOCAL_ONLY_KINDS = ("other",)
+BACKGROUND_CLOUD_MAX_PCT = 60       # background triage uses the cloud only until this % of the daily token cap is
+                                    # used, so Claude's / the page's requests always keep cloud headroom
+CLOUD_RETRY_AFTER_S = 600           # after a cloud failure, background work stays on the local GPU this long
 
 
 def _hook(name, *a):
@@ -163,15 +166,19 @@ class LocalLLM:
 
     # ------------------------------------------------------------ routing (local GPU vs cloud)
     def route(self, kind):
-        """"cloud" for deep work someone waits for, "local" for background triage / tiny calls,
-        or when the cloud is off or today's token cap is used up."""
+        """"cloud" for all model work; "local" for local_kinds, when the cloud is off or today's token cap is
+        used up, and for background triage above BACKGROUND_CLOUD_MAX_PCT of the cap or just after a cloud failure."""
         c = self.cloud
         if not c["enabled"] or kind in c["local_kinds"]:
             return "local"
         day = time.strftime("%Y-%m-%d")
         if self.cloud_used["day"] != day:
             self.cloud_used.update(day=day, tokens=0, calls=0, fallbacks=0)
-        return "cloud" if self.cloud_used["tokens"] < c["daily_token_cap"] else "local"
+        used = self.cloud_used["tokens"]
+        if kind in BACKGROUND_KINDS and (time.time() < self.cloud_used.get("down_until", 0) or
+                                         used >= c["daily_token_cap"] * BACKGROUND_CLOUD_MAX_PCT / 100):
+            return "local"
+        return "cloud" if used < c["daily_token_cap"] else "local"
 
     def model_for(self, kind):
         return self.cloud["model"] if self.route(kind) == "cloud" else self.model
@@ -207,6 +214,7 @@ class LocalLLM:
                                   c["model"], c["num_ctx"], c["max_input_chars"], self.cloud_gate, True)
             except Exception as ex:          # offline / credit used up / model missing -> local GPU
                 self.cloud_used["fallbacks"] += 1
+                self.cloud_used["down_until"] = time.time() + CLOUD_RETRY_AFTER_S
                 _hook("count", "cloud:fallback")
                 self.cloud_used["last_error"] = f"{type(ex).__name__}: {ex}"[:300]
                 _hook("event", "warning", "cloud_model", kind, "cloud failed, used local: " + str(ex)[:250])
@@ -512,6 +520,12 @@ language, no jargon, nothing that isn't in the report.""", 400),
 (passed/failed, counts), then each failure: test or step name, file:line and the key error or
 assertion message. Ignore passing noise. At most 12 bullets.""", 700),
     "filemap": ("""Describe what this file does in ONE line of at most 20 words. No preamble, no markdown.""", 60),
+    "digest": ("""You condense the output of a dashboard tool (AWS Lambda / Step Functions error feed across client
+accounts) for a developer who will act on it. Keep every concrete fact that matters: client/profile and
+function names, statuses (RED / AMBER / GREEN), counts and trends, tags (NEW / SPIKE / REGRESSION / CHRONIC),
+exact error messages (shorten only very long ones), event_ids, request ids, file:line, deploy verdicts, dates.
+Drop repeated lines, boilerplate, links and healthy items (just say how many were healthy). Problems first,
+worst first. Short markdown bullets, no preamble, nothing that isn't in the text.""", 1200),
     "ask": ("""You are the on-call assistant for Open Flow's AWS integrations dashboard (CloudWatch Logs + Step
 Functions across client AWS accounts; HubSpot / NetSuite / other syncs in Lambda). You get the question
 and the dashboard's data (client status, error patterns with counts and triage, latest examples, the

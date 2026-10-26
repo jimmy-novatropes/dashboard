@@ -56,7 +56,10 @@ _active = {"url": None, "at": 0.0}
 MAX_OUT = 40_000          # keep tool results a sensible size for the conversation
 LINES_SUMMARY_MIN_CHARS = 6000   # get_log_lines brief: longer than this (~1.5k tokens) -> the tower's model summarizes
 LINES_SUMMARY_READ = 200         # lines the model reads for that summary (cloud model; local if the cloud is off)
-LINES_SUMMARY_WAIT = 45          # seconds to wait for the summary, else the folded lines are returned
+LINES_SUMMARY_WAIT = 90          # seconds to wait for the summary, else the folded lines are returned
+DIGEST_MIN_CHARS = 6000          # list_error_patterns / investigate / clients_status: longer than this -> the tower's
+                                 # cloud model condenses it before it reaches Claude (raw=True skips it)
+DIGEST_WAIT = 90                 # seconds to wait for that digest, else the full output is returned
 PATTERNS_BRIEF_TOP = 6           # list_error_patterns brief: full entries for the top N, one line each for the rest
 PATTERNS_BRIEF_EXAMPLES = 3      # ...with an example only for the top N
 ASK_WAIT = 150                   # ask_tower / morning_brief: seconds to wait for the tower's model
@@ -404,6 +407,41 @@ def guard(fn):
     return wrap
 
 
+def _digest(text, what):
+    """The tower's model (cloud when on) condenses a long tool result; None if it can't right now."""
+    try:
+        r = api_post("/api/ai/prompt", {"template": "digest", "text": text, "question": f"Tool: {what}"})
+        if r.get("error"):
+            return None
+        j = _wait_job(r["id"], DIGEST_WAIT)
+        if j.get("status") == "running" or j.get("error") or not j.get("answer"):
+            return None
+        return j["answer"]
+    except Exception:
+        return None
+
+
+def digested(what):
+    """Results longer than DIGEST_MIN_CHARS are condensed by the tower's cloud model before they reach
+    Claude. raw=True (or the model being unavailable) returns the full output."""
+    import functools
+
+    def deco(fn):
+        @functools.wraps(fn)
+        def wrap(*a, **kw):
+            out = fn(*a, **kw)
+            if kw.get("raw") or not isinstance(out, str) or len(out) <= DIGEST_MIN_CHARS:
+                return out
+            d = _digest(out, what)
+            if not d:
+                return out
+            first = out.split("\n", 1)[0]
+            return finish([first, f"Cloud-model digest of ~{len(out) // 4:,} tokens of {what} output "
+                                  f"(verify key facts; everything: same call with raw=True):", d])
+        return wrap
+    return deco
+
+
 # Tool profile: "core" (default) exposes the everyday tools + more_tools (which reaches all the others),
 # so every message carries far fewer tool definitions. AWS_ERROR_FEED_TOOLS=all exposes everything.
 TOOLS_MODE = os.environ.get("AWS_ERROR_FEED_TOOLS", "core").strip().lower()
@@ -538,13 +576,15 @@ def error_overview(hours: float = 24, profile: str = "") -> str:
 
 @tool()
 @guard
+@digested("list_error_patterns")
 def list_error_patterns(hours: float = 24, profile: str = "", level: str = "error,suspect",
                         log_group_prefix: str = "", search: str = "", limit: int = 12,
                         only_new_or_spiking: bool = False, include_muted: bool = False,
-                        detail: str = "brief") -> str:
+                        detail: str = "brief", raw: bool = False) -> str:
     """Recurring problems grouped by type+message, tagged NEW / SPIKE / REGRESSION / CHRONIC.
     detail="brief" (default): one line per pattern (type, count, tags, message, where, triage verdict).
-    detail="normal": + examples and trends for the top ones; "full": everything. level: comma list."""
+    detail="normal": + examples and trends for the top ones; "full": everything. level: comma list.
+    Long results are condensed by the tower's cloud model; raw=True returns everything."""
     note = ensure_range(hours)
     rows = api("/api/summary", hours=hours, profile=profile, level=level,
                grp_prefix=log_group_prefix, q=search, hide_muted="" if include_muted else 1)
@@ -614,21 +654,30 @@ def list_error_patterns(hours: float = 24, profile: str = "", level: str = "erro
 @guard
 def get_log_lines(hours: float = 24, profile: str = "", level: str = "", log_group: str = "",
                   log_group_prefix: str = "", search: str = "", error_type: str = "",
-                  signature: str = "", limit: int = 30, detail: str = "brief") -> str:
+                  signature: str = "", limit: int = 30, detail: str = "brief", raw: bool = False) -> str:
     """Log lines (newest first) with event ids for get_line_context. Filter by profile, level (comma
     list), exact log_group or prefix, free-text search, or a pattern (error_type + signature from
-    list_error_patterns). detail="brief" (default): short results come back as lines; long ones are
-    read by the tower's model and come back as a summary + key event ids. detail="lines": the lines,
-    repeats folded (×N), long messages shortened. detail="full": whole messages, account and stream."""
+    list_error_patterns). Short results come back as lines; long ones (any detail) are read by the
+    tower's cloud model and come back as a summary + key event ids. detail="brief"/"lines": repeats
+    folded (×N), long messages shortened; "full": whole messages, account and stream. raw=True: never
+    summarize (only to check exact lines before editing)."""
     note = ensure_range(hours)
     r = api("/api/events", hours=hours, profile=profile, level=level, grp=log_group,
             grp_prefix=log_group_prefix, q=search, etype=error_type,
             sig=signature if error_type else "", limit=max(1, min(limit, 200)))
-    out = [note + f"Showing {len(r['events'])} of {r['total']} matching lines — dashboard: "
-           f"{link(tab='all', hours=int(hours), profile=profile, level=level or 'error,suspect,warning,info', grp=log_group, q=search, etype=error_type, sig=signature if error_type else '')}"]
-    if detail != "full":
+    head = [note + f"Showing {len(r['events'])} of {r['total']} matching lines — dashboard: "
+            f"{link(tab='all', hours=int(hours), profile=profile, level=level or 'error,suspect,warning,info', grp=log_group, q=search, etype=error_type, sig=signature if error_type else '')}"]
+    out = list(head)
+    if detail == "full":
+        budget = MAX_OUT // max(1, len(r["events"]))
+        for e in r["events"]:
+            out += [f"\n--- {t(e['ts'])} | {e['profile']} ({e['account']}, {e['region']}) | {e['group']} | "
+                    f"{e['level']}{' ' + e['etype'] if e['level'] in ('error', 'suspect') else ''}"
+                    + (f" | flagged: {e['hint']}" if e.get("hint") else ""),
+                    f"event_id: {e['id']}   stream: {e['stream']}",
+                    cap(e["message"], min(4000, max(500, budget)))]
+    else:
         groups = {}
-        head = list(out)
         for e in r["events"]:                      # newest first: later ones in a group are older
             key = (e["profile"], e["group"], e["level"], e.get("etype"), _NUM.sub("#", e["message"][:300]))
             g = groups.get(key)
@@ -647,16 +696,16 @@ def get_log_lines(hours: float = 24, profile: str = "", level: str = "", log_gro
                     _problem_text(e["message"], 1500) if prob else cap(e["message"], 400)]
         if len(groups) < len(r["events"]):
             out.append(f"\n({len(r['events'])} lines folded into {len(groups)}; detail=\"full\" shows each line whole)")
-        if detail == "brief" and len("\n".join(out)) > LINES_SUMMARY_MIN_CHARS:
-            s = _summarize_lines(hours, profile, level, log_group, log_group_prefix, search, error_type, signature, limit)
-            if s:
-                return finish(head + s)
-            out.append("(The tower's model couldn't summarize these right now, so here are the lines.)")
-        return finish(out)
+    if not raw and len("\n".join(out)) > LINES_SUMMARY_MIN_CHARS:
+        s = _summarize_lines(hours, profile, level, log_group, log_group_prefix, search, error_type, signature, limit)
+        if s:
+            return finish(head + s)
+        out.append("(The tower's model couldn't summarize these right now, so here are the lines.)")
+    return finish(out)
 
 
 def _summarize_lines(hours, profile, level, log_group, log_group_prefix, search, error_type, signature, limit):
-    """get_log_lines brief, long result: the tower's model (cloud when on) reads the lines instead of Claude."""
+    """get_log_lines, long result: the tower's model (cloud when on) reads the lines instead of Claude."""
     try:
         r = api("/api/ai/summarize", kind="lines", profile=profile, level=level, grp=log_group,
                 grp_prefix=log_group_prefix, q=search, etype=error_type, sig=signature if error_type else "",
@@ -675,16 +724,7 @@ def _summarize_lines(hours, profile, level, log_group, log_group_prefix, search,
     return [f"{who} summary of {r['lines']} lines ({r.get('model', '?')}; verify key facts):", j["answer"],
             *([f"\nKey error lines, newest first (event_id for get_line_context / locate_code): {', '.join(ids)}"]
               if ids else []),
-            "Raw lines: same call with detail=\"lines\" (folded) or detail=\"full\"."]
-    budget = MAX_OUT // max(1, len(r["events"]))
-    for e in r["events"]:
-        out += [f"\n--- {t(e['ts'])} | {e['profile']} ({e['account']}, {e['region']}) | {e['group']} | "
-                f"{e['level']}{' ' + e['etype'] if e['level'] in ('error', 'suspect') else ''}"
-                + (f" | flagged: {e['hint']}" if e.get("hint") else ""),
-                f"event_id: {e['id']}   stream: {e['stream']}",
-                cap(e["message"], min(4000, max(500, budget)))]
-    return finish(out)
-
+            "Exact lines: get_line_context(event_id), or this call with raw=True (detail=\"full\" for whole messages)."]
 
 @tool()
 @guard
@@ -1002,9 +1042,11 @@ def _find_group(function, profile):
 
 @tool()
 @guard
-def clients_status() -> str:
+@digested("clients_status")
+def clients_status(raw: bool = False) -> str:
     """Red/amber/green status per client with reasons, error counts (1h/6h/24h) and recent deploys.
-    Start here for "how are my clients?"."""
+    Start here for "how are my clients?". Long results are condensed by the tower's cloud model
+    (problems first); raw=True returns everything."""
     cards = api("/api/ops/clients")
     out = [f"Dashboard: {link(tab='clients')} (★ = priority project)"]
     asleep = [c["profile"] for c in cards if c.get("asleep")]
@@ -1297,8 +1339,8 @@ _prof_cache = {"at": 0.0, "names": []}
 
 
 def _raw(name):
-    f = REGISTRY[name]
-    return getattr(f, "__wrapped__", f)
+    import inspect
+    return inspect.unwrap(REGISTRY[name])      # past guard and digested: internal calls get the full output
 
 
 def _profiles():
@@ -1359,9 +1401,9 @@ def ask_tower(question: str, profile: str = "", function: str = "", hours: float
         add("error patterns", lambda: _raw("list_error_patterns")(hours=hours, profile=prof, limit=15, detail="full"))
         if fn:
             add(f"log lines of {fn}", lambda: _raw("get_log_lines")(hours=hours, profile=prof, log_group_prefix=f"/aws/lambda/{fn}",
-                                                                     level="error,suspect,warning", limit=100, detail="lines"))
+                                                                     level="error,suspect,warning", limit=100, detail="lines", raw=True))
         add("deploys", lambda: _raw("list_deploys")(profile=prof, hours=72))
-        add("tasks", lambda: _raw("tasks_list")(client=prof))
+        add("tasks", lambda: _raw("tasks_list")(client=prof, detail="full"))
     else:
         add("all clients", lambda: _raw("clients_status")())
         add("morning brief", lambda: api("/api/ai/brief").get("text") or "")
@@ -1536,9 +1578,12 @@ def morning_brief(refresh: bool = False) -> str:
 
 @tool()
 @guard
-def investigate(profile: str, function: str = "", error_type: str = "", signature: str = "", hours: float = 24) -> str:
+@digested("investigate")
+def investigate(profile: str, function: str = "", error_type: str = "", signature: str = "", hours: float = 24,
+                raw: bool = False) -> str:
     """Broad look at a client (optionally one function / error): top patterns with notes and triage,
-    latest example, preceding lines, code location and run outcomes."""
+    latest example, preceding lines, code location and run outcomes. Long results are condensed by the
+    tower's cloud model (event ids and file:line kept); raw=True returns everything."""
     prefix = f"/aws/lambda/{function}" if function and not function.startswith("/") else function
     rows = api("/api/summary", hours=hours, profile=profile, level="error,suspect", hide_muted=1,
                grp_prefix=prefix or "", etype=error_type, sig=signature if error_type else "")
@@ -2622,10 +2667,13 @@ def _task_line(it, today):
 
 @tool()
 @guard
-def tasks_list(status: str = "", client: str = "", search: str = "", done_days: float = 7) -> str:
+def tasks_list(status: str = "", client: str = "", search: str = "", done_days: float = 7,
+               detail: str = "brief") -> str:
     """The user's task list kept in the dashboard (tasks.db, local only). Default: everything not done
     + items done in the last done_days. status: open | in_progress | waiting | done | proposed (from the daily
     mail/meeting intake, waiting for accept) | dismissed | all (comma list ok).
+    detail="brief" (default): one line per task (id, status, priority, due, client, title), done items only
+    counted unless status asks for them. detail="full": + request, reason, links, ref.
     Call this before tasks_add (e.g. when turning recent emails into tasks) to see what is already tracked."""
     r = api("/api/tasks", status=status, client=client, q=search, done_days=done_days)
     if r.get("error"):
@@ -2634,8 +2682,18 @@ def tasks_list(status: str = "", client: str = "", search: str = "", done_days: 
     items = r["items"]
     out = [f"{len([i for i in items if i['status'] != 'done'])} not done, {len([i for i in items if i['status'] == 'done'])} done "
            f"(shown) — dashboard: {link(tab='tasks')}"]
+    if detail == "full":
+        for it in items:
+            out += _task_line(it, today)
+        return finish(out if items else out + ["No tasks match."])
+    show_done = "done" in status or "all" in status
+    done = [i for i in items if i["status"] == "done"]
     for it in items:
-        out += _task_line(it, today)
+        if it["status"] != "done" or show_done:
+            out.append(_task_line(it, today)[0])
+    if done and not show_done:
+        out.append(f"({len(done)} done in the last {done_days:g} days - status=\"done\" lists them.)")
+    out.append("Request / reason / links per task: detail=\"full\" (add search= or client= to narrow).")
     return finish(out if items else out + ["No tasks match."])
 
 

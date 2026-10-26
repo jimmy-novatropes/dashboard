@@ -55,5 +55,8 @@ When code changes are ready, give the user only these steps (adapt the model lin
    on the laptop and the tower.
 5. Ask Claude "dashboard status" to confirm it works.
 New Ollama model: set `MODEL_TO_INSTALL` (+ `SWITCH_TO_NEW_MODEL`) at the top of `deploy_tower.py` before step 1.
-Cloud model (Ollama Pro, `gpt-oss:120b-cloud`): `cloud_llm` in `new_app/config.json`; deep work goes to the cloud,
-background triage stays local (see `LOCAL_ONLY_KINDS` in `aws_local.py`).
+Cloud model (Ollama Pro, `gpt-oss:120b-cloud`): `cloud_llm` in `new_app/config.json`; all model work goes to the cloud,
+background triage included (back to the local GPU after a cloud failure or above `BACKGROUND_CLOUD_MAX_PCT` of the
+daily cap; `LOCAL_ONLY_KINDS` in `aws_local.py`, `cloud_llm.local_kinds` in config.json).
+Long results of get_log_lines / list_error_patterns / investigate / clients_status come back as a cloud-model
+summary; add `raw=True` only to check exact lines before editing. `tasks_list` is one line per task (`detail="full"` for more).
