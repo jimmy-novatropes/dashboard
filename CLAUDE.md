@@ -33,6 +33,18 @@
 - Tools not listed (schedules, inventory, deploys, notes, mutes, reports…) are reached with `more_tools()`.
 - Normal reading/editing still works as before — these are shortcuts, not requirements.
 
+## Quality loop (new_app/aws_quality.py)
+- Before committing / deploying any change (yours or the tower's): `review_change(repo, intent)` = cloud review
+  (3 finder passes + 3 verifier votes, Important / Nit / Pre-existing with file:line, risk tier, how to revert).
+  `code_change` drafts include it. Max 3 rounds on the same files, then rethink the approach.
+- Triage: "actionable" needs a second cloud call to agree (else downgraded, note "verifier disagreed").
+- When you learn what a pattern really was: `triage_feedback(profile, error_type, signature, label)`; muting and
+  dashboard tasks from an error (error_ref) count too. `quality_report()` (more_tools) = how often triage was right;
+  `triage_eval(target)` re-scores the triage on the labeled set (weekly by itself; run it before switching models).
+- After fixing an error: `sweep_bug_class(profile, error_type, signature)` finds the same weakness in other repos
+  (nightly 02:xx for fixed / confirmed patterns; `sweep_results`). Bad deploys (worse / new errors) become a
+  high-priority task with rollback steps.
+
 ## Rules
 - Keep `old_app` and `new_app` in sync for shared fixes; they differ only in port (8765/8766), the local
   model default (off/on), `mcp_server.py` default URL and `install_autostart.ps1`.

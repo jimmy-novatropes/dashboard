@@ -68,6 +68,7 @@ BRIEF_MAX_AGE_HOURS = 8          # morning_brief rewrites a brief older than thi
 RESEARCH_WAIT = 240              # research: seconds to wait for the tower's report
 CODE_CHANGE_CHARS = 120_000      # code_change: file text the tower's model reads per change
 CODE_CHANGE_WAIT = 180           # code_change: seconds to wait for the draft
+REVIEW_WAIT = 120                # code_change / review_change: seconds to wait for the cloud review of the diff
 PATTERNS_BRIEF_LIMIT = 12        # list_error_patterns brief: one line per pattern, at most this many
 
 INSTRUCTIONS = """\
@@ -447,7 +448,7 @@ def digested(what):
 TOOLS_MODE = os.environ.get("AWS_ERROR_FEED_TOOLS", "core").strip().lower()
 CORE = {"morning_brief", "ask_tower", "research", "code_change", "clients_status", "investigate", "fix_brief",
         "list_error_patterns", "get_log_lines", "get_line_context", "find_code", "local_read", "local_run",
-        "tasks_list"}       # the rest (tasks_add, tasks_update, outline, ...): more_tools()
+        "tasks_list", "review_change"}       # the rest (tasks_add, tasks_update, outline, ...): more_tools()
 CORE |= {x.strip() for x in os.environ.get("AWS_ERROR_FEED_EXTRA_TOOLS", "").split(",") if x.strip()}
 REGISTRY, EXPOSED = {}, set()
 
@@ -456,7 +457,7 @@ REGISTRY, EXPOSED = {}, set()
 # reads, and is marked read-only so Claude can group them and you can set "Always allow" once for all of them.
 WRITE_TOOLS = {"code_change", "local_draft_change", "local_run", "more_tools", "tasks_add", "tasks_update",
                "add_note", "mute_pattern", "unmute_pattern", "switch_model", "project_priority",
-               "rescan_infrastructure", "load_history"}
+               "rescan_infrastructure", "load_history", "triage_feedback", "triage_eval", "sweep_bug_class"}
 
 
 def tool():
@@ -1548,8 +1549,118 @@ def code_change(instruction: str, files: str, apply_id: str = "", job_id: str = 
     aid = uuid.uuid4().hex[:8]
     _pending_changes[aid] = {"files": {reals[rel]: (raws[rel], new[rel], b"\r\n" in raws[rel])
                                        for rel in texts if new[rel] != texts[rel]}, "at": time.time()}
-    return finish([f"Tower draft ({len(diff)} diff lines) - review, then code_change(instruction=..., files=..., "
-                   f"apply_id=\"{aid}\") writes exactly this:", "```diff", *diff, "```", note])
+    review = _review_diff("\n".join(diff), instruction, "", ",".join(reals))
+    return finish([f"Tower draft ({len(diff)} diff lines) - check it and the review below, then "
+                   f"code_change(instruction=..., files=..., apply_id=\"{aid}\") writes exactly this:",
+                   "```diff", *diff, "```", note, "", review])
+
+
+def _review_diff(diff, intent="", repo="", files="", job_id=""):
+    """Cloud review of a diff (finders + verifier votes, risk tier, how to revert) -> text."""
+    try:
+        if not job_id:
+            r = api_post("/api/ai/review", {"diff": diff, "intent": intent, "repo": repo, "files": files})
+            if r.get("error"):
+                return f"Review: not available ({r['error']})."
+            job_id = r["id"]
+        j = _wait_job(job_id, REVIEW_WAIT)
+    except Exception as ex:
+        return f"Review: not available ({type(ex).__name__})."
+    if j.get("status") == "running":
+        return f"Review still running - review_change(job_id=\"{job_id}\") in ~30s."
+    if j.get("error") or not j.get("answer"):
+        return f"Review failed ({j.get('error') or 'empty'})."
+    return "Review: " + j["answer"]
+
+
+@tool()
+@guard
+def review_change(repo: str = "", intent: str = "", base: str = "", path: str = "", job_id: str = "") -> str:
+    """Cloud code review of the uncommitted changes in a repo (or base="main" / a commit range like
+    "main...branch"): several finder passes + verifier votes, only confirmed findings labeled Important /
+    Nit / Pre-existing with file:line, a risk tier (low / medium / high) and how to revert. Run it before
+    committing or deploying any change you or the tower wrote. intent = what the change should do."""
+    if job_id:
+        return finish([_review_diff("", job_id=job_id)])
+    try:
+        real = _resolve(repo)
+    except ValueError as ex:
+        return str(ex)
+    if base and not _REF_OK.match(base):
+        return f"'{base}' doesn't look like a git ref."
+    cmd = ["git", "diff", "--patch", "--unified=3"] + ([base] if base else ["HEAD"]) + (["--", path] if path else [])
+    try:
+        r = subprocess.run(cmd, cwd=real, capture_output=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as ex:
+        return f"git failed: {ex}"
+    if r.returncode != 0:
+        return "git error: " + r.stderr.decode("utf-8", errors="replace")[:500]
+    diff = r.stdout.decode("utf-8", errors="replace")
+    if not diff.strip():
+        return "No changes to review (git diff is empty; new files must be `git add`-ed to show up)."
+    files = ",".join(_re.findall(r"^\+\+\+ b/(.+)$", diff, _re.M))
+    return finish([f"{repo or real}: {diff.count(chr(10))} diff lines in {files.count(',') + 1} file(s).",
+                   _review_diff(diff, intent, os.path.basename(real), files)])
+
+
+@tool()
+@guard
+def quality_report(days: float = 30) -> str:
+    """How good the tower's judgement is: triage outcomes (was "actionable" right - muted / task / fixed /
+    ignored), verifier results, the latest eval score, diff reviews, bug-class sweeps and bad-deploy alerts."""
+    r = api("/api/quality/text")
+    return finish([r.get("text") or r.get("error") or "?"])
+
+
+@tool()
+@guard
+def triage_feedback(profile: str, error_type: str, signature: str, label: str, note: str = "") -> str:
+    """Tell the tower what a pattern really was: label = actionable | noise | external | unclear (or clear).
+    It scores the triage against it and it joins the eval set. error_type + signature from list_error_patterns."""
+    r = api("/api/quality/label", profile=profile, etype=error_type, sig=signature, label=label, note=note)
+    return r.get("error") or f"Saved: {profile} {error_type} = {label}."
+
+
+@tool()
+@guard
+def triage_eval(target: str = "cloud", verify: bool = True, job_id: str = "") -> str:
+    """Re-run the triage on every labeled pattern (your labels + muted = noise, tasks / fixes = actionable)
+    and score it: accuracy, false alarms, misses. target = "cloud" or "local" (compare models before switching).
+    Runs weekly by itself; takes a few minutes."""
+    if not job_id:
+        r = api("/api/quality/eval", target=target, verify="1" if verify else "0")
+        if r.get("error"):
+            return r["error"]
+        job_id = r["id"]
+    j = _wait_job(job_id, 150)
+    if j.get("status") == "running":
+        return f"Eval still running - triage_eval(job_id=\"{job_id}\") in a minute."
+    return finish([j.get("answer") or j.get("error") or "?"])
+
+
+@tool()
+@guard
+def sweep_bug_class(profile: str, error_type: str, signature: str = "", job_id: str = "") -> str:
+    """After fixing an error pattern: the tower names its bug class, searches every repo on the tower for the
+    same weakness and checks each hit with the cloud model -> file:line list of likely repeats. Also runs
+    nightly for recently fixed / confirmed patterns (see sweep_results)."""
+    if not job_id:
+        r = api("/api/quality/sweep", profile=profile, etype=error_type, sig=signature)
+        if r.get("error"):
+            return r["error"]
+        job_id = r["id"]
+    j = _wait_job(job_id, 150)
+    if j.get("status") == "running":
+        return f"Sweep still running - sweep_bug_class(profile=..., error_type=..., job_id=\"{job_id}\") in a minute."
+    return finish([j.get("answer") or j.get("error") or "?"])
+
+
+@tool()
+@guard
+def sweep_results(n: int = 5) -> str:
+    """The latest bug-class sweeps (nightly + on demand): bug class and the file:line places with the same weakness."""
+    r = api("/api/quality/sweeps", n=n)
+    return finish([r.get("text") or r.get("error") or "?"])
 
 
 @tool()

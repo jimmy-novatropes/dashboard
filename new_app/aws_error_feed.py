@@ -68,6 +68,7 @@ import aws_tasks  # noqa: E402  (tasks / follow-ups, kept in tasks.db)
 import aws_intake  # noqa: E402  (daily: yesterday's Gmail + Fireflies -> proposed tasks)
 import aws_brief  # noqa: E402  (daily morning brief written by the tower's model)
 import aws_updates  # noqa: E402  (weekly client update email drafts -> proposed tasks)
+import aws_quality  # noqa: E402  (triage outcomes + eval, diff review, bug-class sweep, bad-deploy alerts)
 import aws_research  # noqa: E402  (web research: Ollama web search + fetch, cloud model writes a cited report)
 DAY_MS = 86_400_000
 LEVELS = ("error", "suspect", "warning", "info", "platform")
@@ -1277,6 +1278,16 @@ def deploy_impact(store, d, window_hours=24):
             "new_patterns": new, "gone_patterns": gone, "verdict": verdict, "patterns": pats}
 
 
+def deploy_check(store, workers, d, window_hours=6):
+    """Before/after verdict for one deploy (as on the Clients tab), or None if the 'before' isn't loaded."""
+    w = next((w for w in workers if w.profile == d["profile"] and w.region == d["region"]), None)
+    covered = getattr(w, "covered_from", None) or int(time.time() * 1000)
+    imp = deploy_impact(store, d, window_hours)
+    if covered <= d["deployed_at"] - window_hours * 3_600_000:
+        return imp
+    return deploy_impact_hourly(store, d, window_hours)
+
+
 VERSION_DESC_RX = re.compile(r"\b(?:git|commit|sha|version|release|v)[\s:=#]*([0-9a-f]{7,40}|v?\d[\w.\-]{0,38})\b", re.I)
 VERSION_ENV_KEYS = ("GIT_SHA", "GIT_COMMIT", "COMMIT_SHA", "CODE_VERSION", "APP_VERSION", "VERSION",
                     "RELEASE", "BUILD_ID", "DEPLOY_VERSION")
@@ -2201,6 +2212,7 @@ TRACES = aws_ops.TraceJobs()
 LLM = None
 AIJOBS = None
 TRIAGE = None
+QUALITY = None
 HEALTH = None
 DRAIN = None
 PREFS = None
@@ -2470,7 +2482,7 @@ def make_handler(store, workers, cfg):
         def do_POST(self):
             u = urlparse(self.path)
             if u.path not in ("/api/ai/read", "/api/ai/prompt", "/api/ai/filemap", "/api/ai/filemap_known",
-                              "/api/ai/research", "/api/tasks/add", "/api/tasks/update"):
+                              "/api/ai/research", "/api/ai/review", "/api/tasks/add", "/api/tasks/update"):
                 return self.send(404, "not found", "text/plain")
             n = int(self.headers.get("Content-Length") or 0)
             if n > 12_000_000:
@@ -2491,6 +2503,12 @@ def make_handler(store, workers, cfg):
                     return self.json({"error": "No question."})
                 return self.json({"id": aws_research.start(AIJOBS, LLM, aws_research.api_key(cfg), q,
                                                            str(body.get("depth") or "normal"))})
+            if u.path == "/api/ai/review":
+                diff = str(body.get("diff") or "")
+                if not diff.strip() or not QUALITY:
+                    return self.json({"error": "No diff." if QUALITY else "quality checks not loaded"})
+                return self.json({"id": QUALITY.start_review(diff, str(body.get("intent") or ""),
+                                                             str(body.get("repo") or ""), str(body.get("files") or ""))})
             if u.path == "/api/ai/prompt":
                 tpl = str(body.get("template") or "")
                 if tpl not in aws_local.TEMPLATES:
@@ -2561,12 +2579,22 @@ def make_handler(store, workers, cfg):
             if u.path in ("/api/health", "/api/health/text"):
                 snap = HEALTH.snapshot(LLM, TRIAGE, DRAIN, cfg["keep_hours"], force=bool(q.get("force")))
                 if u.path.endswith("/text"):
-                    return self.send(200, aws_health.text_report(snap), "text/plain; charset=utf-8")
+                    txt = aws_health.text_report(snap)
+                    if QUALITY:
+                        try:
+                            txt += "\n" + QUALITY.text()
+                        except Exception as ex:
+                            txt += f"\nQUALITY: couldn't compute ({type(ex).__name__}: {ex})"
+                    return self.send(200, txt, "text/plain; charset=utf-8")
                 return self.json(snap)
             if u.path == "/api/summary":
                 return self.json(store.annotate(store.summary(q), q.get("profile")))
             if u.path.startswith("/api/infra/") or u.path.startswith("/api/digest"):
                 return self.infra(u.path, q)
+            if u.path.startswith("/api/quality/"):
+                if not QUALITY:
+                    return self.json({"error": "quality checks not loaded"})
+                return self.json(QUALITY.api(u.path, q))
             if u.path.startswith("/api/ai/"):
                 return self.ai(u.path, q)
             if u.path.startswith(("/api/ops/", "/report")):
@@ -2747,6 +2775,8 @@ tr.click:hover{background:var(--bg);cursor:pointer}
 .win td b{font-size:15px;color:var(--fg)}.win td .chg{display:block;font-size:10.5px;color:var(--mute)}
 .win td .chg.up{color:var(--err)}.win td .chg.down{color:var(--ok)}
 .ai{font-size:12px;margin-top:3px;padding:3px 8px;border-radius:6px;background:rgba(77,171,247,.10);border-left:3px solid var(--acc)}
+.lbls{margin-top:3px;font-size:11.5px;color:var(--mute)}.lbls .lb{font-size:11px;color:var(--mute);cursor:pointer;text-decoration:underline;background:none;border:0;padding:0;margin:0 0 0 8px}.lbls .lb:hover{color:var(--acc)}
+.vchk{font-size:11px;color:var(--ok);margin-left:6px}.vdis{font-size:11px;color:var(--warn);margin-left:6px}
 .ai b{text-transform:uppercase;font-size:10.5px;letter-spacing:.04em}.ai .v-actionable{color:var(--err)}.ai .v-noise{color:var(--ok)}
 .ai .v-external{color:var(--sus)}.ai .v-unclear{color:var(--mute)}
 .aibox{margin-top:8px;padding:8px 10px;border-radius:6px;background:rgba(77,171,247,.08);font-size:13px;white-space:pre-wrap}
@@ -3483,9 +3513,29 @@ async function aiStatus(){
   }catch(e){}
 }
 let AI_OK=false;
+const LABEL_TXT={actionable:'real issue',noise:'noise',external:'partner / their data',unclear:'not sure'};
 function aiLine(t){
   if(!t)return '';
-  return `<div class="ai">🤖 <b class="v-${esc(t.verdict)}">${esc(t.verdict)}</b> · ${esc(t.category)} — ${esc(t.summary)}${t.next_step?`<br><span class="small">Next: ${esc(t.next_step)}</span>`:''}<span class="small" style="opacity:.6"> (${Math.round((t.confidence||0)*100)}%, ${esc(t.model)})</span></div>`;
+  const ver=t.verified==='confirmed'?' <span class="vchk" title="a second cloud check agreed">✓ double-checked</span>'
+    :t.verified==='disputed'?` <span class="vdis" title="${esc(t.note||'')}">first said ${esc(t.first_verdict)}, second check disagreed</span>`:'';
+  return `<div class="ai">🤖 <b class="v-${esc(t.verdict)}">${esc(t.verdict)}</b> · ${esc(t.category)} — ${esc(t.summary)}${t.next_step?`<br><span class="small">Next: ${esc(t.next_step)}</span>`:''}<span class="small" style="opacity:.6"> (${Math.round((t.confidence||0)*100)}%, ${esc(t.model)})</span>${ver}${labelBtns(t)}</div>`;
+}
+function labelBtns(t){
+  if(!t.etype)return '';
+  const d=`data-e="${esc(t.etype)}" data-s="${esc(t.sig)}" data-p="${esc(t.profile)}"`;
+  if(t.label)return `<div class="lbls">✓ You said: <b>${esc(LABEL_TXT[t.label]||t.label)}</b> <button class="lb" ${d} data-l="clear" onclick="labelTri(event,this)">undo</button></div>`;
+  return `<div class="lbls">Was it? ${['actionable','noise','external'].map(l=>`<button class="lb" ${d} data-l="${l}" onclick="labelTri(event,this)">${LABEL_TXT[l]}</button>`).join('')}</div>`;
+}
+async function labelTri(ev,b){
+  ev.stopPropagation(); const box=b.closest('.lbls'); const l=b.dataset.l;
+  box.style.opacity=.5;
+  const r=await getJ('/api/quality/label?'+new URLSearchParams({etype:b.dataset.e,sig:b.dataset.s,profile:b.dataset.p,label:l}));
+  box.style.opacity=1;
+  if(r.error){box.insertAdjacentHTML('beforeend',` <span class="small">${esc(r.error)}</span>`);return}
+  const k=b.dataset.e+'|'+b.dataset.s+'|'+b.dataset.p, t=AITRIAGE[k]||{etype:b.dataset.e,sig:b.dataset.s,profile:b.dataset.p};
+  t.label=l==='clear'?null:l; AITRIAGE[k]=t;
+  (sumRows||[]).forEach(g=>{if(g.ai&&g.ai.etype===t.etype&&g.ai.sig===t.sig&&g.ai.profile===t.profile)g.ai.label=t.label});
+  box.outerHTML=labelBtns(t);
 }
 async function aiSummarize(params,box){
   if(!AI_OK){box.innerHTML='<div class="small">Local model is off (see the 🤖 line at the top).</div>';return}
@@ -3613,6 +3663,7 @@ def main():
     store = Store(db, cfg)
     aws_ops.init_db(store)
     aws_local.init_db(store)
+    aws_quality.init_db(store)
     global LLM, AIJOBS, TRIAGE
     LLM = aws_local.LocalLLM(cfg)
     LLM.meter = lambda kind, i, o: aws_local.record_usage(store, "local", kind, i, o)
@@ -3713,6 +3764,10 @@ def main():
         HEALTH.event("info", "settings", "wake", f"{prof} opened - loading it (awake {PREFS.wake_hours:g}h)")
     PREFS.on_wake = on_wake
     TRIAGE.start()
+    global QUALITY
+    QUALITY = aws_quality.Quality(LLM, store, TASKS, cfg, HERE, AIJOBS,
+                                  lambda d, win: deploy_check(store, workers, d, win), HEALTH.event)
+    QUALITY.start()
     print("Local model:", LLM.check(force=True)["detail"])
 
     print(f"Watching {len(workers)} profile/region pair(s):")

@@ -48,6 +48,18 @@ is usually normal progress output, not an error -> "noise".
 (outage, rate limit, expired token on their side). Base everything only on the lines given; if unsure
 say "unclear" with low confidence. No markdown, no extra text."""
 
+# Second opinion before an error is called "actionable" (verify before you flag: a separate call must agree).
+VERIFY_VERDICTS = ("actionable",)
+VERIFY_SYSTEM = """You double-check another model's triage of a recurring error from AWS Lambda / Step Functions
+integrations (HubSpot, NetSuite, Epicor, QuickBooks syncs). You get the same lines it saw and its verdict.
+Be skeptical: agree only if the lines clearly show something the developer must fix in code or config.
+Retried-and-succeeded, partner outages / rate limits / their bad data, and progress counters are NOT actionable.
+Reply with ONLY a JSON object:
+{"agree": true or false,
+ "verdict": your own verdict, one of ["actionable","noise","external","unclear"],
+ "reason": "<= 1 sentence, quoting the line that decides it"}
+No markdown, no extra text."""
+
 SUMMARY_SYSTEM = """You summarise logs from AWS Lambda / Step Functions integrations for a developer.
 Be brief and concrete: what happened, in order, what failed and why (if visible), and which record IDs
 or functions are involved. Use at most 8 short bullet points. Quote exact error messages when useful.
@@ -76,7 +88,7 @@ anything that isn't in the notes."""
 
 # Health hooks (set by aws_error_feed to aws_health.Health methods); all optional.
 HOOKS = {"event": None, "count": None, "llm_call": None}
-BACKGROUND_KINDS = ("triage",)      # everything else is someone (Claude / the page) waiting for an answer
+BACKGROUND_KINDS = ("triage", "triage_verify", "eval", "sweep", "deploy_alert")      # everything else is someone (Claude / the page) waiting for an answer
 # Cloud model (Ollama Pro, e.g. gpt-oss:120b-cloud, served through the same local Ollama): does all the model
 # work, background triage included. These kinds always stay on the local GPU (config cloud_llm.local_kinds overrides):
 LOCAL_ONLY_KINDS = ("other",)
@@ -311,6 +323,9 @@ def init_db(store):
                 etype TEXT, sig TEXT, profile TEXT, at INTEGER, model TEXT, count INTEGER, data TEXT,
                 PRIMARY KEY(etype, sig, profile));
             CREATE TABLE IF NOT EXISTS ai_cache(k TEXT PRIMARY KEY, at INTEGER, text TEXT);
+            CREATE TABLE IF NOT EXISTS triage_inputs(
+                etype TEXT, sig TEXT, profile TEXT, at INTEGER, input TEXT,
+                PRIMARY KEY(etype, sig, profile));
             CREATE TABLE IF NOT EXISTS ai_usage(
                 day TEXT, source TEXT, kind TEXT, calls INTEGER, in_chars INTEGER, out_chars INTEGER,
                 PRIMARY KEY(day, source, kind));
@@ -321,11 +336,17 @@ def init_db(store):
 def get_triage(store, profile=None):
     with store.lock:
         rows = store.db.execute("SELECT etype, sig, profile, at, model, count, data FROM ai_triage").fetchall()
+        try:                                  # your labels from the dashboard / triage_feedback (aws_quality)
+            labels = {(e, s, p): l for e, s, p, l in
+                      store.db.execute("SELECT etype, sig, profile, label FROM triage_labels").fetchall()}
+        except Exception:
+            labels = {}
     out = {}
     for et, sg, pf, at, model, cnt, data in rows:
         if profile and pf != profile:
             continue
-        out[(et, sg, pf)] = {**json.loads(data), "at": at, "model": model, "count_at_triage": cnt}
+        out[(et, sg, pf)] = {**json.loads(data), "at": at, "model": model, "count_at_triage": cnt,
+                             "etype": et, "sig": sg, "profile": pf, "label": labels.get((et, sg, pf))}
     return out
 
 
@@ -371,6 +392,41 @@ def attach_triage(store, rows, profile=None):
 
 
 # ============================================================================ background triage
+def judge(llm, user, evidence_text, verify=True, ask=None):
+    """One triage verdict for a pattern: first call, evidence check, then (for "actionable") a second call
+    that must agree, else the verdict is downgraded. ask(system, user, kind, max_tokens) -> dict lets the
+    eval run the same steps on a chosen model. Returns the cleaned verdict dict (+ "_model")."""
+    ask = ask or (lambda system, u, kind, mt: llm.chat(system, u, as_json=True, timeout=600, max_tokens=mt, kind=kind))
+    raw = ask(TRIAGE_SYSTEM, user, "triage", 500)
+    used_model = raw.pop("_model", None) or llm.model
+    res = {"verdict": raw.get("verdict") if raw.get("verdict") in VERDICTS else "unclear",
+           "category": raw.get("category") if raw.get("category") in CATEGORIES else "unknown",
+           "summary": str(raw.get("summary", ""))[:400], "likely_cause": str(raw.get("likely_cause", ""))[:300],
+           "next_step": str(raw.get("next_step", ""))[:300],
+           "confidence": max(0.0, min(1.0, float(raw.get("confidence") or 0))),
+           "evidence": str(raw.get("evidence", ""))[:300]}
+    res = check_evidence(res, evidence_text)
+    if verify and res["verdict"] in VERIFY_VERDICTS:
+        try:
+            v = ask(VERIFY_SYSTEM, user + "\n\nProposed triage:\n" + json.dumps(
+                {k: res[k] for k in ("verdict", "category", "summary", "likely_cause", "evidence")}), "triage_verify", 300)
+            res["verifier_model"] = v.pop("_model", None)
+            if v.get("agree") is True or str(v.get("agree")).lower() == "true":
+                res["verified"] = "confirmed"
+                _hook("count", "triage:verify:confirmed")
+            else:
+                res["verified"] = "disputed"
+                res["first_verdict"] = res["verdict"]
+                res["verdict"] = v.get("verdict") if v.get("verdict") in ("noise", "external") else "unclear"
+                res["note"] = ("verifier disagreed: " + str(v.get("reason") or "")[:240]).strip()
+                _hook("count", "triage:verify:disputed")
+        except Exception as ex:
+            res["verified"] = "skipped"
+            _hook("event", "warning", "triage", "verify", f"{type(ex).__name__}: {ex}"[:250])
+    res["_model"] = used_model
+    return res
+
+
 class Triage(threading.Thread):
     """Every few minutes: triage the patterns that matter most and don't have a fresh triage."""
 
@@ -424,15 +480,9 @@ class Triage(threading.Thread):
                 + f"\nLog groups: {', '.join(list(g['log_groups'])[:5])}\n"
                 + (f"Team note: {g['note']}\n" if g.get("note") else "")
                 + f"\nSample lines:\n{samples}\n\nWhat the same log stream printed around the latest one:\n{ctx_txt}")
-        res = self.llm.chat(TRIAGE_SYSTEM, user, as_json=True, timeout=600, max_tokens=500, kind="triage")
+        res = judge(self.llm, user, samples + "\n" + ctx_txt,
+                    verify=self.cfg.get("local_llm", {}).get("triage_verify", True))
         used_model = res.pop("_model", None) or self.llm.model     # cloud or local, whichever answered
-        res = {"verdict": res.get("verdict") if res.get("verdict") in VERDICTS else "unclear",
-               "category": res.get("category") if res.get("category") in CATEGORIES else "unknown",
-               "summary": str(res.get("summary", ""))[:400], "likely_cause": str(res.get("likely_cause", ""))[:300],
-               "next_step": str(res.get("next_step", ""))[:300],
-               "confidence": max(0.0, min(1.0, float(res.get("confidence") or 0))),
-               "evidence": str(res.get("evidence", ""))[:300]}
-        res = check_evidence(res, samples + "\n" + ctx_txt)
         _hook("count", "triage:verdict:" + res["verdict"])
         note = res.get("note") or ""
         if note.startswith("downgraded"):
@@ -440,6 +490,8 @@ class Triage(threading.Thread):
         elif note.startswith("quoted evidence"):
             _hook("count", "triage:evidence_dropped")
         with self.store.lock:
+            self.store.db.execute("INSERT OR REPLACE INTO triage_inputs VALUES (?,?,?,?,?)",
+                                  (g["etype"], g["sig"], prof, int(time.time() * 1000), user[:60000]))
             self.store.db.execute("INSERT OR REPLACE INTO ai_triage VALUES (?,?,?,?,?,?,?)",
                                   (g["etype"], g["sig"], prof, int(time.time() * 1000), used_model, g["count"],
                                    json.dumps(res)))
