@@ -45,6 +45,11 @@
   (nightly 02:xx for fixed / confirmed patterns; `sweep_results`). Bad deploys (worse / new errors) become a
   high-priority task with rollback steps.
 
+## Backup when the Claude limit is used up
+- `claude_on_ollama.py` (dashboard root, double-click; settings at the top) or `backup_ai/Claude on Ollama.cmd`: the same Claude Code, pointed at Ollama (`glm-5.3:cloud`, background
+  `gpt-oss:120b-cloud`) with the aws-error-feed tools. Settings at the top of `backup_ai/claude_ollama.ps1`.
+  If you are running on it: keep changes small, use review_change before committing, verify every diff.
+
 ## Rules
 - Keep `old_app` and `new_app` in sync for shared fixes; they differ only in port (8765/8766), the local
   model default (off/on), `mcp_server.py` default URL and `install_autostart.ps1`.

@@ -21,7 +21,7 @@ import urllib.request
 COMMIT = True                           # commit COMMIT_PATHS locally (if changed)
 PUSH = False                            # True = also git pull --rebase + git push to GitHub
 COMMIT_MESSAGE = ""                     # "" = automatic ("Update: <changed files>"); or write your own
-COMMIT_PATHS = [".gitignore", "CLAUDE.md", "new_app", "old_app", "logging_kit"]   # never config.json / *.db (git-ignored)
+COMMIT_PATHS = [".gitignore", "CLAUDE.md", "new_app", "old_app", "logging_kit", "backup_ai", "claude_on_ollama.py"]   # never config.json / *.db (git-ignored)
 COMMIT_TRAILER = ("Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>\n"
                   "Claude-Session: https://claude.ai/code/session_011KCTv4MMSvGb1qCJvzuc34")
 CHECK_FILES = ["aws_error_feed.py", "aws_tasks.py", "aws_local.py", "aws_ops.py", "aws_health.py",
