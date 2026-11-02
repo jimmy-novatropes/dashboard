@@ -1,6 +1,7 @@
 # local data - never commit (logs can contain customer records)
 errors.db*
 tasks.db*
+personal.db*
 *.jsonl.imported
 *.log
 config.json

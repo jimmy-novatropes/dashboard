@@ -69,6 +69,7 @@ import aws_intake  # noqa: E402  (daily: yesterday's Gmail + Fireflies -> propos
 import aws_brief  # noqa: E402  (daily morning brief written by the tower's model)
 import aws_updates  # noqa: E402  (weekly client update email drafts -> proposed tasks)
 import aws_quality  # noqa: E402  (triage outcomes + eval, diff review, bug-class sweep, bad-deploy alerts)
+import aws_personal  # noqa: E402  (personal tasks + background Ollama research, personal.db)
 import aws_research  # noqa: E402  (web research: Ollama web search + fetch, cloud model writes a cited report)
 DAY_MS = 86_400_000
 LEVELS = ("error", "suspect", "warning", "info", "platform")
@@ -2219,6 +2220,8 @@ PREFS = None
 PICKER = None
 CODE = None
 TASKS = None
+PERSONAL = None       # personal tasks (personal.db)
+PRESEARCH = None      # their background researcher
 INTAKE = None
 BRIEF = None
 UPDATES = None
@@ -2479,10 +2482,52 @@ def make_handler(store, workers, cfg):
                 return self.json({"error": str(ex)})
             return self.send(404, "not found", "text/plain")
 
+        def personal_get(self, path, q):
+            if not PERSONAL:
+                return self.json({"error": "personal.db is not open"})
+            try:
+                if path == "/api/personal":
+                    return self.json({"items": PERSONAL.list(q.get("status", ""), q.get("q", ""),
+                                                             float(q.get("done_days") or 7), int(q.get("limit") or 500)),
+                                      "counts": PERSONAL.counts(),
+                                      "researcher": PRESEARCH.status() if PRESEARCH else {}})
+                if path == "/api/personal/counts":
+                    return self.json(PERSONAL.counts())
+                if path == "/api/personal/get":
+                    return self.json(PERSONAL.get(q.get("id") or 0) or {"error": "not found"})
+                if path == "/api/personal/delete":
+                    return self.json({"deleted": PERSONAL.delete(q.get("id") or 0)})
+                if path == "/api/personal/research":       # research this task again now
+                    r = PERSONAL.update(q.get("id") or 0, {"research": True})
+                    if PRESEARCH:
+                        PRESEARCH.wake.set()
+                    return self.json(r)
+            except (ValueError, TypeError) as ex:
+                return self.json({"error": str(ex)})
+            return self.send(404, "not found", "text/plain")
+
+        def personal_post(self, path, body):
+            if not PERSONAL:
+                return self.json({"error": "personal.db is not open"})
+            try:
+                if path == "/api/personal/add":
+                    items = body.get("items") if isinstance(body.get("items"), list) else [body]
+                    r = PERSONAL.add(items)
+                elif path == "/api/personal/update":
+                    r = PERSONAL.update(body.get("id"), {k: v for k, v in body.items() if k != "id"})
+                else:
+                    return self.send(404, "not found", "text/plain")
+                if PRESEARCH:
+                    PRESEARCH.wake.set()
+                return self.json(r)
+            except (ValueError, TypeError) as ex:
+                return self.json({"error": str(ex)})
+
         def do_POST(self):
             u = urlparse(self.path)
             if u.path not in ("/api/ai/read", "/api/ai/prompt", "/api/ai/filemap", "/api/ai/filemap_known",
-                              "/api/ai/research", "/api/ai/review", "/api/tasks/add", "/api/tasks/update"):
+                              "/api/ai/research", "/api/ai/review", "/api/tasks/add", "/api/tasks/update",
+                              "/api/personal/add", "/api/personal/update"):
                 return self.send(404, "not found", "text/plain")
             n = int(self.headers.get("Content-Length") or 0)
             if n > 12_000_000:
@@ -2493,6 +2538,8 @@ def make_handler(store, workers, cfg):
                 return self.send(400, "bad json", "text/plain")
             if u.path.startswith("/api/tasks/"):
                 return self.tasks_post(u.path, body if isinstance(body, dict) else {"items": body})
+            if u.path.startswith("/api/personal/"):
+                return self.personal_post(u.path, body if isinstance(body, dict) else {"items": body})
             if u.path == "/api/ai/filemap_known":
                 return self.json(AIJOBS.filemap_known(body.get("files") or []))
             if not LLM.ready:
@@ -2561,6 +2608,8 @@ def make_handler(store, workers, cfg):
                 return self.send(200, PAGE, "text/html; charset=utf-8")
             if u.path == "/api/tasks" or u.path.startswith("/api/tasks/"):
                 return self.tasks_get(u.path, q)
+            if u.path == "/api/personal" or u.path.startswith("/api/personal/"):
+                return self.personal_get(u.path, q)
             if u.path == "/api/events":
                 evs, total = store.list_events(q, int(q.get("limit") or 500))
                 return self.json({"events": evs, "total": total})
@@ -2791,6 +2840,7 @@ tr.click:hover{background:var(--bg);cursor:pointer}
   <div class="tabs">
    <button data-v="clients" class="on">Clients</button>
    <button data-v="tasks">Tasks<span class="n" id="n-tasks"></span></button>
+   <button data-v="personal">Personal<span class="n" id="n-personal"></span></button>
    <button data-v="errors">Errors<span class="n" id="n-error"></span></button>
    <button data-v="suspect">Hidden errors?<span class="n" id="n-suspect"></span></button>
    <button data-v="all">All logs<span class="n" id="n-all"></span></button>
@@ -2864,6 +2914,28 @@ tr.click:hover{background:var(--bg);cursor:pointer}
    <button type="submit">Save</button> <button type="button" id="tCancel">Cancel</button> <span id="tFormErr" class="up small"></span>
   </form><datalist id="tClients"></datalist>
   <div id="tBody"></div></div>
+ <div id="v-personal" class="view">
+  <p class="help">Your <b>personal</b> to-dos, kept apart from work tasks in <b>personal.db</b> on the tower (never synced). Add one here or tell Claude <i>"add X to my personal tasks"</i>. The tower's Ollama model researches each task in the background (web search + pages) and writes <b>What to do next</b>; open tasks are re-checked weekly. Click a row for findings and sources.</p>
+  <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px;align-items:center">
+   <select id="pStatus"><option value="">Not done + done in the last 7 days</option><option value="open,in_progress,waiting">Not done</option><option value="open">Open</option><option value="in_progress">In progress</option><option value="waiting">Waiting</option><option value="done">Done</option><option value="all">All</option></select>
+   <input id="pQ" placeholder="search…" style="min-width:140px">
+   <button id="pAddBtn">+ Add personal task</button>
+   <span id="pState" class="small" style="color:var(--mute)"></span>
+  </div>
+  <form id="pForm" class="ev info" style="display:none;padding:10px 14px;margin-bottom:10px">
+   <b id="pFormH">New personal task</b>
+   <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:8px;margin:8px 0">
+    <input name="title" placeholder="Title (e.g. Renew passport)" required style="grid-column:1/-1">
+    <input name="category" placeholder="Category (home, health, travel…)">
+    <select name="priority"><option value="high">high</option><option value="normal">normal</option><option value="low">low</option></select>
+    <input name="due" type="date">
+    <label class="small"><input type="checkbox" name="research" checked> research it</label>
+    <textarea name="details" rows="2" placeholder="Details: what you need, constraints, budget, location…" style="grid-column:1/-1"></textarea>
+    <textarea name="notes" rows="1" placeholder="Notes" style="grid-column:1/-1"></textarea>
+   </div>
+   <button type="submit">Save</button> <button type="button" id="pCancel">Cancel</button> <span id="pFormErr" class="up small"></span>
+  </form>
+  <div id="pBody"></div></div>
  <div id="v-runs" class="view">
   <p class="help">Each Lambda run as one row: when it ran, how long, records processed, errors and outcome. Click a run to see everything it logged. Above: functions that ran but processed nothing / far less than usual, or went quiet.</p>
   <div id="nothingBox"></div>
@@ -3054,7 +3126,7 @@ async function counts(){
 async function refresh(newIds,force){
   if(busy)return; busy=true;
   try{
-    const HEAVY={tasks:loadTasks,clients:loadClients,runs:loadRuns,trace:pollTrace,volume:loadVolume,deploys:loadDeploys,partners:loadPartners,schedules:loadSchedules,inventory:loadInventory,apis:loadApis,digest:loadDigest,health:loadHealth};
+    const HEAVY={tasks:loadTasks,personal:loadPersonal,clients:loadClients,runs:loadRuns,trace:pollTrace,volume:loadVolume,deploys:loadDeploys,partners:loadPartners,schedules:loadSchedules,inventory:loadInventory,apis:loadApis,digest:loadDigest,health:loadHealth};
     if(tab==='patterns'||HEAVY[tab]){
       if(force||Date.now()-lastHeavy>30000){ lastHeavy=Date.now();
         tab==='patterns'?(sumRows=await getJ('/api/summary?'+params(false)),renderSummary()):await HEAVY[tab](); }
@@ -3334,6 +3406,56 @@ $('tForm').onsubmit=async e=>{e.preventDefault(); const f=e.target, b={};
   const r=taskEdit?await postJ('/api/tasks/update',{id:taskEdit.id,...b}):await postJ('/api/tasks/add',{items:[{...b,source:'manual'}]});
   if(r.error||(r.errors||[]).length){$('tFormErr').textContent=r.error||r.errors.join('; ');return}
   f.style.display='none'; taskEdit=null; loadTasks()};
+// ---------------------------------------------------------------- personal tasks (personal.db + Ollama researcher)
+let pRows=[], pOpen=new Set(), pEdit=null, pqTimer=null, pPoll=null;
+const RST={queued:'⏳ queued',running:'🔎 researching…',done:'✓ researched',error:'⚠ failed',off:'— off'};
+const pSteps=t=>t.next_steps?`<div style="white-space:pre-wrap;font-size:12.5px;line-height:1.45;max-width:560px">${esc(t.next_steps)}</div>`:`<span class="small" style="color:var(--mute)">${t.research_status==='off'?'research off':t.research_status==='error'?'research failed':'researching soon…'}</span>`;
+const pDetail=t=>`<div style="padding:6px 4px;font-size:13px;line-height:1.5">${t.details?`<div style="white-space:pre-wrap"><b>Details:</b> ${esc(t.details)}</div>`:''}${t.notes?`<div style="white-space:pre-wrap"><b>Notes:</b> ${esc(t.notes)}</div>`:''}${t.findings?`<div style="white-space:pre-wrap;margin-top:6px"><b>Findings:</b>\n${esc(t.findings)}</div>`:''}${(t.sources||[]).length?`<div style="margin-top:6px"><b>Sources:</b><ol style="margin:2px 0 0 18px;padding:0">${t.sources.map(x=>`<li><a href="${esc(x.url)}" target="_blank" rel="noopener">${esc(x.title)}</a></li>`).join('')}</ol></div>`:''}${(t.queries||[]).length?`<div class="small" style="color:var(--mute)">searched: ${esc(t.queries.join(' · '))}</div>`:''}${t.research_error?`<div class="small" style="color:var(--err)">${esc(t.research_error)}</div>`:''}<div class="small" style="color:var(--mute)">#${t.id} · added ${ago(t.created)}${t.researched_at?' · researched '+ago(t.researched_at)+(t.research_model?' by '+esc(t.research_model):''):''}${t.done_at?' · done '+ago(t.done_at):''}</div></div>`;
+async function loadPersonal(){
+  const p=new URLSearchParams({status:$('pStatus').value,q:$('pQ').value.trim()});
+  const r=await getJ('/api/personal?'+p);
+  if(r.error){$('pBody').innerHTML=`<div class="empty">${esc(r.error)}</div>`;return}
+  pRows=r.items; const c=r.counts||{}, rs=r.researcher||{}, td=todayStr();
+  $('n-personal').textContent=c.open||'';
+  $('pState').innerHTML=(rs.has_key===false?'<span style="color:var(--sus)">no Ollama API key (config.json research.api_key) - next steps from the model only</span> · ':'')+(rs.busy?`researching #${rs.current}: ${esc(rs.stage||'')}`:c.researching?`${c.researching} waiting for research`:'researcher idle')+(rs.last_error?` · <span title="${esc(rs.last_error)}" style="color:var(--err)">last error</span>`:'');
+  $('count').textContent=`${c.open||0} not done${c.overdue?` · ${c.overdue} overdue`:''}`;
+  $('pBody').innerHTML=pRows.length?`<div style="overflow-x:auto"><table><thead><tr><th>Task</th><th>What to do next</th><th>Due</th><th>Priority</th><th>Status</th><th>Research</th><th></th></tr></thead><tbody>${pRows.map(t=>{
+    const over=t.status!=='done'&&t.due&&t.due<td;
+    return `<tr class="click" data-id="${t.id}" style="vertical-align:top;${t.status==='done'?'opacity:.55':''}"><td>${t.priority==='high'?'<span style="color:var(--err)">● </span>':''}<b>${esc(t.title)}</b>${t.category?`<div class="small" style="color:var(--mute)">${esc(t.category)}</div>`:''}</td>
+    <td>${pSteps(t)}</td><td style="white-space:nowrap${over?';color:var(--err)':''}">${esc(t.due||'—')}${over?' overdue':''}</td>
+    <td>${tSel('priority',t.priority,['high','normal','low'])}</td><td>${tSel('status',t.status,['open','in_progress','waiting','done'],TST)}</td>
+    <td class="small" style="white-space:nowrap">${RST[t.research_status]||esc(t.research_status||'')}${t.researched_at?'<br>'+ago(t.researched_at):''}</td>
+    <td style="white-space:nowrap"><button class="act" data-a="again" title="Research this again now">research again</button><button class="act" data-a="edit">edit</button><button class="act" data-a="del">delete</button></td></tr>
+    <tr class="run-lines${pOpen.has(t.id)?' on':''}" data-for="${t.id}"><td colspan="7">${pDetail(t)}</td></tr>`}).join('')}</tbody></table></div>`
+    :'<div class="empty">No personal tasks yet. Add one with "+ Add personal task", or tell Claude: "add renew my passport to my personal tasks".</div>';
+  $('pBody').querySelectorAll('tr.click').forEach(tr=>{const id=+tr.dataset.id;
+    tr.onclick=e=>{if(e.target.closest('select,button,a'))return; pOpen.has(id)?pOpen.delete(id):pOpen.add(id); $('pBody').querySelector(`tr[data-for="${id}"]`).classList.toggle('on')};
+    tr.querySelectorAll('select.tsel').forEach(s=>s.onchange=async()=>{await postJ('/api/personal/update',{id,[s.dataset.k]:s.value}); loadPersonal()});
+    tr.querySelectorAll('.act').forEach(b=>b.onclick=async e=>{e.stopPropagation();
+      if(b.dataset.a==='edit')return personalForm(pRows.find(t=>t.id===id));
+      if(b.dataset.a==='again'){b.textContent='queued ✓';await getJ('/api/personal/research?id='+id);return loadPersonal()}
+      if(b.textContent!=='sure?'){b.textContent='sure?';setTimeout(()=>b.textContent='delete',3000);return}
+      await getJ('/api/personal/delete?id='+id); loadPersonal()})});
+  clearTimeout(pPoll); if(tab==='personal'&&(rs.busy||c.researching))pPoll=setTimeout(loadPersonal,10000);
+}
+function personalForm(t){
+  pEdit=t||null; const f=$('pForm'); f.style.display=''; $('pFormErr').textContent='';
+  const v=t||{priority:'normal'};
+  ['title','category','due','details','notes'].forEach(k=>f.elements[k].value=v[k]||'');
+  f.elements.priority.value=v.priority||'normal'; f.elements.research.checked=!t||t.research_status!=='off';
+  $('pFormH').textContent=t?`Edit personal task #${t.id}`:'New personal task'; f.elements.title.focus();
+}
+$('pStatus').onchange=()=>loadPersonal();
+$('pQ').oninput=()=>{clearTimeout(pqTimer); pqTimer=setTimeout(loadPersonal,300)};
+$('pAddBtn').onclick=()=>personalForm(null);
+$('pCancel').onclick=()=>{$('pForm').style.display='none'; pEdit=null};
+$('pForm').onsubmit=async e=>{e.preventDefault(); const f=e.target, b={};
+  ['title','category','due','details','notes','priority'].forEach(k=>b[k]=f.elements[k].value.trim());
+  const res=f.elements.research.checked;
+  if(pEdit){ if(res!==(pEdit.research_status!=='off'))b.research=res; }else b.research=res;
+  const r=pEdit?await postJ('/api/personal/update',{id:pEdit.id,...b}):await postJ('/api/personal/add',{items:[b]});
+  if(r.error||(r.errors||[]).length){$('pFormErr').textContent=r.error||r.errors.join('; ');return}
+  f.style.display='none'; pEdit=null; loadPersonal()};
 let BRIEF_OPEN=null;
 async function loadBrief(refresh){
   const b=await getJ('/api/ai/brief'+(refresh?'?refresh=1':'')).catch(()=>({}));
@@ -3347,6 +3469,7 @@ async function loadBrief(refresh){
 async function loadClients(){
   const all=await getJ('/api/ops/clients'); loadPrefs(); loadBrief(false);
   const tc=await getJ('/api/tasks/counts').catch(()=>({})); $('n-tasks').textContent=Object.values(tc).reduce((s,x)=>s+x.open,0)||'';
+  getJ('/api/personal/counts').then(pc=>$('n-personal').textContent=pc.open||'').catch(()=>{});
   const tlink=p=>{const x=tc[p];return x?`<a data-tasks="${esc(p)}"${x.overdue?' style="color:var(--err)"':''}>${x.open} task${x.open>1?'s':''}${x.overdue?` (${x.overdue} overdue)`:''}</a>`:''};
   const cards=all.filter(c=>!c.asleep), sleeping=all.filter(c=>c.asleep);
   const red=cards.filter(c=>c.status==='red').length, amb=cards.filter(c=>c.status==='amber').length;
@@ -3458,7 +3581,7 @@ function show(v){
   tab=v; document.querySelectorAll('.tabs button').forEach(b=>b.classList.toggle('on',b.dataset.v===v));
   const feed=['errors','suspect','all'].includes(v);
   $('v-feed').classList.toggle('on',feed); $('v-patterns').classList.toggle('on',v==='patterns'); $('v-volume').classList.toggle('on',v==='volume'); $('v-deploys').classList.toggle('on',v==='deploys'); $('v-partners').classList.toggle('on',v==='partners');
-  ['schedules','inventory','apis','digest','health','clients','tasks','runs','trace'].forEach(x=>$('v-'+x).classList.toggle('on',v===x));
+  ['schedules','inventory','apis','digest','health','clients','tasks','personal','runs','trace'].forEach(x=>$('v-'+x).classList.toggle('on',v===x));
   $('fLevel').style.display=(v==='all'||v==='patterns')?'':'none';
   if(v==='patterns'&&!$('fLevel').dataset.touched)$('fLevel').value='error,suspect';
   if(v==='all'&&!$('fLevel').dataset.touched)$('fLevel').value='error,suspect,warning,info';
@@ -3674,6 +3797,11 @@ def main():
     global TASKS
     TASKS = aws_tasks.open_db(HERE, cfg)
     print(f"Tasks: {TASKS.path}")
+    global PERSONAL, PRESEARCH
+    PERSONAL = aws_personal.open_db(HERE, cfg)
+    PRESEARCH = aws_personal.Researcher(PERSONAL, LLM, lambda: aws_research.api_key(cfg), HEALTH.event)
+    PRESEARCH.start()
+    print(f"Personal tasks: {PERSONAL.path} (researcher on, {LLM.model_for(aws_personal.MODEL_KIND)})")
     global INTAKE
     INTAKE = aws_intake.Intake(LLM, TASKS, cfg, HERE, lambda: sorted({w.profile for w in workers}))
     INTAKE.start()

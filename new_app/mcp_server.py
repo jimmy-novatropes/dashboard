@@ -99,6 +99,8 @@ team") must be respected. Only mute or mark fixed when the user asks.
 After a deploy: did_my_fix_work(function, profile) (minutes after a deploy = too early, offer to check later).
 Tasks live in the dashboard (tasks.db): tasks_list, then more_tools tasks_add / tasks_update; store only request, reason, links.
 "proposed" tasks come from the daily mail/meeting intake and wait for the user's accept.
+PERSONAL tasks (separate list, personal.db): "add X to my personal tasks" -> personal_add. Don't research them
+yourself - the tower's Ollama model does it in the background and fills "next steps"; personal_list shows them.
 Everything else (schedules, inventory, deploys, partner APIs, runs, trace_record, notes, mutes, reports,
 history, outline / get_symbol / repo_map / local_git, system_health, usage_savings) -> more_tools().
 Always include the dashboard link from the tool output. Only the last 24 hours are loaded by default;
@@ -448,7 +450,7 @@ def digested(what):
 TOOLS_MODE = os.environ.get("AWS_ERROR_FEED_TOOLS", "core").strip().lower()
 CORE = {"morning_brief", "ask_tower", "research", "code_change", "clients_status", "investigate", "fix_brief",
         "list_error_patterns", "get_log_lines", "get_line_context", "find_code", "local_read", "local_run",
-        "tasks_list", "review_change"}       # the rest (tasks_add, tasks_update, outline, ...): more_tools()
+        "tasks_list", "review_change", "personal_add", "personal_list"}       # the rest (tasks_add, tasks_update, outline, ...): more_tools()
 CORE |= {x.strip() for x in os.environ.get("AWS_ERROR_FEED_EXTRA_TOOLS", "").split(",") if x.strip()}
 REGISTRY, EXPOSED = {}, set()
 
@@ -456,6 +458,7 @@ REGISTRY, EXPOSED = {}, set()
 # Tools that change something (files, tasks, notes, mutes, settings) or run commands. Every other tool only
 # reads, and is marked read-only so Claude can group them and you can set "Always allow" once for all of them.
 WRITE_TOOLS = {"code_change", "local_draft_change", "local_run", "more_tools", "tasks_add", "tasks_update",
+               "personal_add", "personal_update",
                "add_note", "mute_pattern", "unmute_pattern", "switch_model", "project_priority",
                "rescan_infrastructure", "load_history", "triage_feedback", "triage_eval", "sweep_bug_class"}
 
@@ -2853,6 +2856,90 @@ def tasks_update(id: int, status: str = "", priority: str = "", due: str = "", t
     if r.get("error"):
         return r["error"]
     return "\n".join(_task_line(r, time.strftime("%Y-%m-%d")))
+
+
+# ============================================================================ personal tasks (personal.db on the tower)
+PERSONAL_STEP_CHARS = 160        # personal_list brief: characters of "next steps" shown per task
+
+
+def _personal_line(it, today, steps=PERSONAL_STEP_CHARS):
+    over = it["status"] != "done" and it.get("due") and it["due"] < today
+    head = (f"#{it['id']} [{it['status']}{'|' + it['priority'] if it['priority'] != 'normal' else ''}"
+            f"{'|due ' + it['due'] if it.get('due') else ''}{' OVERDUE' if over else ''}] {it['title']}"
+            f" (research: {it.get('research_status')})")
+    ns = (it.get("next_steps") or "").replace("\n", " ")
+    return head + (f"\n   next: {ns[:steps]}{'…' if len(ns) > steps else ''}" if ns and steps and it["status"] != "done" else "")
+
+
+@tool()
+@guard
+def personal_add(title: str, details: str = "", due: str = "", priority: str = "", category: str = "",
+                 research: bool = True) -> str:
+    """Add a task to the user's PERSONAL task list (separate from work tasks; personal.db on the tower).
+    title: short, imperative. details: what they need / constraints / budget / location. due: YYYY-MM-DD.
+    priority: high|normal|low. The tower's Ollama model researches it in the background (web search) and
+    writes "next steps" - do NOT research it yourself. research=False for plain reminders."""
+    it = {k: v for k, v in dict(title=title, details=details, due=due, priority=priority, category=category).items() if v}
+    it["research"] = bool(research)
+    r = api_post("/api/personal/add", {"items": [it]})
+    if r.get("error"):
+        return r["error"]
+    if r["errors"]:
+        return "Error: " + "; ".join(r["errors"])
+    if r["added"]:
+        return (f"Added personal task #{r['added'][0]}" + (" - the tower is researching it; next steps will appear in "
+                f"the Personal tab" if research else "") + f". {link(tab='personal')}")
+    return f"Already on the list as #{r['updated'][0]} (details updated, research queued). {link(tab='personal')}"
+
+
+@tool()
+@guard
+def personal_list(status: str = "", search: str = "", id: int = 0) -> str:
+    """The user's PERSONAL task list with the tower's researched "next steps". Default: not done + done in
+    the last 7 days, one line each + the start of the next steps. status: open|in_progress|waiting|done|all.
+    id=N: that task in full (next steps, findings, sources)."""
+    today = time.strftime("%Y-%m-%d")
+    if id:
+        it = api("/api/personal/get", id=id)
+        if it.get("error"):
+            return f"No personal task #{id}."
+        out = [_personal_line(it, today, 0)]
+        for k, lab in (("details", "Details"), ("notes", "Notes"), ("next_steps", "Next steps"), ("findings", "Findings")):
+            if it.get(k):
+                out.append(f"{lab}:\n{it[k]}")
+        if it.get("sources"):
+            out.append("Sources:\n" + "\n".join(f"[{i}] {x['title']} - {x['url']}" for i, x in enumerate(it["sources"], 1)))
+        if it.get("research_error"):
+            out.append("Research error: " + it["research_error"])
+        return "\n".join(out)
+    r = api("/api/personal", status=status, q=search)
+    if r.get("error"):
+        return r["error"]
+    items, c = r["items"], r.get("counts") or {}
+    out = [f"{c.get('open', 0)} personal tasks not done ({c.get('researching', 0)} being researched) - {link(tab='personal')}"]
+    out += [_personal_line(i, today) for i in items] or ["No personal tasks match."]
+    out.append("Full next steps / findings / sources: personal_list(id=N). Changes: more_tools personal_update.")
+    return "\n".join(out)
+
+
+@tool()
+@guard
+def personal_update(id: int, status: str = "", priority: str = "", due: str = "", title: str = "",
+                    details: str = "", notes: str = "", category: str = "", research_again: bool = False) -> str:
+    """Change one personal task: status (open|in_progress|waiting|done), priority, due (YYYY-MM-DD or "none"),
+    title, details, notes, category. Changing title/details or research_again=True re-runs the tower's research."""
+    f = {k: v for k, v in dict(status=status, priority=priority, due=due, title=title, details=details,
+                              notes=notes, category=category).items() if v}
+    if f.get("due", "").lower() == "none":
+        f["due"] = ""
+    if research_again:
+        f["research"] = True
+    if not f:
+        return "Nothing to change - pass at least one field."
+    r = api_post("/api/personal/update", {"id": id, **f})
+    if r.get("error"):
+        return r["error"]
+    return _personal_line(r, time.strftime("%Y-%m-%d"))
 
 
 @tool()

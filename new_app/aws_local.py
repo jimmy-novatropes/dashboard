@@ -88,7 +88,7 @@ anything that isn't in the notes."""
 
 # Health hooks (set by aws_error_feed to aws_health.Health methods); all optional.
 HOOKS = {"event": None, "count": None, "llm_call": None}
-BACKGROUND_KINDS = ("triage", "triage_verify", "eval", "sweep", "deploy_alert")      # everything else is someone (Claude / the page) waiting for an answer
+BACKGROUND_KINDS = ("triage", "triage_verify", "eval", "sweep", "deploy_alert", "personal")      # everything else is someone (Claude / the page) waiting for an answer
 # Cloud model (Ollama Pro, e.g. gpt-oss:120b-cloud, served through the same local Ollama): does all the model
 # work, background triage included. These kinds always stay on the local GPU (config cloud_llm.local_kinds overrides):
 LOCAL_ONLY_KINDS = ("other",)
