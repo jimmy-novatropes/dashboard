@@ -88,6 +88,20 @@ daily cap; `LOCAL_ONLY_KINDS` in `aws_local.py`, `cloud_llm.local_kinds` in conf
 Long results of get_log_lines / list_error_patterns / investigate / clients_status come back as a cloud-model
 summary; add `raw=True` only to check exact lines before editing. `tasks_list` is one line per task (`detail="full"` for more).
 
+<!-- graphify-usage:start -->
+## Graphify MCP (all client repos)
+- MCP server `graphify` = one merged graph of every client repo (`Openflow Repos\_graphify\merged-graph.json`,
+  refreshed nightly 03:15 by `setup_graphify.py`). Use it for structure: who calls what, impact of a change,
+  the same pattern across clients. Text search -> `find_code`; errors -> `ask_tower` / `fix_brief`.
+- Client known -> always pass `project_path` = that repo folder (e.g. `C:\Users\jagom\Documents\Openflow Repos\stellaromics`).
+  Without it the merged graph mixes clients and returns unrelated files.
+- Keep answers small: `token_budget` 500-1000, `depth` 1-2, `context_filter=["call"]` when tracing calls; raise only if needed.
+- Never `get_node` / `get_neighbors` a generic name (`lambda_handler`, `handler`, `main`, `load_secrets`): it lists
+  hundreds of matches. Use the full node id (`<repo>::<path>_<name>`) or a client-specific function name.
+- `god_nodes` on the merged graph is copied boilerplate (load_secrets, is_running_in_lambda): use it per repo with
+  `exclude_hubs_percentile=99`.
+<!-- graphify-usage:end -->
+
 ## graphify
 
 This project has a knowledge graph at graphify-out/ with god nodes, community structure, and cross-file relationships.
