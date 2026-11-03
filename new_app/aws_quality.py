@@ -41,7 +41,7 @@ SWEEP_MAX_HITS = 30               # code locations checked per sweep
 SWEEP_BATCH = 6                   # snippets per model call
 SWEEP_MAX_FILE_KB = 400
 SWEEP_EXT = (".py", ".js", ".ts", ".mjs", ".cjs", ".java", ".cs", ".rb", ".go", ".php")
-SWEEP_SKIP_DIRS = {".git", "node_modules", "venv", ".venv", "env", "__pycache__", "dist", "build", ".serverless",
+SWEEP_SKIP_DIRS = {"graphify-out", "_graphify", ".git", "node_modules", "venv", ".venv", "env", "__pycache__", "dist", "build", ".serverless",
                    ".idea", ".vscode", "site-packages", "coverage", ".pytest_cache", "vendor", "dashboard"}
 ALERT_EVERY_S = 600               # bad-deploy check interval
 ALERT_WINDOW_H = 6                # before/after window per deploy

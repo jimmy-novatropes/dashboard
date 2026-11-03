@@ -546,7 +546,7 @@ def trace_timeline(job):
 # =========================================================================== code links
 PY_FRAME = re.compile(r'File "([^"]+)", line (\d+)(?:, in ([\w<>.]+))?')
 JS_FRAME = re.compile(r"at (?:([\w.<>$]+) )?\(?((?:/var/task|/opt)/[^:()\s]+):(\d+):\d+\)?")
-SKIP_DIRS = {".git", "node_modules", "venv", ".venv", "__pycache__", ".idea", ".vscode", "dist", "build",
+SKIP_DIRS = {"graphify-out", "_graphify", ".git", "node_modules", "venv", ".venv", "__pycache__", ".idea", ".vscode", "dist", "build",
              "site-packages", ".aws-sam", ".serverless", "cdk.out", ".terraform", "env"}
 
 

@@ -343,7 +343,8 @@ class Researcher:
         src = "\n\n".join(f"[{i}] {p['title']} - {p['url']}\n{p['text']}" for i, p in enumerate(pages, 1))
         ans = self.llm.chat(NEXT_SYSTEM, f"Today: {today}\n{task}\n\nSources:\n{src or '(none - use common sense)'}",
                             max_tokens=REPORT_TOKENS, kind=MODEL_KIND).strip()
-        m = re.search(r"NEXT STEPS:\s*(.*?)(?:\n\s*FINDINGS:\s*(.*))?$", ans, re.S | re.I)
+        hdr = lambda w: r"[#*\s]*" + w + r"[\s:*]*\n?"          # "NEXT STEPS:", "**NEXT STEPS**", "## Findings" ...
+        m = re.search(hdr("NEXT STEPS") + r"(.*?)(?:\n" + hdr("FINDINGS") + r"(.*))?$", ans, re.S | re.I)
         next_steps = (m.group(1).strip() if m else ans)[:3000]
         findings = ((m.group(2) or "").strip() if m else "")[:6000]
         return next_steps, findings, [{"title": p["title"][:200], "url": p["url"]} for p in pages], queries

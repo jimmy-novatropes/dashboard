@@ -1815,7 +1815,7 @@ def did_my_fix_work(function: str, profile: str = "", window_hours: float = 24,
 import fnmatch
 import re as _re
 
-SKIP_DIRS = {".git", "node_modules", "venv", ".venv", "env", "__pycache__", ".idea", ".vscode", "dist", "build",
+SKIP_DIRS = {"graphify-out", "_graphify", ".git", "node_modules", "venv", ".venv", "env", "__pycache__", ".idea", ".vscode", "dist", "build",
              ".serverless", "site-packages", ".pytest_cache", ".mypy_cache", "archive", "coverage", ".next"}
 # never sent anywhere: secrets, keys, credentials, local databases
 DENY = _re.compile(r"(^\.env|secret|credential|password|\.pem$|\.key$|\.pfx$|\.p12$|id_rsa|\.db$|\.sqlite|"
