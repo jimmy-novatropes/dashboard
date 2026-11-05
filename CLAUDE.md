@@ -91,7 +91,7 @@ summary; add `raw=True` only to check exact lines before editing. `tasks_list` i
 <!-- graphify-usage:start -->
 ## Graphify MCP (all client repos)
 - MCP server `graphify` = one merged graph of every client repo (`Openflow Repos\_graphify\merged-graph.json`,
-  refreshed nightly 03:15 by `setup_graphify.py`). Use it for structure: who calls what, impact of a change,
+  refreshed every 4 hours by `setup_graphify.py`). Use it for structure: who calls what, impact of a change,
   the same pattern across clients. Text search -> `find_code`; errors -> `ask_tower` / `fix_brief`.
 - Client known -> always pass `project_path` = that repo folder (e.g. `C:\Users\jagom\Documents\Openflow Repos\stellaromics`).
   Without it the merged graph mixes clients and returns unrelated files.

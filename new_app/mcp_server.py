@@ -69,6 +69,11 @@ RESEARCH_WAIT = 240              # research: seconds to wait for the tower's rep
 CODE_CHANGE_CHARS = 120_000      # code_change: file text the tower's model reads per change
 CODE_CHANGE_WAIT = 180           # code_change: seconds to wait for the draft
 REVIEW_WAIT = 120                # code_change / review_change: seconds to wait for the cloud review of the diff
+FALLBACK_MAX_CHARS = 12_000      # no digest available -> cut long results to this (~3k tokens), raw=True for all
+LOCAL_OLLAMA_URL = os.environ.get("AWS_ERROR_FEED_OLLAMA", "http://127.0.0.1:11434")  # used if the tower's model fails
+LOCAL_OLLAMA_MODELS = ["qwen2.5-coder", "qwen3", "llama3"]   # first installed one wins
+LOCAL_OLLAMA_WAIT = 90           # seconds
+LOCAL_OLLAMA_READ = 48_000       # chars of tool output the local model reads
 PATTERNS_BRIEF_LIMIT = 12        # list_error_patterns brief: one line per pattern, at most this many
 
 INSTRUCTIONS = """\
@@ -424,6 +429,35 @@ def _digest(text, what):
         return None
 
 
+def _ollama_digest(text, what):
+    """Fallback when the tower's model can't digest: call local Ollama directly. None if unavailable."""
+    try:
+        with urllib.request.urlopen(f"{LOCAL_OLLAMA_URL}/api/tags", timeout=3) as r:
+            names = [m["name"] for m in json.load(r).get("models", [])]
+        model = next((n for pref in LOCAL_OLLAMA_MODELS for n in names if n.startswith(pref)), names[0] if names else None)
+        if not model:
+            return None
+        prompt = (f"Condense this output of the tool '{what}' for a developer. Keep every event_id, file:line, "
+                  f"function name, count and exact error message. Short bullets.\n\n{text[:LOCAL_OLLAMA_READ]}")
+        req = urllib.request.Request(f"{LOCAL_OLLAMA_URL}/api/generate",
+                                     data=json.dumps({"model": model, "prompt": prompt, "stream": False}).encode(),
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=LOCAL_OLLAMA_WAIT) as r:
+            return (json.load(r).get("response") or "").strip() or None
+    except Exception:
+        return None
+
+
+def _shrink(out, what):
+    """Long output with no tower digest: local Ollama digest, else a hard cut. Keeps the first line."""
+    first = out.split("\n", 1)[0]
+    d = _ollama_digest(out, what)
+    if d:
+        return finish([first, f"Local-model digest of ~{len(out) // 4:,} tokens of {what} output "
+                              f"(verify key facts; everything: same call with raw=True):", d])
+    return cap(out, FALLBACK_MAX_CHARS) + "\n(Cut: no model available to summarize. raw=True returns everything.)"
+
+
 def digested(what):
     """Results longer than DIGEST_MIN_CHARS are condensed by the tower's cloud model before they reach
     Claude. raw=True (or the model being unavailable) returns the full output."""
@@ -437,7 +471,7 @@ def digested(what):
                 return out
             d = _digest(out, what)
             if not d:
-                return out
+                return _shrink(out, what)
             first = out.split("\n", 1)[0]
             return finish([first, f"Cloud-model digest of ~{len(out) // 4:,} tokens of {what} output "
                                   f"(verify key facts; everything: same call with raw=True):", d])
@@ -704,7 +738,7 @@ def get_log_lines(hours: float = 24, profile: str = "", level: str = "", log_gro
         s = _summarize_lines(hours, profile, level, log_group, log_group_prefix, search, error_type, signature, limit)
         if s:
             return finish(head + s)
-        out.append("(The tower's model couldn't summarize these right now, so here are the lines.)")
+        return _shrink(finish(out), "get_log_lines")
     return finish(out)
 
 
@@ -2312,8 +2346,9 @@ def _tower_job(template, text, question="", seconds=50):
 
 @tool()
 @guard
+@digested("fix_brief")
 def fix_brief(profile: str, function: str = "", error_type: str = "", signature: str = "", hours: float = 24,
-              job_id: str = "") -> str:
+              job_id: str = "", raw: bool = False) -> str:
     """Everything to fix ONE error in one call: pattern, triage, latest example, preceding logs, the
     failing code (or the print that wrote it), recent runs + a local diagnosis (verify it). Poll
     with job_id."""
