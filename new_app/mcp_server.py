@@ -45,7 +45,9 @@ URLS = [u.strip().rstrip("/") for u in os.environ.get("AWS_ERROR_FEED_URL", "htt
         if u.strip()] or ["http://127.0.0.1:8766"]
 BASE = URLS[0]
 AUTOSTART = os.environ.get("AWS_ERROR_FEED_AUTOSTART", "1") != "0"
-REPOS = os.environ.get("AWS_ERROR_FEED_REPOS") or None
+# Default: the folder that holds the dashboard repo (e.g. ...\Openflow Repos), so local_run / file
+# reads work on every client repo without setting the env var.
+REPOS = os.environ.get("AWS_ERROR_FEED_REPOS") or os.path.dirname(os.path.dirname(HERE))
 # documents the tower's model may read (contracts, PDFs, specs, exports): drop them here, or set the env var
 DOCS = os.environ.get("AWS_ERROR_FEED_DOCS") or os.path.join(os.path.expanduser("~"), "Documents", "Tower Inbox")
 try:
@@ -484,14 +486,14 @@ def digested(what):
 TOOLS_MODE = os.environ.get("AWS_ERROR_FEED_TOOLS", "core").strip().lower()
 CORE = {"morning_brief", "ask_tower", "research", "code_change", "clients_status", "investigate", "fix_brief",
         "list_error_patterns", "get_log_lines", "get_line_context", "find_code", "local_read", "local_run",
-        "tasks_list", "review_change", "personal_add", "personal_list"}       # the rest (tasks_add, tasks_update, outline, ...): more_tools()
+        "tasks_list", "review_change", "personal_add", "personal_list", "new_repo"}       # the rest (tasks_add, tasks_update, outline, ...): more_tools()
 CORE |= {x.strip() for x in os.environ.get("AWS_ERROR_FEED_EXTRA_TOOLS", "").split(",") if x.strip()}
 REGISTRY, EXPOSED = {}, set()
 
 
 # Tools that change something (files, tasks, notes, mutes, settings) or run commands. Every other tool only
 # reads, and is marked read-only so Claude can group them and you can set "Always allow" once for all of them.
-WRITE_TOOLS = {"code_change", "local_draft_change", "local_run", "more_tools", "tasks_add", "tasks_update",
+WRITE_TOOLS = {"new_repo", "code_change", "local_draft_change", "local_run", "more_tools", "tasks_add", "tasks_update",
                "personal_add", "personal_update",
                "add_note", "mute_pattern", "unmute_pattern", "switch_model", "project_priority",
                "rescan_infrastructure", "load_history", "triage_feedback", "triage_eval", "sweep_bug_class"}
@@ -2762,6 +2764,36 @@ def find_print_site(message, folder, limit=3):
         if len(out) >= limit:
             break
     return out
+
+
+# --------------------------------------------------------------------------- new client repo
+NEW_REPO_ROOT = os.environ.get("NEW_REPO_ROOT") or ((REPOS or "").split(";")[0].strip()) \
+    or os.path.join(os.path.expanduser("~"), "Documents", "Openflow Repos")
+NEW_REPO_SCRIPT = os.environ.get("NEW_REPO_SCRIPT") or os.path.join(NEW_REPO_ROOT, "new-repo.ps1")
+NEW_REPO_TIMEOUT_S = 180
+
+
+@tool()
+@guard
+def new_repo(name: str) -> str:
+    """Create a new private client repo on GitHub from the general_assets template and clone it into the
+    Openflow Repos folder on the laptop (runs new-repo.ps1 with the laptop's gh login). name: e.g. acme_corp."""
+    name = (name or "").strip().lower().replace(" ", "_")
+    if not _re.fullmatch(r"[a-z0-9_\-]{2,80}", name):
+        return "Invalid name: use lowercase letters, numbers, _ or -."
+    if not os.path.isfile(NEW_REPO_SCRIPT):
+        return f"Script not found: {NEW_REPO_SCRIPT} (set NEW_REPO_SCRIPT)."
+    argv = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", NEW_REPO_SCRIPT, "-Name", name]
+    try:
+        r = subprocess.run(argv, cwd=NEW_REPO_ROOT, capture_output=True, timeout=NEW_REPO_TIMEOUT_S,
+                           stdin=subprocess.DEVNULL)
+    except FileNotFoundError:
+        return "PowerShell not found on this machine."
+    except subprocess.TimeoutExpired:
+        return f"Timed out after {NEW_REPO_TIMEOUT_S}s - check GitHub and the folder before retrying."
+    text = (r.stdout + b"\n" + r.stderr).decode("utf-8", errors="replace").strip()
+    status = "OK" if r.returncode == 0 else f"FAILED (exit {r.returncode})"
+    return f"new_repo {name}: {status}\n{text[-3000:]}"
 
 
 # --------------------------------------------------------------------------- core tool set + the rest on demand
