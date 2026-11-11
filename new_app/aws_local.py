@@ -150,6 +150,8 @@ class LocalLLM:
         self.meter = None                     # meter(kind, chars_read, chars_written) - savings counter
         cc = cfg.get("cloud_llm") or {}
         self.cloud = {"enabled": bool(cc.get("enabled")), "model": cc.get("model") or "gpt-oss:120b-cloud",
+                      # per-kind cloud model, e.g. {"triage_verify": "glm-5.3:cloud"} (set by upgrade_tower.py)
+                      "kind_models": {k: v for k, v in (cc.get("kind_models") or {}).items() if v},
                       "local_kinds": tuple(cc.get("local_kinds") or LOCAL_ONLY_KINDS),
                       "num_ctx": int(cc.get("num_ctx") or 65536),
                       "max_input_chars": int(cc.get("max_input_chars") or 180000),
@@ -194,8 +196,11 @@ class LocalLLM:
             return "local"
         return "cloud" if used < c["daily_token_cap"] else "local"
 
+    def cloud_model_for(self, kind):
+        return self.cloud["kind_models"].get(kind) or self.cloud["model"]
+
     def model_for(self, kind):
-        return self.cloud["model"] if self.route(kind) == "cloud" else self.model
+        return self.cloud_model_for(kind) if self.route(kind) == "cloud" else self.model
 
     def max_input_for(self, kind):
         return self.cloud["max_input_chars"] if self.route(kind) == "cloud" else self.max_input_chars
@@ -208,7 +213,7 @@ class LocalLLM:
     def cloud_status(self):
         c = self.cloud
         return {"enabled": c["enabled"], "model": c["model"], "daily_token_cap": c["daily_token_cap"],
-                "local_kinds": list(c["local_kinds"]), **self.cloud_used, "queue": self.cloud_gate.state()}
+                "local_kinds": list(c["local_kinds"]), "kind_models": dict(c["kind_models"]), **self.cloud_used, "queue": self.cloud_gate.state()}
 
     @property
     def ready(self):
@@ -225,7 +230,7 @@ class LocalLLM:
             c = self.cloud
             try:
                 return self._chat(system, user, as_json, timeout, max_tokens, kind,
-                                  c["model"], c["num_ctx"], c["max_input_chars"], self.cloud_gate, True)
+                                  self.cloud_model_for(kind), c["num_ctx"], c["max_input_chars"], self.cloud_gate, True)
             except Exception as ex:          # offline / credit used up / model missing -> local GPU
                 self.cloud_used["fallbacks"] += 1
                 self.cloud_used["down_until"] = time.time() + CLOUD_RETRY_AFTER_S

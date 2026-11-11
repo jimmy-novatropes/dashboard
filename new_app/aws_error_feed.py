@@ -101,6 +101,8 @@ DEFAULTS = {
     "on_demand_wake_hours": 2,
     "gpu_vram_gb": 12,            # tower GPU memory (RTX A2000 12 GB) - for the Health tab's GPU advice    # an on-demand project stays loaded this long after you open it
     "profile_priority": {},       # optional defaults, e.g. {"hrs": "high", "puretech": "on_demand"} (dashboard wins)
+    "info_repeats_per_hour": 20,          # plain info lines: store this many of one pattern per log group per hour,
+                                          # count the rest (lines with a record count are always stored); 0 = store all
     "full_lines_per_pattern_hour": 200,   # after this many lines of one pattern in an hour, store the rest short
     "repeat_line_chars": 1000,            # ...to this many characters: start + end kept (JSON lines always whole)         # plain info lines are dropped sooner (errors / hidden errors / warnings / platform keep keep_hours)
     "poll_seconds": 30,
@@ -560,6 +562,10 @@ class Store:
         self.full_per_hour = int(cfg.get("full_lines_per_pattern_hour") or 0)   # 0 = keep every line in full
         self.short_chars = int(cfg.get("repeat_line_chars") or 500)
         self._seen_hour = {}            # (profile, etype, sig, hour) -> lines stored this hour
+        self.info_repeats = int(cfg.get("info_repeats_per_hour") or 0)
+        self.keep_info = None           # (message) -> True if an info line must always be stored (record counts)
+        self._info_hour = {}            # (profile, grp, etype, sig, hour) -> info lines seen this hour
+        self.info_skipped = 0           # repeated info lines counted, not stored (since start)
         reset_old_db(path)
         self.db = sqlite3.connect(path, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
@@ -610,6 +616,14 @@ class Store:
                     continue
                 etype, sig = signature(msg, level, hint)
                 kind = kind_of(msg, level)
+                if level == "info" and self.info_repeats:
+                    hk = (e["profile"], e["group"], etype, sig, e["ts"] // 3_600_000)
+                    c = self._info_hour[hk] = self._info_hour.get(hk, 0) + 1
+                    if len(self._info_hour) > 200_000:
+                        self._info_hour.clear()
+                    if c > self.info_repeats and not (self.keep_info and self.keep_info(msg)):
+                        self.info_skipped += 1
+                        continue            # same info line again this hour: counted, not stored
             if self.regroup and level in ("error", "suspect", "warning"):
                 try:
                     sig, ch = self.regroup(e["profile"], etype, sig, e["ts"])
@@ -1395,6 +1409,7 @@ def digest_text(dg):
 
 
 EXTRA_RX = []
+OLLAMA_WAIT_S = 180                 # at start, keep checking this long for Ollama before warning
 _clients_cache = {"at": 0, "data": None}
 
 
@@ -3841,6 +3856,7 @@ def main():
                  + (f" ollama[{cfg['tuning_note']}]" if cfg.get("tuning_note") else ""))
     global CODE, EXTRA_RX
     EXTRA_RX[:] = [re.compile(x, re.I) for x in cfg["record_count_patterns"]]
+    store.keep_info = lambda m: aws_ops.extract_count(m, EXTRA_RX) is not None   # run record counts need these lines
     root = cfg["repos_root"] or os.path.dirname(HERE)
     rf = cfg["repos_file"] if os.path.isabs(cfg["repos_file"]) else os.path.join(HERE, cfg["repos_file"])
     CODE = aws_ops.CodeIndex(root, rf)
@@ -3874,6 +3890,9 @@ def main():
                 print("run rollup failed:", ex)
                 HEALTH.event("error", "rollup", "runs", f"{type(ex).__name__}: {ex}")
             n += 1
+            skipped, store.info_skipped = store.info_skipped, 0
+            if skipped:
+                HEALTH.count("store:info_repeats_skipped", skipped)
             DRAIN.prune(now - cfg["keep_hours"] * 3_600_000)
             if n % 288 == 0:
                 HEALTH.prune()
@@ -3896,7 +3915,21 @@ def main():
     QUALITY = aws_quality.Quality(LLM, store, TASKS, cfg, HERE, AIJOBS,
                                   lambda d, win: deploy_check(store, workers, d, win), HEALTH.event)
     QUALITY.start()
-    print("Local model:", LLM.check(force=True)["detail"])
+    st = LLM.check(force=True)
+    print("Local model:", st["detail"])
+    if not st["ok"] and LLM.enabled:
+        def wait_local():
+            # Ollama often starts at logon a little after the dashboard: say when it's there
+            t0 = time.time()
+            while time.time() - t0 < OLLAMA_WAIT_S:
+                time.sleep(10)
+                s = LLM.check(force=True)
+                if s["ok"]:
+                    print(f"Local model: {s['detail']} (after {time.time() - t0:.0f}s)", flush=True)
+                    return
+            print(f"Local model: still not ready after {OLLAMA_WAIT_S}s - {LLM.check(force=True)['detail']}", flush=True)
+            HEALTH.event("warning", "local_model", "start", f"Ollama not ready {OLLAMA_WAIT_S}s after start")
+        threading.Thread(target=wait_local, daemon=True).start()
 
     print(f"Watching {len(workers)} profile/region pair(s):")
     for w in workers:

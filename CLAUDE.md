@@ -2,7 +2,7 @@
 
 - `old_app/` — single-computer dashboard (port 8765, local model off). Stable; change only when asked.
 - `new_app/` — the one in use: runs on the tower (`initium`, port 8766, shared over Tailscale at
-  https://initium.tail11109.ts.net), local model (Ollama, qwen3:14b) for triage, log summaries and
+  https://initium.tail11109.ts.net), local model (Ollama, qwen3:30b-a3b, backup only - the cloud model does the work) for triage, log summaries and
   `local_read` / `local_git`. The laptop's Claude connector runs `new_app/mcp_server.py` against the tower.
 - `logging_kit/` — `oflog.py` (structured log lines for client Lambdas) + `apply_oflog.py` (adds it to a repo).
 
@@ -41,6 +41,11 @@
 - When you learn what a pattern really was: `triage_feedback(profile, error_type, signature, label)`; muting and
   dashboard tasks from an error (error_ref) count too. `quality_report()` (more_tools) = how often triage was right;
   `triage_eval(target)` re-scores the triage on the labeled set (weekly by itself; run it before switching models).
+  Targets: `cloud`, `local`, `cloud:<model>`, `local:<model>`. Outcomes are auto-labels too (quiet 3 days after a deploy
+  -> actionable, quiet with no deploy -> not; `AUTO_LABELS` in aws_quality.py). Per-step cloud models:
+  `cloud_llm.kind_models` in config.json (e.g. `{"triage_verify": "glm-5.3:cloud"}`).
+- Model bake-off: the user runs `new_app/upgrade_tower.py` on the tower (pulls candidates, evals them, applies winners;
+  settings at the top, results in `upgrade_results.json`).
 - After fixing an error: `sweep_bug_class(profile, error_type, signature)` finds the same weakness in other repos
   (nightly 02:xx for fixed / confirmed patterns; `sweep_results`). Bad deploys (worse / new errors) become a
   high-priority task with rollback steps.

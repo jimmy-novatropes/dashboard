@@ -27,7 +27,11 @@ DAY_MS = 86_400_000
 # ------------------------------------------------------------------------------------------ settings
 OUTCOME_DAYS = 30                 # triage verdicts scored over this many days
 IGNORED_AFTER_DAYS = 7            # "actionable", nothing done, still happening this long after first seen -> ignored
-EVAL_MAX_CASES = 40               # labeled patterns per eval run
+EVAL_MAX_CASES = 80               # labeled patterns per eval run
+AUTO_LABELS = True                # outcomes become test labels too: quiet AUTO_QUIET_DAYS after a deploy of its
+                                  # function -> actionable; quiet that long with no deploy -> not actionable
+AUTO_QUIET_DAYS = 3
+EVAL_TARGET_RX = re.compile(r"^(cloud|local)(:[\w.:/-]{1,80})?$")   # "cloud", "local", "cloud:<model>", "local:<model>"
 EVAL_WEEKDAY, EVAL_HOUR = 6, 3    # weekly eval: Sunday 03:xx tower time (weekday 0 = Monday)
 REVIEW_VERIFIERS = 3              # verifier votes per review finding
 REVIEW_MIN_VOTES = 2              # votes needed to keep a finding
@@ -235,13 +239,16 @@ class Quality(threading.Thread):
                 if " | " in ref:
                     e, s = ref.split(" | ", 1)
                     linked.setdefault((e.strip(), s.strip()[:200]), it)
-        recent, groups, first = {}, {}, {}
-        for p, g, e, s, n, h0 in self._q("SELECT profile, grp, etype, sig, SUM(CASE WHEN hour >= ? THEN n ELSE 0 END), "
-                                         "MIN(hour) FROM pattern_hours GROUP BY profile, grp, etype, sig", (hour_now - 24,)):
+        recent, groups, first, last = {}, {}, {}, {}
+        for p, g, e, s, n, h0, h1 in self._q("SELECT profile, grp, etype, sig, SUM(CASE WHEN hour >= ? THEN n ELSE 0 END), "
+                                             "MIN(hour), MAX(CASE WHEN n > 0 THEN hour END) FROM pattern_hours "
+                                             "GROUP BY profile, grp, etype, sig", (hour_now - 24,)):
             k = (e, s, p)
             recent[k] = recent.get(k, 0) + (n or 0)
             groups.setdefault(k, set()).add(g)
             first[k] = min(first.get(k, h0), h0)
+            if h1 is not None:
+                last[k] = max(last.get(k, h1), h1)
         deploys = self._q("SELECT profile, log_group, deployed_at FROM deploys WHERE deployed_at >= ?", (since - 7 * DAY_MS,))
         rows = []
         for e, s, p, at, model, data in tri:
@@ -272,7 +279,8 @@ class Quality(threading.Thread):
                 out = "open"
             rows.append({"etype": e, "sig": s, "profile": p, "verdict": final, "first_verdict": verdict,
                          "verified": d.get("verified"), "category": d.get("category"), "model": model,
-                         "outcome": out, "at": at})
+                         "outcome": out, "at": at,
+                         "quiet_h": hour_now - last[k] if k in last else None})
         return rows
 
     @staticmethod
@@ -285,6 +293,8 @@ class Quality(threading.Thread):
             return "actionable"
         if o == "muted":
             return "not"
+        if AUTO_LABELS and o in ("gone after deploy", "stopped") and (r.get("quiet_h") or 0) >= AUTO_QUIET_DAYS * 24:
+            return "actionable" if o == "gone after deploy" else "not"
         return None
 
     def score(self, rows):
@@ -327,7 +337,7 @@ class Quality(threading.Thread):
             k = (r["etype"], r["sig"], r["profile"])
             if lab and k in inputs:
                 cases.append({"key": k, "label": lab, "input": inputs[k][0]})
-        cases.sort(key=lambda c: c["label"] != "actionable")       # keep both classes when capped
+        cases.sort(key=lambda c: (c["label"] != "actionable", c["key"]))   # both classes when capped; same set every run
         act = [c for c in cases if c["label"] == "actionable"]
         nott = [c for c in cases if c["label"] == "not"]
         half = EVAL_MAX_CASES // 2
@@ -343,11 +353,16 @@ class Quality(threading.Thread):
                 return ("No labeled patterns yet: label some with triage_feedback, or mute noise / add tasks from "
                         "errors in the dashboard - those become the test set.")
             llm = self.llm
-            if target == "local":
-                ask = lambda system, u, kind, mt: llm._chat(system, u, True, 600, mt, "eval", llm.model, llm.num_ctx,
+            side, _, model_name = target.partition(":")
+            if side == "local":
+                m = model_name or llm.model
+                ask = lambda system, u, kind, mt: llm._chat(system, u, True, 600, mt, "eval", m, llm.num_ctx,
                                                             llm.max_input_chars, llm.gate, False)
-            else:
-                ask = lambda system, u, kind, mt: llm.chat(system, u, as_json=True, timeout=600, max_tokens=mt, kind="eval")
+            else:                          # "cloud" = today's setup (per-kind models); "cloud:<model>" = every step on it
+                c = llm.cloud
+                ask = lambda system, u, kind, mt: llm._chat(system, u, True, 600, mt, "eval",
+                                                            model_name or llm.cloud_model_for(kind), c["num_ctx"],
+                                                            c["max_input_chars"], llm.cloud_gate, True)
             models, res = Counter(), []
 
             def one(c):
@@ -357,7 +372,8 @@ class Quality(threading.Thread):
                     return c, j["verdict"]
                 except Exception as ex:
                     return c, "error:" + type(ex).__name__
-            with ThreadPoolExecutor(3 if target != "local" else 1) as ex:
+            t0 = time.time()
+            with ThreadPoolExecutor(3 if side != "local" else 1) as ex:
                 res = list(ex.map(one, cases))
             tp = sum(1 for c, v in res if c["label"] == "actionable" and v == "actionable")
             fp = sum(1 for c, v in res if c["label"] == "not" and v == "actionable")
@@ -370,7 +386,10 @@ class Quality(threading.Thread):
                     "precision_pct": round(100 * tp / (tp + fp), 1) if tp + fp else None,
                     "recall_pct": round(100 * tp / (tp + fn), 1) if tp + fn else None,
                     "misses": [f"{c['key'][2]}: {c['key'][0]} -> {v}" for c, v in res if c["label"] == "actionable" and v != "actionable"][:8],
-                    "false_alarms": [f"{c['key'][2]}: {c['key'][0]}" for c, v in res if c["label"] == "not" and v == "actionable"][:8]}
+                    "false_alarms": [f"{c['key'][2]}: {c['key'][0]}" for c, v in res if c["label"] == "not" and v == "actionable"][:8],
+                    "secs": round(time.time() - t0, 1),
+                    "labels": {"actionable": sum(1 for c, _ in res if c["label"] == "actionable"),
+                               "not": sum(1 for c, _ in res if c["label"] == "not")}}
             model = ", ".join(f"{m} x{n}" for m, n in models.most_common())
             self._w("INSERT OR REPLACE INTO triage_evals VALUES (?,?,?,?,?)", (_now(), target, model, len(res), json.dumps(data)))
             self.event("info", "quality", "eval", f"{target} ({model}): accuracy {data['accuracy_pct']}% on {len(res)} "
@@ -675,8 +694,14 @@ class Quality(threading.Thread):
                 rows = [r for r in rows if r["profile"] == q["profile"]]
             return {"score": self.score(rows), "rows": rows[:300]}
         if path == "/api/quality/eval":
-            target = "local" if q.get("target") == "local" else "cloud"
+            target = (q.get("target") or "cloud").strip()
+            if not EVAL_TARGET_RX.match(target):
+                return {"error": "target must be cloud | local | cloud:<model> | local:<model>"}
             return {"id": self._job("eval", self.run_eval, target, q.get("verify", "1") != "0")}
+        if path == "/api/quality/evals":
+            rows = self._q("SELECT at, target, model, cases, data FROM triage_evals ORDER BY at DESC LIMIT ?",
+                           (int(q.get("n") or 10),))
+            return {"rows": [{"at": at, "target": t, "model": m, "cases": n, **json.loads(d)} for at, t, m, n, d in rows]}
         if path == "/api/quality/sweep":
             if not (q.get("profile") and q.get("etype")):
                 return {"error": "Need profile, etype and sig (from list_error_patterns)."}

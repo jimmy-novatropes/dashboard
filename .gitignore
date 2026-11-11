@@ -12,3 +12,4 @@ __pycache__/
 gmail_client.json
 gmail_token.json
 config.json.bak*
+upgrade_results.json
