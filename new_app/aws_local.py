@@ -252,8 +252,9 @@ class LocalLLM:
             body["format"] = "json"
         if model.startswith("gpt-oss"):
             body["think"] = "low"                 # gpt-oss: keep its reasoning short
-        elif re.match(r"(qwen3|deepseek-r1)", model):
-            body["think"] = False
+        else:
+            body["think"] = False                 # thinking models otherwise spend max_tokens thinking and answer nothing
+                                                  # (models without the option: retried below without it)
         prio = 1 if kind in BACKGROUND_KINDS else 0
         rec = {"kind": kind, "model": model, "prio": prio, "num_ctx": num_ctx, "cloud": cloud,
                "in_chars": len(system) + len(user), "truncated": cut}

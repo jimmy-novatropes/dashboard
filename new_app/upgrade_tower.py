@@ -26,6 +26,7 @@ LOCAL_CANDIDATES = ["gemma4:26b-a4b", "gpt-oss:20b"]   # backup models that suit
 APPLY_TO_KINDS = ["triage_verify"]       # which steps the winning cloud model takes over ("triage" too = all triage)
 MIN_GAIN_POINTS = 3.0                    # accuracy points a candidate must win by to be applied
 MAX_ERRORS = 2                           # candidates with more failed calls than this are not applied
+MAX_UNCLEAR_PCT = 25                     # more "unclear" verdicts than this = the model didn't answer properly
 MAX_SLOWER_PCT = 50                      # a local candidate may be at most this much slower than today's local model
 RUN_LOCAL_EVALS = True                   # False = skip the local bake-off (it takes longest: ~20-60 min per model)
 APPLY_WINNERS = True                     # False = only print the comparison, change nothing
@@ -143,14 +144,16 @@ def table(results):
     for t, d in results.items():
         if d:
             print(f"{t:40} {d['accuracy_pct']:>7}% {str(d['precision_pct']):>8}% {str(d['recall_pct']):>6}% "
-                  f"{d['unclear']:>7} {d['errors']:>6} {str(d.get('secs', '')):>6}")
+                  f"{d['unclear']:>7} {d['errors']:>6} {str(d.get('secs', '')):>6}"
+                  + ("   <- mostly no valid answer, not a fair score" if d["unclear"] > d["cases"] * MAX_UNCLEAR_PCT / 100 else ""))
         else:
             print(f"{t:40} {'(failed)':>8}")
 
 
 def best(results, prefix, baseline):
     base = results.get(baseline)
-    cands = [(t, d) for t, d in results.items() if t.startswith(prefix) and d and d["errors"] <= MAX_ERRORS]
+    cands = [(t, d) for t, d in results.items() if t.startswith(prefix) and d and d["errors"] <= MAX_ERRORS
+             and d["unclear"] <= d["cases"] * MAX_UNCLEAR_PCT / 100]
     if not base or not cands:
         return None, base
     t, d = max(cands, key=lambda x: (x[1]["accuracy_pct"], -x[1]["errors"], -(x[1].get("secs") or 0)))
