@@ -2,7 +2,7 @@
 
 - `old_app/` — single-computer dashboard (port 8765, local model off). Stable; change only when asked.
 - `new_app/` — the one in use: runs on the tower (`initium`, port 8766, shared over Tailscale at
-  https://initium.tail11109.ts.net), local model (Ollama, qwen3:30b-a3b, backup only - the cloud model does the work) for triage, log summaries and
+  https://initium.tail11109.ts.net), local model (Ollama, gpt-oss:20b since 11-11 bake-off, backup only - the cloud model does the work) for triage, log summaries and
   `local_read` / `local_git`. The laptop's Claude connector runs `new_app/mcp_server.py` against the tower.
 - `logging_kit/` — `oflog.py` (structured log lines for client Lambdas) + `apply_oflog.py` (adds it to a repo).
 

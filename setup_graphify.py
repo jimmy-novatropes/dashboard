@@ -30,6 +30,8 @@ AUTO_FIND_REPOS = True           # also add every repo find_repos.py finds (its 
 CODE_ONLY = True                 # True = local AST only, no API key, no data leaves the machine
 LLM_BACKEND = ""                 # used only if CODE_ONLY=False: "claude", "openai", "gemini", "ollama", ...
 GRAPHIFY_PACKAGE = "graphifyy[mcp,sql]"
+UPGRADE_GRAPHIFY = False         # True = upgrade Graphify this run. Quit Claude first: its running graphify-mcp.exe
+                                 # locks the files and Windows refuses the upgrade. False = install only if missing.
 STRICT_HOOK = False              # True = Claude Code must run `graphify query` before its first raw file read
 INSTALL_GIT_HOOKS = True         # auto-rebuild graph on commit / checkout / merge
 SETUP_CLAUDE_CODE_PROJECT = True # CLAUDE.md section + PreToolUse hook in each repo
@@ -51,9 +53,11 @@ FORCE_REBUILD = False            # True = full re-scan (use after big refactors/
 
 GLOBAL_CLAUDE_MD = Path.home() / ".claude" / "CLAUDE.md"   # usage rules for every Claude Code session
 WRITE_GLOBAL_USAGE_RULES = True
-NIGHTLY_REFRESH = True           # Windows scheduled task that re-runs this script every night
-NIGHTLY_TIME = "03:15"           # after the tower's 02:xx sweeps
-NIGHTLY_TASK_NAME = "Graphify nightly refresh"
+NIGHTLY_REFRESH = True           # Windows scheduled task that re-runs this script (no Claude restart needed)
+REFRESH_EVERY_HOURS = 4          # 1-23; 0 = once a day at NIGHTLY_TIME
+NIGHTLY_TIME = "03:15"           # first run of the day (03:15, 07:15, 11:15 ... with 4 h) - clear of the 02:xx sweeps
+NIGHTLY_TASK_NAME = "Graphify refresh"
+OLD_TASK_NAMES = ["Graphify nightly refresh"]   # removed when found
 LOG_FILE = MERGED_GRAPH.parent / "last_run.log"            # full output of the latest run
 # ==================================================================
 
@@ -119,6 +123,7 @@ def find_exe(name):
         return p
     candidates = [
         Path.home() / ".local" / "bin",
+        Path(os.environ.get("APPDATA", "")) / "uv" / "tools" / "graphifyy" / "Scripts",
         Path(os.environ.get("APPDATA", "")) / "Python" / f"Python{sys.version_info.major}{sys.version_info.minor}" / "Scripts",
         Path(sys.executable).parent / "Scripts",
         Path(sys.executable).parent,
@@ -135,6 +140,11 @@ def find_exe(name):
 def install_graphify():
     if sys.version_info < (3, 10):
         sys.exit("Python 3.10+ required.")
+    gfy, mcp = find_exe("graphify"), find_exe("graphify-mcp")
+    if gfy and mcp and not UPGRADE_GRAPHIFY:
+        log("Graphify already installed (set UPGRADE_GRAPHIFY = True to upgrade)")
+        run([gfy, "--version"], check=False)
+        return gfy, mcp
     uv = find_exe("uv")
     if not uv:
         log("uv not found - installing it with pip")
@@ -142,7 +152,14 @@ def install_graphify():
         uv = find_exe("uv")
     if uv:
         log("Installing/upgrading Graphify with uv")
-        run([uv, "tool", "install", "--upgrade", GRAPHIFY_PACKAGE])
+        r = run([uv, "tool", "install", "--upgrade", GRAPHIFY_PACKAGE], check=False)
+        if r.returncode != 0:
+            if gfy and mcp:
+                log("Upgrade failed (Claude is probably running graphify-mcp.exe) - continuing with the installed version."
+                    " Quit Claude from the system tray to upgrade.")
+                return gfy, mcp
+            sys.exit("Graphify install failed - see the error above. If it says 'Access is denied': quit Claude from the"
+                     " system tray, end any graphify-mcp.exe in Task Manager, then run this script again.")
         run([uv, "tool", "update-shell"], check=False, quiet=True)
     else:
         log("Falling back to pip --user")
@@ -336,7 +353,7 @@ def update_claude_code_mcp(servers: dict):
 USAGE_START, USAGE_END = "<!-- graphify-usage:start -->", "<!-- graphify-usage:end -->"
 USAGE_RULES = f"""{USAGE_START}
 ## Graphify MCP (all client repos)
-- MCP server `graphify` = one merged graph of every client repo (`{MERGED_GRAPH}`, refreshed nightly).
+- MCP server `graphify` = one merged graph of every client repo (`{MERGED_GRAPH}`, refreshed every few hours).
   Use it for structure: who calls what, impact of a change, the same pattern across clients.
 - Client known -> always pass `project_path` = that repo folder (e.g. `{MERGED_GRAPH.parent.parent / 'stellaromics'}`).
   Without it the merged graph mixes clients and returns unrelated files.
@@ -368,14 +385,23 @@ def register_nightly_task():
     pyw = py.with_name("pythonw.exe")
     exe = pyw if pyw.exists() else py
     action = f'"{exe}" "{Path(__file__).resolve()}"'
+    for old in OLD_TASK_NAMES:
+        if run(["schtasks", "/Query", "/TN", old], check=False, quiet=True).returncode == 0:
+            run(["schtasks", "/Delete", "/TN", old, "/F"], check=False, quiet=True)
+            log(f"Removed old scheduled task '{old}'")
+    hourly = 0 < REFRESH_EVERY_HOURS < 24
+    when = f"every {REFRESH_EVERY_HOURS} h from {NIGHTLY_TIME}" if hourly else f"daily at {NIGHTLY_TIME}"
     q = run(["schtasks", "/Query", "/TN", NIGHTLY_TASK_NAME, "/XML"], check=False, quiet=True)
-    if q.returncode == 0 and str(Path(__file__).resolve()) in q.stdout and f"T{NIGHTLY_TIME}:00" in q.stdout:
-        log(f"Nightly task already scheduled ({NIGHTLY_TIME})")
+    same_interval = (f"<Interval>PT{REFRESH_EVERY_HOURS}H</Interval>" in q.stdout) if hourly else ("<Interval>" not in q.stdout)
+    if (q.returncode == 0 and str(Path(__file__).resolve()) in q.stdout
+            and f"T{NIGHTLY_TIME}:00" in q.stdout and same_interval):
+        log(f"Refresh task already scheduled ({when})")
         return
-    r = run(["schtasks", "/Create", "/F", "/SC", "DAILY", "/ST", NIGHTLY_TIME, "/TN", NIGHTLY_TASK_NAME,
+    sched = ["/SC", "HOURLY", "/MO", str(REFRESH_EVERY_HOURS)] if hourly else ["/SC", "DAILY"]
+    r = run(["schtasks", "/Create", "/F", *sched, "/ST", NIGHTLY_TIME, "/TN", NIGHTLY_TASK_NAME,
              "/TR", action], check=False, quiet=True)
     if r.returncode == 0:
-        log(f"Nightly task scheduled: '{NIGHTLY_TASK_NAME}' at {NIGHTLY_TIME} (log: {LOG_FILE})")
+        log(f"Refresh task scheduled: '{NIGHTLY_TASK_NAME}' {when} (log: {LOG_FILE})")
     else:
         log(f"Could not schedule nightly task: {(r.stdout + r.stderr).strip()}")
 
